@@ -1,0 +1,25 @@
+[project]
+name = "bioview-server"
+version = "0.9.3"
+description = "Cross-platform backend providing core functionality for headless and networked clients"
+authors = [
+    {name = "Aakash Kapoor",email = "113218196+meowkash@users.noreply.github.com"}
+]
+license = {text = "GPL-v3"}
+readme = "README.md"
+requires-python = ">=3.12, <3.13"
+dependencies = [
+    "pygame (>=2.6.1,<3.0.0)",
+    "h5py (>=3.14.0,<4.0.0)",
+    "scipy (>=1.16.1,<2.0.0)"
+]
+
+[project.optional-dependencies]
+uhd = [
+    "uhd ; platform_system == 'Windows'"
+]
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
