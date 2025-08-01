@@ -18,7 +18,6 @@ except ImportError:
 import socket
 import json
 import time
-import os
 import sys
 from threading import Thread, Lock
 import multiprocessing as mp
@@ -43,7 +42,7 @@ SUPPORTED_COMMANDS = [
 ]
 
 class Server:
-    def __init__(self, address='localhost', control_port=9999, data_port=9998):
+    def __init__(self, address='0.0.0.0', control_port=8888, data_port=8889):
         self.address = address # This can be a list 
         self.control_port = control_port
         self.data_port = data_port
@@ -79,6 +78,14 @@ class Server:
             self.data_socket.bind((self.address, self.data_port))
             self.data_socket.listen(10)  # More clients for data
             print(f"✓ Data server listening on {self.address}:{self.data_port}")
+            
+            # Get and display network information
+            local_ip = self.get_local_ip()
+
+            if local_ip and self.address == '0.0.0.0':
+                print(f"Local network address: {local_ip}")
+                print(f"Clients should connect to: {local_ip}:{self.data_port},{self.control_port}")
+            
         except Exception as e: 
             print(f'Error occurred while starting server: {e}')
         
@@ -111,8 +118,20 @@ class Server:
             self.data_socket.close()
             
         print("Client server stopped")
-        
-    def run_control_server(self): 
+
+    def get_local_ip(self):
+        """Get the local IP address"""
+        try:
+            # Connect to a remote address to determine local IP
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.connect(("8.8.8.8", 80))
+            local_ip = sock.getsockname()[0]
+            sock.close()
+            return local_ip
+        except Exception:
+            return None
+         
+    def run_control_server(self):  
         while self.running:
             try:
                 client_socket, address = self.control_socket.accept()
