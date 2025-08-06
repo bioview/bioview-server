@@ -46,7 +46,7 @@ import multiprocessing as mp
 import traceback
 from enum import Enum, auto
 
-from bioview_server.constants import Configuration
+from bioview_server.datatypes import Configuration
 
 from bioview_common import Command, Response, MAX_BUFFER_SIZE, APP_VERSION, CONTROL_PORT, DATA_PORT, get_ip, get_app_info
 

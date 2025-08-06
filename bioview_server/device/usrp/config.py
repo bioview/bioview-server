@@ -1,55 +1,31 @@
-from .defaults import BASE_USRP_CONFIG
-from bioview_server.constants import Configuration
+from bioview_server.datatypes import Configuration
 
+"""
+We make some general assumptions, specifically -
+* Each device has two working channels
+* Each device uses the default data formats
+* Each device uses internal timing reference and clock
+* Each device sends waveforms of amplitude 1
+"""
 
-class MultiUsrpConfiguration(Configuration):
-    """
-    Handles an arbitrary number of USRP devices, keeping a clear distinction between the common variables and non-common variables
-    """
+BASE_USRP_CONFIG = {
+    "tx_amplitude": [1, 1],
+    "rx_channels": [0, 1],
+    "tx_channels": [0, 1],
+    "rx_subdev": "A:A A:B",
+    "tx_subdev": "A:A A:B",
+    "cpu_format": "fc32",
+    "wire_format": "sc16",
+    "clock": "internal",
+    "pps": "internal",
+    "if_filter_bw": 5e3,
+    "save_ds": 100,
+    "disp_ds": 10,
+}
 
+class USRPConfiguration(Configuration):
     def __init__(
         self,
-        samp_rate: int,
-        devices: list[dict],
-        save_ds: int = BASE_USRP_CONFIG["save_ds"],
-        save_iq: bool = False,
-        save_imaginary: bool = True,
-        disp_ds: int = BASE_USRP_CONFIG["disp_ds"],
-        disp_imaginary: bool = False,
-        display_sources: list = [],
-    ):
-        super().__init__()
-        # Store common configuration values
-        self.samp_rate = samp_rate
-        self.save_ds = save_ds
-        self.save_iq = save_iq
-        self.save_imaginary = save_imaginary
-        self.disp_ds = disp_ds
-        self.disp_imaginary = disp_imaginary
-        self.display_sources = display_sources
-
-        # Initialize per-device configuration
-        self.devices = {}
-        for device in devices:
-            if not isinstance(device, dict):
-                raise ValueError(
-                    f"Expected device configuration to be a dict but got {type(device)} instead"
-                )
-            self.devices[device["device_name"]] = UsrpConfiguration(**device)
-
-            # Copy necessary common configuration values to all devices
-            self.devices[device["device_name"]].samp_rate = samp_rate
-
-    def get_disp_freq(self):
-        return self.samp_rate / (self.save_ds * self.disp_ds)
-
-    def get_individual_configs(self):
-        return self.devices.values()
-
-class UsrpConfiguration(Configuration):
-    def __init__(
-        self,
-        device_name: str,
         if_freq: list,
         tx_gain: list,
         rx_gain: list,
@@ -69,7 +45,6 @@ class UsrpConfiguration(Configuration):
         super().__init__(**kwargs)
 
         # Add inputs
-        self.device_name = device_name
         self.if_freq = if_freq
         self.rx_gain = rx_gain
         self.tx_gain = tx_gain

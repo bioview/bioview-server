@@ -1,40 +1,47 @@
+import uhd 
 import math
+import queue 
 from threading import Thread
 import numpy as np
-import uhd
 
-from .defaults import INIT_DELAY
-from .config import UsrpConfiguration
+INIT_DELAY = 0.05  # 50mS initial delay before transmit
 
 from bioview_server.utils import emit_signal
 
 class TransmitWorker(Thread):
     def __init__(
         self,
-        config: UsrpConfiguration,
         usrp,
+        tx_gain,
+        tx_amplitude, 
+        tx_channels, 
+        samp_rate, 
+        if_freq, 
         tx_streamer,
-        running: bool = True
+        cmd_queue, 
+        log_event, 
+        running: bool = False
     ):
         super().__init__()
         # Signals 
         self.log_event = None 
         
         # Modifiable params
-        self.tx_gain = config.get_param("tx_gain").copy()
-        self.tx_amplitude = config.get_param("tx_amplitude")
+        self.tx_gain = tx_gain
+        self.tx_amplitude = tx_amplitude
 
         # Fixed params
-        self.samp_rate = config.get_param("samp_rate")
-        self.if_freq = config.get_param("if_freq")
-        self.tx_channels = config.get_param("tx_channels")
+        self.tx_channels = tx_channels
+        self.samp_rate = samp_rate
+        self.if_freq = if_freq
 
         self._generate_tx_waveforms()
 
-        self.config = config
         self.usrp = usrp
         self.tx_streamer = tx_streamer
         self.running = running
+
+        self.cmd_queue = cmd_queue
         self.tx_buffer_size = self.tx_streamer.get_max_num_samps()
 
     def _get_buf_size(self, freq):
@@ -75,6 +82,7 @@ class TransmitWorker(Thread):
             )
 
     def run(self):
+        self.running = True
         emit_signal(self.log_event, "debug", "Transmission Started")
         tx_metadata = uhd.types.TXMetadata()
         tx_metadata.start_of_burst = True
@@ -86,12 +94,33 @@ class TransmitWorker(Thread):
 
         while self.running:
             # Check for updated parameters
-            curr_tx_gain = self.config.get_param("tx_gain")
-            if curr_tx_gain != self.tx_gain:
-                for chan in self.config.tx_channels:
-                    self.usrp.set_tx_gain(curr_tx_gain[chan], chan)
-                emit_signal(self.log_event, "debug", f"Tx gain updated to {curr_tx_gain}. Current {self.tx_gain}")
-                self.tx_gain = curr_tx_gain
+            try: 
+                current_command = self.cmd_queue.pop()
+                
+                # Command here will just tell adjustable params and will make changes 
+                param = current_command['param']
+                val = current_command['value']
+                
+                if param == 'tx_gain': 
+                    if val != self.tx_gain:
+                        for chan in self.tx_channels:
+                            self.usrp.set_tx_gain(val[chan], chan)
+                    
+                    emit_signal(self.log_event, "debug", f"Tx gain updated to {val}. Current {self.tx_gain}")
+                    self.tx_gain = val
+                elif param == 'tx_amplitude': 
+                    curr_tx_amplitude = self.tx_amplitude       
+                    if val != curr_tx_amplitude: 
+                        for idx in range(len(self.tx_channels)): 
+                            self.tx_waveform[idx] = self.tx_waveform[idx] * val / curr_tx_amplitude[idx]
+                    
+                    emit_signal(self.log_event, "debug", f"Tx amplitude updated to {val}. Current {self.tx_amplitude}")
+                    self.tx_amplitude = val 
+                # NOTE: Any other modifiable parameters may be added here 
+                else: 
+                    pass              
+            except queue.Empty: 
+                pass 
 
             try:
                 # Send samples

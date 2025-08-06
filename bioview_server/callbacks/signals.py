@@ -1,5 +1,6 @@
 import queue
-from bioview_common import ConnectionStatus, Response
+import numpy as np
+from bioview_common import ConnectionStatus, Response, DataSource
 
 def log_event(response_queue, level, message):
     if level == "error":
@@ -36,3 +37,14 @@ def connection_state_changed(response_queue, device_id, status: ConnectionStatus
         response_queue.put_nowait(response)
     except queue.Full: 
         print('Unable to add to response queue as it is full.')
+    
+def data_ready(data_queue, data: np.ndarray, source: DataSource):
+    response = {
+        'source': source, 
+        'data': data
+    }
+
+    try: 
+        data_queue.put_nowait(response)
+    except queue.Full: 
+        print('Unable to add to data queue as it is full.')

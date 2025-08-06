@@ -1,11 +1,7 @@
-from .config import BiopacConfiguration
-from .device import BiopacDevice
-from .utils import load_mpdev_dll
+from .backend import BIOPACBackend
+from .device import BIOPACDevice
 
-def get_device_object(device_name, config, resp_queue, data_queue, save=False, save_path=None):
-    return BiopacDevice(
-        device_name=device_name, config=config, resp_queue=resp_queue, data_queue=data_queue, save=save, save_path=save_path
-    )
+from .config import BiopacConfiguration
 
 def discover_devices(): 
     devices = []
@@ -22,4 +18,7 @@ def discover_devices():
 
     return device
 
-__all__ = ["BiopacDevice", "BiopacConfiguration", "get_device_object", "discover_devices"]
+__all__ = [
+    "BIOPACBackend",
+    "BIOPACDevice"
+]

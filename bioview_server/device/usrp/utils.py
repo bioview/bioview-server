@@ -7,9 +7,10 @@ import json
 from datetime import datetime, timedelta
 import numpy as np
 
-from .defaults import CLOCK_TIMEOUT
 from bioview_common import DataSource
+from bioview_server.utils import get_cache_file
 
+CLOCK_TIMEOUT = 1000  # 1000ms timeout for external clock locking
 
 def _check_pairing(r_idx, t_idx, rx_cumsum, tx_cumsum, pair_list):
     fn = lambda x, y: (np.where(x - y < 0))[0][0]
@@ -148,7 +149,7 @@ def check_channels(usrp, rx_channels, tx_channels):
     return rx_channels, tx_channels
 
 def get_usrp_address(device_name: str):
-    cache_file = _get_cache_file("serial_maps")
+    cache_file = get_cache_file("usrp_serial_numbers")
     map_dict = {}
 
     try:
@@ -162,7 +163,7 @@ def get_usrp_address(device_name: str):
 
 
 def update_usrp_address(device_name: str, device_serial: str):
-    cache_file = _get_cache_file("serial_maps")
+    cache_file = get_cache_file("usrp_serial_numbers")
     map_dict = {}
 
     try:

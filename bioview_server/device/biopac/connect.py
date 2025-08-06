@@ -12,7 +12,6 @@ class ConnectWorker:
         self.init_failed = None 
         
         # Variables
-        self.config = config
         self.biopac = None
 
     def run(self):

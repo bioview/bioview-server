@@ -1,1 +1,1 @@
-from .signals import connection_state_changed, log_event
+from .signals import connection_state_changed, data_ready, log_event

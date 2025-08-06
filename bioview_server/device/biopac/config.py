@@ -1,4 +1,4 @@
-from bioview_server.constants import Configuration
+from bioview_server.datatypes import Configuration
 
 
 class BiopacConfiguration(Configuration):

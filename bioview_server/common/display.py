@@ -3,7 +3,7 @@ import queue
 import numpy as np
 
 from bioview_common import DataSource
-from bioview_server.constants import Configuration
+from bioview_server.datatypes import Configuration
 from bioview_server.utils import apply_filter, get_filter, emit_signal
 
 class DisplayWorker():

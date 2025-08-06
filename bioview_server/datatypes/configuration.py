@@ -5,9 +5,6 @@ class Configuration:
     def __init__(self):
         pass 
 
-    def get_disp_freq(self):
-        return 10  # Dummy output
-
     def set_param(self, param, value): 
         current_type = type(getattr(self, param, None))
         if current_type is not None:

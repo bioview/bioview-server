@@ -3,35 +3,42 @@ from threading import Thread
 import numpy as np
 
 from bioview_server.utils import apply_filter, get_filter, emit_signal
-from .config import MultiUsrpConfiguration
 
 class ProcessWorker(Thread):
     def __init__(
         self,
-        config: MultiUsrpConfiguration,
+        samp_rate, 
         channel_ifs,
         if_filter_bw,
         data_sources,
         rx_queues: list[queue.Queue],
         save_queue: queue.Queue,
         disp_queue: queue.Queue,
-        running: bool = False,
+        save_imaginary: bool = True,
+        save_iq: bool = True, 
+        disp_imaginary: bool = False, 
+        running: bool = False
     ):
         super().__init__()
         # Signals 
         self.log_event = None 
         
+        self.data_sources = data_sources
+
         # Variables 
-        self.config = config
+        self.samp_rate = samp_rate 
+        self.channel_ifs = channel_ifs
+        self.save_imaginary = save_imaginary
+        self.save_iq = save_iq
+        self.disp_imaginary = disp_imaginary
+
+        # Queues 
         self.rx_queues = rx_queues
         self.save_queue = save_queue
         self.disp_queue = disp_queue
 
+        # State 
         self.running = running
-
-        self.channel_ifs = channel_ifs
-
-        self.data_sources = data_sources
 
         # Load IF filters
         self.if_filts = [
@@ -50,7 +57,7 @@ class ProcessWorker(Thread):
 
         filter = get_filter(
             bounds=[low_cutoff, high_cutoff],
-            samp_rate=self.config.get_param("samp_rate"),
+            samp_rate=self.samp_rate,
             btype="band",
             order=order,
         )
@@ -83,7 +90,7 @@ class ProcessWorker(Thread):
         current_phase = source.accumulated_phase
 
         # Get phase for all samples
-        phase_increment = 2 * np.pi * if_freq / self.config.get_param("samp_rate")
+        phase_increment = 2 * np.pi * if_freq / self.samp_rate
         phases = current_phase + np.arange(len(filt_data)) * phase_increment
 
         # Down-convert from IF to baseband with phase continuity
@@ -94,7 +101,7 @@ class ProcessWorker(Thread):
         source.accumulated_phase = phases[-1] + phase_increment
 
         # Downsampling logic
-        step = self.config.get_param("save_ds")
+        step = self.save_ds
         end_idx = len(baseband_data) - step + 1
         num_windows = (end_idx + step - 1) // step  # Calculate the number of windows
 
@@ -108,7 +115,7 @@ class ProcessWorker(Thread):
         window_indices = start_indices[:, np.newaxis] + np.arange(step)
         windows = baseband_data[window_indices]
 
-        if self.config.get_param("save_iq"):
+        if self.save_iq:
             first_comp = np.mean(np.real(windows), axis=1)
             second_comp = np.mean(np.imag(windows), axis=1)
         else:
@@ -120,10 +127,10 @@ class ProcessWorker(Thread):
     def _process_save(self, buffer):
         # Use numpy preallocated array for speed
         num_sources = len(self.data_sources)
-        len_samples = int(buffer.shape[1] // self.config.get_param("save_ds"))
+        len_samples = int(buffer.shape[1] // self.save_ds)
 
         # We might not always want to save imaginary components
-        if self.config.get_param("save_imaginary"):
+        if self.save_imaginary:
             save_list = np.empty((num_sources, len_samples, 2))
         else:
             save_list = np.empty((num_sources, len_samples))
@@ -139,7 +146,7 @@ class ProcessWorker(Thread):
 
             emit_signal(self.log_event, "debug", f"Processed channel {source.channel}")
 
-            if self.config.get_param("save_imaginary"):
+            if self.save_imaginary:
                 save_list[source.channel, :, 0] = first_comp
                 save_list[source.channel, :, 1] = second_comp
             else:
@@ -194,11 +201,11 @@ class ProcessWorker(Thread):
                 # Add to display queue
                 try:
                     # If we do not have an imaginary component, simply pass processed data
-                    if self.config.get_param("save_imaginary") is False:
+                    if self.save_imaginary is False:
                         self.disp_queue.put(processed)
                     else:
                         # Depending on whether we want to display imaginary or not
-                        if self.config.get_param("disp_iamginary", False):
+                        if self.disp_iamginary:
                             self.disp_queue.put(processed[:, :, 1])
                         else:
                             self.disp_queue.put(processed[:, :, 0])

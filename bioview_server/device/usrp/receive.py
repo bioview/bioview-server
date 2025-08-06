@@ -5,34 +5,40 @@ import numpy as np
 
 from bioview_server.utils import emit_signal
 
-from .defaults import INIT_DELAY, SAVE_BUFFER_SIZE, SETTLING_TIME
-from .config import UsrpConfiguration
+INIT_DELAY = 0.05  # 50mS initial delay before transmit
+SAVE_BUFFER_SIZE = 20  # This is a good balance between real time display and spikes
 
 class ReceiveWorker(Thread):
     def __init__(
         self,
         usrp,
-        config: UsrpConfiguration,
+        rx_gain,
+        rx_channels,
         rx_streamer,
         rx_queue,
-        running: bool = True
+        cmd_queue, 
+        log_event, 
+        running: bool = False 
     ):
         super().__init__()
         # Signals 
-        self.log_event = None 
+        self.log_event = log_event 
         
         # Modifiable params
-        self.rx_gain = config.get_param("rx_gain").copy()
-
-        self.config = config
+        self.rx_gain = rx_gain
+        self.rx_channels = rx_channels
 
         # Device params
         self.usrp = usrp
         self.rx_streamer = rx_streamer
-        self.rx_queue = rx_queue
+        self.rx_queue = rx_queue # Data
+        self.cmd_queue = cmd_queue # Commands (such as gain change)
+
         self.running = running
 
     def run(self):
+        self.running = True 
+        
         emit_signal(self.log_event, "debug", "Receiving Started")
         if self.usrp is None or self.rx_streamer is None:
             emit_signal(self.log_event, "error", "USRP or Rx streamer not initialized.")
@@ -73,12 +79,26 @@ class ReceiveWorker(Thread):
 
         while self.running:
             # Check for updated parameters
-            curr_rx_gain = self.config.get_param("rx_gain")
-            if curr_rx_gain != self.rx_gain:
-                for chan in self.config.rx_channels:
-                    self.usrp.set_rx_gain(curr_rx_gain[chan], chan)
-                emit_signal(self.log_event, "debug", f"Rx gain updated to {curr_rx_gain}. Current {self.rx_gain}")
-                self.rx_gain = curr_rx_gain
+            try: 
+                current_command = self.cmd_queue.pop()
+                
+                # Command here will just tell adjustable params and will make changes 
+                param = current_command['param']
+                val = current_command['value']
+                
+                if param == 'rx_gain': 
+                    if val != self.rx_gain:
+                        for chan in self.rx_channels:
+                            self.usrp.set_rx_gain(val[chan], chan)
+                    
+                    emit_signal(self.log_event, "debug", f"Rx gain updated to {val}. Current {self.rx_gain}")
+                    self.rx_gain = val
+                # NOTE: Any other modifiable parameters may be added here 
+                else: 
+                    pass 
+                    
+            except queue.Empty: 
+                pass 
 
             try:
                 # Receive samples

@@ -2,7 +2,7 @@
 Each device must be imported with exception handling since all drivers are not guaranteed to be installed
 '''
 
-from ..constants.device import Device
+from ..datatypes.device import Device
 
 __all__ = [
     "Device"
@@ -16,7 +16,7 @@ def _check_type(obj, typ):
 
     return isinstance(obj, typ)
 
-from bioview_server.constants import Configuration
+from bioview_server.datatypes import Configuration
 
 def get_device_object(device_name, config, resp_queue, data_queue, save, save_path):
     # config files must always be of type Configuration
