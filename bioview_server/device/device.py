@@ -2,8 +2,11 @@ import queue
 
 import numpy as np
 
-from bioview_server.constants import Configuration, DataSource, ConnectionStatus, Message, Response
+from bioview_common import DataSource, ConnectionStatus, Response 
+from bioview_server.constants import Configuration, Message
 from bioview_server.utils import emit_signal
+
+
 
 class Device:
     def __init__(

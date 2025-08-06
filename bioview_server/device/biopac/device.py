@@ -2,13 +2,14 @@ import queue
 
 from bioview_server.device import Device
 from bioview_server.common import SaveWorker, DisplayWorker
-from bioview_server.constants import ConnectionStatus, DataSource
-from .config import BiopacConfiguration
+
+from bioview_common.constants import ConnectionStatus, DataSource
 
 # Core functionality that should always be available
 from .connect import ConnectWorker
 from .process import ProcessWorker
 from .receive import ReceiveWorker
+from .config import BiopacConfiguration
 
 class BiopacDevice(Device):    
     def __init__(

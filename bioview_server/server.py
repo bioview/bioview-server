@@ -24,22 +24,10 @@ import multiprocessing as mp
 import traceback
 
 from bioview_server.device import discover_devices, get_device_object
-from bioview_server.constants import APP_VERSION, Configuration, Command, Response, MAX_BUFFER_SIZE
 
+from bioview_server.constants import Configuration
+from bioview_common import Command, SUPPORTED_COMMANDS, Response, MAX_BUFFER_SIZE, DataSource, APP_VERSION
 
-SUPPORTED_COMMANDS = [
-    Command.PING,
-    Command.DISCOVER,
-    Command.INIT, 
-    Command.CONNECT,
-    Command.DISCONNECT,
-    Command.CONFIGURE, 
-    Command.START,
-    Command.STOP,
-    Command.UPDATE, 
-    Command.STATUS, 
-    Command.SHUTDOWN
-]
 
 class Server:
     def __init__(self, address='0.0.0.0', control_port=8888, data_port=8889):
