@@ -3,7 +3,7 @@ import queue
 from bioview_server.device import Device
 from bioview_server.common import SaveWorker, DisplayWorker
 
-from bioview_common.constants import ConnectionStatus, DataSource
+from bioview_common import ConnectionStatus, DataSource
 
 # Core functionality that should always be available
 from .connect import ConnectWorker

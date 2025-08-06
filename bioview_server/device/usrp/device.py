@@ -4,7 +4,7 @@ from bioview_server.device import Device
 from bioview_server.common import DisplayWorker, SaveWorker
 from bioview_server.utils import emit_signal
 
-from bioview_common.constants import ConnectionStatus
+from bioview_common import ConnectionStatus
 
 from .config import MultiUsrpConfiguration, UsrpConfiguration
 from .connect import ConnectWorker
