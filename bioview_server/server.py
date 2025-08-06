@@ -493,62 +493,6 @@ class Server:
         while self.status == ServerStatus.STREAMING: 
             pass
     
-
-""" Device Handler
-This is a standalone process which interfaces with devices of a particular kind. In order to isolate
-hardware interfaces from each other, every unique kind of device is ru
-
-The DeviceHandler() class maintains all necessary device info 
-& can also read & write data to & from the device 
-along with storing the read data in a data dump in storage
-
-"""
-
-class DeviceHandler(mp.Process):
-    def __init__(self, config: Configuration, exp_config: Configuration, data_queue: mp.Queue, save):
-        # Device configuration
-        self.config = config 
-        self.exp_config = exp_config
-        self.save = save 
-         
-        self.device_name = config.get_param('device_name', 'dummy_device')
-        self.device = None 
-        self.data_queue = data_queue
-        
-        # Device status 
-        self.is_connected = False 
-        self.is_streaming = False 
-        
-        self.running = False 
-        
-    def connect(self):
-        # Create device object 
-        self.device = get_device_object(
-            device_name = self.device_name, 
-            config = self.config,
-            data_queue = self.data_queue, 
-            resp_queue=None, 
-            save = self.save,
-            exp_config = self.exp_config
-        )
-        
-        self.device.connect()
-    
-    def start(self):
-        self.device.run()
-    
-    def stop(self):
-        self.device.stop()
-        
-    def disconnect(self):
-        self.device.disconnect()
-        
-    def update_config(self, param, value): 
-        self.device.update_config(param, value)    
-    
-    def update_param(self, param, value): 
-        self.device.update_param(param, value)
-    
 if __name__ == "__main__":
     print("=" * 50)
     print(f"BioView Device Server, Version: {APP_VERSION}")

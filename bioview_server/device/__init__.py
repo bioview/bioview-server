@@ -2,7 +2,7 @@
 Each device must be imported with exception handling since all drivers are not guaranteed to be installed
 '''
 
-from .device import Device
+from ..constants.device import Device
 
 __all__ = [
     "Device"

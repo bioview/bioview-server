@@ -12,7 +12,6 @@ from .process import ProcessWorker
 from .receive import ReceiveWorker
 from .transmit import TransmitWorker
 
-
 class MultiUsrpDevice(Device):
     def __init__(
         self,
