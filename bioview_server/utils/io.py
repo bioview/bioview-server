@@ -32,7 +32,6 @@ def init_save_file(file_path, num_channels: int, chunk_size: int = 500):
             chunks=(num_channels, chunk_size),
         )
 
-
 def update_save_file(file_path, chunk):
     save_chunk = np.vstack(
         [chunk[:, :, 0], chunk[:, :, 1]]

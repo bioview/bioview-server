@@ -1,66 +1,33 @@
-'''
-Each device must be imported with exception handling since all drivers are not guaranteed to be installed
-'''
+# Try to load all backends and provide 
+import sys 
 
-from ..datatypes.device import Device
+AVAILABLE_BACKENDS = {}
+
+# TODO: Suppress STDOUT
+try:
+    # Ensure uhd is available
+    import uhd # Crashes occur without this
+    
+    # Ensure device is importable 
+    import usrp as usrp
+
+    AVAILABLE_BACKENDS['usrp'] = usrp
+except Exception as e: 
+    print(f'USRP backend not available: {e}')
+
+try: 
+    # Ensure platform is windows 
+    if sys.platform != 'win32':
+        raise OSError(f'Invalid platfrom {sys.platform}. Ensure you are using Windows')
+    import biopac as biopac
+    # Ensure mpdev.dll exists 
+    if biopac.load_mpdev_dll() == None:
+        raise ValueError('mpdev.dll not found')
+    
+    AVAILABLE_BACKENDS['biopac'] = biopac
+except Exception as e:  
+    print(f'BIOPAC backend not available: {e}')
 
 __all__ = [
-    "Device"
+    "AVAILABLE_BACKENDS"
 ]
-
-device_object_callbacks = {}
-
-def _check_type(obj, typ):
-    if isinstance(obj, list) or isinstance(obj, tuple):
-        return all(isinstance(x, typ) for x in obj)
-
-    return isinstance(obj, typ)
-
-from bioview_server.datatypes import Configuration
-
-def get_device_object(device_name, config, resp_queue, data_queue, save, save_path):
-    # config files must always be of type Configuration
-    if not isinstance(config, Configuration):
-        raise TypeError(f'Specified config must be of type Configuration but got {type(config)} instead.')
-    
-    try: 
-        if config.type == 'usrp': 
-            from .usrp import get_device_object
-        elif config.type == 'biopac': 
-            from .biopac import get_device_object
-        else: 
-            raise NotImplementedError(f'Unable to parse configuration for device type {config.type}')
-    
-        return get_device_object(
-            device_name=device_name,
-            config=config,
-            resp_queue=resp_queue, 
-            data_queue=data_queue, 
-            save=save,
-            save_path=save_path,
-        )
-    except Exception as e: 
-        print(f'Unable to create {config.type} device: {e}')
-
-def discover_devices(): 
-    devices = []
-    
-    # For all backends, this will discover devices
-    try:     
-        from .usrp import discover_devices
-        devices.extend(discover_devices())
-    except Exception as e: 
-        print(f'Error getting USRP devices: {e}')
-    
-    try: 
-        from .biopac import discover_devices
-        devices.extend(discover_devices())
-    except Exception as e: 
-        print(f'Error getting BIOPAC devices: {e}')
-    
-    return devices
-
-__all__.extend([
-    "get_device_object", 
-    "discover_devices"
-])

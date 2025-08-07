@@ -10,34 +10,6 @@ the same level of access or whether each device should be considered as a differ
 connection. Subsequent experimentation and discussion will be pertinent for expanding 
 functionality to handle the case for multiple clients. 
 """
-import sys 
-
-# Populate available backends 
-AVAILABLE_BACKENDS = {}
-try:
-    # Ensure uhd is available
-    import uhd # Crashes occur without this
-    # Ensure device is importable 
-    from bioview_server.device import USRPBackend
-    AVAILABLE_BACKENDS['usrp'] = USRPBackend
-except Exception as e: 
-    print(f'USRP backend not available: {e}')
-
-try: 
-    # Ensure platform is windows 
-    if sys.platform != 'win32':
-        raise OSError(f'Invalid platfrom {sys.platform}. Ensure you are using Windows')
-    # Ensure mpdev.dll exists 
-    from bioview_server.device.biopac import load_mpdev_dll
-    if load_mpdev_dll() == None:
-        raise ValueError('mpdev.dll not found')
-    from bioview_server.device import BIOPACBackend
-    AVAILABLE_BACKENDS['biopac'] = BIOPACBackend
-except Exception as e:  
-    print(f'BIOPAC backend not available: {e}')
-
-print(f'Available Backends: {list(AVAILABLE_BACKENDS.keys())}')
-
 import socket
 import json
 import time
@@ -47,8 +19,11 @@ import traceback
 from enum import Enum, auto
 
 from bioview_server.datatypes import Configuration
+from bioview_server.device import AVAILABLE_BACKENDS
 
 from bioview_common import Command, Response, MAX_BUFFER_SIZE, APP_VERSION, CONTROL_PORT, DATA_PORT, get_ip, get_app_info
+
+print(f'Available Backends: {list(AVAILABLE_BACKENDS.keys())}')
 
 class ServerStatus(Enum): 
     DEFAULT = auto      # Nothing is going on

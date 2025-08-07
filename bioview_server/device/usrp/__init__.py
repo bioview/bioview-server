@@ -1,7 +1,8 @@
 from .backend import USRPBackend
-from .device import USRPDevice
+from .utils import discover_devices, update_device_firmware
     
 __all__ = [
     "USRPBackend",
-    "USRPDevice"
+    "discover_devices",
+    "update_device_firmware"
 ]

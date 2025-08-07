@@ -1,7 +1,7 @@
 """
 Ref: uhd examples
 """
-
+import uhd 
 import time
 import json 
 from datetime import datetime, timedelta
@@ -11,6 +11,35 @@ from bioview_common import DataSource
 from bioview_server.utils import get_cache_file
 
 CLOCK_TIMEOUT = 1000  # 1000ms timeout for external clock locking
+
+def update_device_firmware():
+    pass 
+
+def discover_devices(): 
+    '''
+    Devices discovered using uhd.find contain the following keys - 
+    - 'type': eg. b200
+    - 'name': eg. MyB210
+    - 'serial'
+    - 'product': 'B210'
+
+    These props are wrapped into an appropriate payload
+    '''
+    discovered_devices = {} 
+
+    try:     
+        device_list = uhd.find("")
+
+        for device in device_list: 
+            device_dict = dict(device)
+            discovered_devices[device_dict['name']] = device_dict
+
+            # Update in cache 
+            update_usrp_address(device_dict['name'], device_dict['serial'])
+    except Exception as e: 
+        print(f'Error occured in UHD device discovery: {e}')
+        
+    return discovered_devices
 
 def _check_pairing(r_idx, t_idx, rx_cumsum, tx_cumsum, pair_list):
     fn = lambda x, y: (np.where(x - y < 0))[0][0]

@@ -4,7 +4,12 @@ from bioview_server.utils import init_save_file, update_save_file, emit_signal
 
 class SaveWorker:
     def __init__(
-        self, save_path, data_queue, num_channels, running: bool = False, parent=None
+        self, 
+        save_path, 
+        data_queue, 
+        num_channels, 
+        running: bool = False, 
+        parent=None
     ):
         super().__init__(parent)
         # Signals 
@@ -24,6 +29,8 @@ class SaveWorker:
         if self.data_queue is None:
             return
 
+        self.running = True 
+        
         while self.running:
             try:
                 data = self.data_queue.get()

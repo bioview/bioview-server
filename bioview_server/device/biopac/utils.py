@@ -1,12 +1,54 @@
 import ctypes
 import os
+import wmi 
 import json
 from pathlib import Path
 
-from .constants import BIOPAC_CONNECTION_CODES
+from .constants import BIOPAC_VENDOR_ID, BIOPAC_CONNECTION_CODES
 
 from bioview_server.utils import get_cache_file
 
+def discover_devices(): 
+    # Discover BIOPAC devices connected over USB.
+    discovered_devices = []
+    
+    c = wmi.WMI()
+    try:
+        # Query USB devices from WMI
+        for device in c.Win32_PnPEntity():
+            if device.DeviceID and 'USB' in device.DeviceID:
+                vid = pid = None
+                if 'VID_' in device.DeviceID and 'PID_' in device.DeviceID:
+                    try:
+                        vid_start = device.DeviceID.find('VID_') + 4
+                        vid = device.DeviceID[vid_start:vid_start + 4]
+                        pid_start = device.DeviceID.find('PID_') + 4
+                        pid = device.DeviceID[pid_start:pid_start + 4]
+                    except:
+                        pass
+                
+                device_info = {
+                    'device_id': device.DeviceID,
+                    'name': device.Name or 'Unknown',
+                    'description': device.Description or 'Unknown',
+                    'manufacturer': device.Manufacturer or 'Unknown',
+                    'service': device.Service or 'None',
+                    'status': device.Status or 'Unknown',
+                    'present': device.Present,
+                    'vid': vid,
+                    'pid': pid
+                }
+
+                # Validate and add to list
+                if device_info['vid'] == BIOPAC_VENDOR_ID or \
+                'biopac' in device_info['manufacturer'].lower() or \
+                'biopac' in device_info['name'].lower():  
+                    discovered_devices.append(device_info)
+                    
+    except Exception as e:
+        print(f"Unable to discover BIOPAC devices: {e}")
+
+    return discovered_devices
 
 def load_mpdev_dll(custom_loc: str = None):
     dll = None

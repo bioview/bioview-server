@@ -1,3 +1,6 @@
+# Known BIOPAC USB Vendor IDs and Product IDs
+BIOPAC_VENDOR_ID = 0x097E 
+
 BIOPAC_CONNECTION_CODES = {
     1: "MPSUCCESS",
     2: "MPDRVERR",
