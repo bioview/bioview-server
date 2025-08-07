@@ -3,7 +3,7 @@ import queue
 from bioview_server.device import Device
 from bioview_server.common import SaveWorker, DisplayWorker
 
-from bioview_common import ConnectionStatus, DataSource
+from bioview_common import DeviceStatus, DataSource
 
 # Core functionality that should always be available
 from .connect import ConnectWorker
@@ -99,7 +99,7 @@ class BiopacDevice(Device):
         
         if self.handler is None:
             self.log_event("error", "No BIOPAC object found")
-            self.connection_state_changed(ConnectionStatus.DISCONNECTED)
+            self.connection_state_changed(DeviceStatus.DISCONNECTED)
             return
 
         # Start receiving
@@ -109,4 +109,4 @@ class BiopacDevice(Device):
         self.receive_worker.log_event = self.log_event
         
         # Update status bar
-        self.connection_state_changed(ConnectionStatus.CONNECTED)
+        self.connection_state_changed(DeviceStatus.CONNECTED)

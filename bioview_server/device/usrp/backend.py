@@ -6,7 +6,7 @@ from bioview_server.datatypes import Backend
 from bioview_server.common import DisplayWorker, SaveWorker
 from bioview_server.utils import emit_signal
 
-from bioview_common import ConnectionStatus
+from bioview_common import DeviceStatus
 
 from .config import USRPConfiguration
 from .process import ProcessWorker
@@ -174,7 +174,7 @@ class USRPBackend(Backend):
             
             self.usrp_configs[device_key] = USRPConfiguration.from_dict('USRPConfiguration', device_config)
             self.usrp_handlers[device_key] = None 
-            self.usrp_states[device_key] = ConnectionStatus.DISCONNECTED # TODO: Replace with new state variable
+            self.usrp_states[device_key] = DeviceStatus.DISCONNECTED
             self.transmit_workers[device_key] = None 
             self.receive_workers[device_key] = None 
         
@@ -257,7 +257,7 @@ class USRPBackend(Backend):
                 )
 
                 if response is None: 
-                    self.usrp_states[device_key] = ConnectionStatus.DISCONNECTED
+                    self.usrp_states[device_key] = DeviceStatus.DISCONNECTED
                     emit_signal(self.init_failed, f"Unable to initialize device: {e}")
                 else: 
                     # Save objects
@@ -287,9 +287,9 @@ class USRPBackend(Backend):
 
                     # TODO: Broadcast state change
                     # Save state 
-                    self.usrp_states[device_key] = ConnectionStatus.CONNECTED
+                    self.usrp_states[device_key] = DeviceStatus.CONNECTED
             except Exception as e:
-                self.usrp_states[device_key] = ConnectionStatus.DISCONNECTED
+                self.usrp_states[device_key] = DeviceStatus.DISCONNECTED
                 emit_signal(self.init_failed, f"Unable to initialize device: {e}")
 
     def start_streaming(self): 
@@ -372,9 +372,9 @@ class USRPBackend(Backend):
 
         inited = True
         for _, dev_state in self.state.items():
-            if dev_state != ConnectionStatus.CONNECTED:
+            if dev_state != DeviceStatus.CONNECTED:
                 inited = False
                 break
 
         if inited:
-            emit_signal(self.connection_state_changed, ConnectionStatus.CONNECTED)
+            emit_signal(self.connection_state_changed, DeviceStatus.CONNECTED)

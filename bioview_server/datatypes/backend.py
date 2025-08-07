@@ -1,6 +1,6 @@
 import multiprocessing as mp
 
-from bioview_common import DataSource, ConnectionStatus 
+from bioview_common import DataSource, DeviceStatus 
 
 from bioview_server.callbacks import connection_state_changed, data_ready, log_event
 
@@ -24,8 +24,8 @@ class Backend(mp.Process):
         self.command_queue = command_queue # Gets from client
         self.response_queue = response_queue # Sends to client
         
-        # State - TODO: Modify to include streaming 
-        self.state = ConnectionStatus.DISCONNECTED
+        # State 
+        self.state = DeviceStatus.NOINIT
         
         # Signals 
         self.log_event = lambda x, y: log_event(self.response_queue, x, y)
@@ -45,7 +45,10 @@ class Backend(mp.Process):
     def initialize(self, config): 
         # Basically, init the device with a config 
         self.data_sources = self.get_data_sources() 
-        self.state = ConnectionStatus.CONNECTED
+        self.state = DeviceStatus.CONNECTING
+
+        # TODO: Add code for connecting 
+        self.state = DeviceStatus.CONNECTED
 
     def get_device_param(self):
         pass 
@@ -62,7 +65,7 @@ class Backend(mp.Process):
 
     def disconnect(self):
         self.device.disconnect()
-        self.state = ConnectionStatus.DISCONNECTED
+        self.state = DeviceStatus.DISCONNECTED
     
     # Implement saving, which is usually common for all devices 
     def saving_thread(self): 

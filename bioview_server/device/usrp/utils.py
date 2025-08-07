@@ -25,14 +25,14 @@ def discover_devices():
 
     These props are wrapped into an appropriate payload
     '''
-    discovered_devices = {} 
+    discovered_devices = []
 
     try:     
         device_list = uhd.find("")
 
         for device in device_list: 
             device_dict = dict(device)
-            discovered_devices[device_dict['name']] = device_dict
+            discovered_devices.append(device_dict)
 
             # Update in cache 
             update_usrp_address(device_dict['name'], device_dict['serial'])

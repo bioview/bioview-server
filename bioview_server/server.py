@@ -16,22 +16,18 @@ import time
 from threading import Thread, Lock
 import multiprocessing as mp
 import traceback
-from enum import Enum, auto
 
 from bioview_server.datatypes import Configuration
 from bioview_server.device import AVAILABLE_BACKENDS
 
-from bioview_common import Command, Response, MAX_BUFFER_SIZE, APP_VERSION, CONTROL_PORT, DATA_PORT, get_ip, get_app_info
+from bioview_common import (
+    Command, Response, ServerStatus,
+    MAX_BUFFER_SIZE, APP_VERSION, 
+    CONTROL_PORT, DATA_PORT, 
+    get_ip, get_app_info
+)
 
 print(f'Available Backends: {list(AVAILABLE_BACKENDS.keys())}')
-
-class ServerStatus(Enum): 
-    DEFAULT = auto      # Nothing is going on
-    CLIENT_CONNECTED = auto
-    CLIENT_DISCONNECTED = auto
-    DEVICES_CONNECTED = auto
-    DEVICES_DISCONNECTED = auto 
-    STREAMING = auto
 
 class Server:
     def __init__(self, control_port=CONTROL_PORT, data_port=DATA_PORT):
