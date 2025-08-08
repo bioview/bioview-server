@@ -1,9 +1,9 @@
 # Try to load all backends and provide 
 import sys 
+from bioview_server.utils import suppress_stdout
 
 AVAILABLE_BACKENDS = {}
 
-# TODO: Suppress STDOUT
 try:
     # Ensure uhd is available
     import uhd # Crashes occur without this
@@ -15,14 +15,16 @@ try:
 except Exception as e: 
     print(f'USRP backend not available: {e}')
 
-try: 
+try:
     # Ensure platform is windows 
     if sys.platform != 'win32':
         raise OSError(f'Invalid platfrom {sys.platform}. Ensure you are using Windows')
     import biopac as biopac
+    
     # Ensure mpdev.dll exists 
-    if biopac.load_mpdev_dll() == None:
-        raise ValueError('mpdev.dll not found')
+    with suppress_stdout(): 
+        if biopac.load_mpdev_dll() == None:
+            raise ValueError('mpdev.dll not found')
     
     AVAILABLE_BACKENDS['biopac'] = biopac
 except Exception as e:  
