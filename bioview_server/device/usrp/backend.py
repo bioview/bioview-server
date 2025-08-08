@@ -166,16 +166,15 @@ class USRPBackend(Backend):
 
         # Saving parameters 
         self.save_worker = None 
-        self.save_queue = None 
+        self.save_queue = mp.Queue()
 
-        if self.save and self.save_path is not None:
-            self.save_queue = mp.Queue()
+        if self.enable_save and self.save_path is not None:
             self.save_worker = SaveWorker(
                 save_path = self.save_path,
                 data_queue = self.save_queue,
-                num_channels = len(self.data_sources)
+                num_channels = len(self.data_sources),
+                log_event = self.log_event
             )
-            self.save_worker.log_event = self.log_event
 
         # Display parameters
         self.display_worker = None 

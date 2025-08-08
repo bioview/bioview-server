@@ -100,7 +100,7 @@ def configure_biopac_device(mpdev_handler, channels, sample_rate):
         raise Exception(f"BIOPAC Channel Configuration Failed with Error Code: {result_code}")
     
     # Set sample rate 
-    result_code = mpdev_handler.setSampleRate(c_double(1/sample_rate))
+    result_code = mpdev_handler.setSampleRate(c_double(1000.0/sample_rate))
     if BIOPAC_CONNECTION_CODES.get(result_code, None)  != "MPSUCCESS":
         raise Exception(f"BIOPAC Sample Rate Configuration Failed with Error Code: {result_code}")
 

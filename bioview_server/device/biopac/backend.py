@@ -39,9 +39,20 @@ class BIOPACBackend(Backend):
         # Track mpdev.dll handler
         self.mpdev_handler = load_mpdev_dll(mpdev_path)
 
+        # Populate data sources 
+        self.populate_data_sources()
+
         # Saving parameters 
         self.save_worker = None 
         self.save_queue = mp.Queue()
+
+        if self.enable_save and self.save_path is not None:
+            self.save_worker = SaveWorker(
+                save_path = save_path,
+                data_queue = self.save_queue,
+                num_channels = len(self.data_sources),
+                log_event = self.log_event
+            )
 
         # Display parameters
         # TODO: Run this in a function which is constantly providing new data_sources
@@ -54,23 +65,7 @@ class BIOPACBackend(Backend):
         )
         self.display_worker.data_ready = self.data_ready
         self.display_worker.log_event = self.log_event
-
-        # Workers
-        self.transmit_worker = None 
-        self.receive_worker = None 
-        
-        # Save/Display Workers
-        self.num_channels = len(self.config.channels)
-        if self.save and self.save_path is not None:
-            self.save_worker = SaveWorker(
-                save_path=self.save_path,
-                data_queue=self.save_queue,
-                num_channels=self.num_channels,
-                running=True,
-            )
-            self.save_worker.log_event = self.log_event
-        else:
-            self.save_worker = None 
+    
             
 
     def _populate_data_sources(self):

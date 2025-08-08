@@ -22,12 +22,6 @@ class BiopacConfiguration(Configuration):
         # By default, we load from $PATH and $ROOT but a custom path may be provided
         self.mpdev_path = mpdev_path
 
-    def get_samp_time(self):
-        return 1000.0 / self.samp_rate
-
     def get_channels(self):
         # Since the API expects 16 channels, ensure we always pad to return in the appropriate format
         return self.channels + [0] * (16 - len(self.channels))
-
-    def get_disp_freq(self):
-        return self.samp_rate
