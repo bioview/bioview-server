@@ -1,7 +1,7 @@
 import queue
 import multiprocessing as mp
 import numpy as np
-from typing import Dict 
+from typing import Dict, Callable
 
 from bioview_common import DataSource
 from bioview_server.utils import apply_filter, get_filter, emit_signal
@@ -11,10 +11,11 @@ class DisplayWorker():
         self,
         display_ds: int, 
         display_filter: Dict, 
-        data_queue: mp.Queue,
+        data_queue: mp.Queue, # Data comes in
         cmd_queue: mp.Queue, # To handle display filter changes, for example
-        running: bool = False,
-        parent = None,
+        data_ready: Callable, # Data pushed to client
+        log_event: Callable,
+        parent = None
     ):
         super().__init__(parent)
         self.display_ds = display_ds
@@ -27,7 +28,7 @@ class DisplayWorker():
         )
 
         self.data_queue = data_queue
-        self.running = running
+        self.running = False
 
         # Define signals 
         self.data_ready = None
@@ -44,7 +45,7 @@ class DisplayWorker():
         return processed
 
     def run(self):
-        emit_signal(self.log_event, "debug", "Display started")
+        self.running = True 
 
         while self.running:
             if len(self.display_sources) == 0:

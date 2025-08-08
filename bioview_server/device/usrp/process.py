@@ -2,7 +2,9 @@ import queue
 from threading import Thread
 import numpy as np
 
-from bioview_server.utils import apply_filter, get_filter, emit_signal
+from typing import Callable
+
+from bioview_server.utils import apply_filter, get_filter
 
 class ProcessWorker(Thread):
     def __init__(
@@ -10,35 +12,36 @@ class ProcessWorker(Thread):
         samp_rate, 
         channel_ifs,
         if_filter_bw,
-        data_sources,
+        num_channels,
         rx_queues: list[queue.Queue],
         save_queue: queue.Queue,
-        disp_queue: queue.Queue,
-        save_imaginary: bool = True,
-        save_iq: bool = True, 
-        disp_imaginary: bool = False, 
-        running: bool = False
+        display_queue: queue.Queue,
+        save_imaginary: bool,
+        save_iq: bool, 
+        display_imaginary: bool, 
+        log_event: Callable
     ):
         super().__init__()
-        # Signals 
-        self.log_event = None 
         
-        self.data_sources = data_sources
+        # Signal
+        self.log_event = log_event 
+        
+        self.num_channels = num_channels
 
         # Variables 
         self.samp_rate = samp_rate 
         self.channel_ifs = channel_ifs
         self.save_imaginary = save_imaginary
         self.save_iq = save_iq
-        self.disp_imaginary = disp_imaginary
+        self.display_imaginary = display_imaginary
 
         # Queues 
         self.rx_queues = rx_queues
         self.save_queue = save_queue
-        self.disp_queue = disp_queue
+        self.display_queue = display_queue
 
         # State 
-        self.running = running
+        self.running = False
 
         # Load IF filters
         self.if_filts = [
@@ -47,7 +50,7 @@ class ProcessWorker(Thread):
         ]
 
         # Keep track of phase and filter states for all data sources
-        for source in self.data_sources:
+        for source in self.num_channels:
             source.accumulated_phase = 0.0
             source.filter_state = None
 
@@ -73,7 +76,7 @@ class ProcessWorker(Thread):
             # Check for significant discontinuity
             discontinuity = abs(data[0] - source.last_samples)
             if discontinuity > 3 * np.std(data[: min(100, len(data))]):
-                emit_signal(self.log_event, "debug", f"Potential discontinuity detected in {source.channel}")
+                self.log_event("debug", f"Potential discontinuity detected in {source.channel}")
 
         # Store last sample for next buffer
         if not hasattr(source, "last_samples"):
@@ -126,7 +129,7 @@ class ProcessWorker(Thread):
 
     def _process_save(self, buffer):
         # Use numpy preallocated array for speed
-        num_sources = len(self.data_sources)
+        num_sources = len(self.num_channels)
         len_samples = int(buffer.shape[1] // self.save_ds)
 
         # We might not always want to save imaginary components
@@ -135,7 +138,7 @@ class ProcessWorker(Thread):
         else:
             save_list = np.empty((num_sources, len_samples))
 
-        for source in self.data_sources:
+        for source in self.num_channels:
             data = buffer[source.rx_idx, :]
             first_comp, second_comp = self._process_chunk(
                 data=data,
@@ -144,7 +147,7 @@ class ProcessWorker(Thread):
                 if_freq=self.channel_ifs[source.tx_idx],
             )
 
-            emit_signal(self.log_event, "debug", f"Processed channel {source.channel}")
+            self.log_event("debug", f"Processed channel {source.channel}")
 
             if self.save_imaginary:
                 save_list[source.channel, :, 0] = first_comp
@@ -194,36 +197,36 @@ class ProcessWorker(Thread):
                 if self.save_queue is not None:
                     try:
                         self.save_queue.put(processed)
-                        emit_signal(self.log_event, "debug", "[USRP] Added to save queue")
+                        self.log_event("debug", "[USRP] Added to save queue")
                     except queue.Full:
-                        emit_signal(self.log_event, "debug", "[USRP] Save Queue Full")
+                        self.log_event("debug", "[USRP] Save Queue Full")
 
                 # Add to display queue
                 try:
                     # If we do not have an imaginary component, simply pass processed data
                     if self.save_imaginary is False:
-                        self.disp_queue.put(processed)
+                        self.display_queue.put(processed)
                     else:
                         # Depending on whether we want to display imaginary or not
-                        if self.disp_iamginary:
-                            self.disp_queue.put(processed[:, :, 1])
+                        if self.display_imaginary:
+                            self.display_queue.put(processed[:, :, 1])
                         else:
-                            self.disp_queue.put(processed[:, :, 0])
-                        emit_signal(self.log_event, "debug", "[USRP] Added to display queue")
+                            self.display_queue.put(processed[:, :, 0])
+                        self.log_event("debug", "[USRP] Added to display queue")
                 except queue.Full:
-                    emit_signal(self.log_event, "debug", "[USRP] Display Queue Full")
+                    self.log_event("debug", "[USRP] Display Queue Full")
 
             except queue.Empty:
-                emit_signal(self.log_event, "debug", "[USRP] Rx Queue Empty")
+                self.log_event("debug", "[USRP] Rx Queue Empty")
                 continue
             except queue.Full:
-                emit_signal(self.log_event, "debug", "[USRP] Rx Queue Full")
+                self.log_event("debug", "[USRP] Rx Queue Full")
                 continue
             except Exception as e:
-                emit_signal(self.log_event, "error", f"[USRP] Processing error: {e}")
+                self.log_event("error", f"[USRP] Processing error: {e}")
                 continue
 
-        emit_signal(self.log_event, "debug", "[USRP] Processing stopped")
+        self.log_event("debug", "[USRP] Processing stopped")
 
     def stop(self):
         self.running = False

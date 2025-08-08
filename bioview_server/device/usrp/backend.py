@@ -1,4 +1,5 @@
 import uhd 
+import queue 
 import multiprocessing as mp
 from typing import Dict, List
 
@@ -134,6 +135,8 @@ class USRPBackend(Backend):
         self.save_ds = save_ds
         self.save_iq = save_iq
         self.save_imaginary = save_imaginary
+        
+        self.rx_data_queue = {} # Need to keep this internal
 
         # Configuration for processing data to be displayed 
         self.display_ds = display_ds
@@ -148,8 +151,13 @@ class USRPBackend(Backend):
         self.transmit_workers = {}
         self.tx_command_queue = {}
         self.receive_workers = {} 
-        self.rx_command_queue = {}
+        self.rx_command_queue = {} # Gets decoded instructions from overall command queue
+        
 
+        # A dict of dict based access is used instead of list of dict simply because it offers
+        # a greater degree of convenience while maintaining ordering (as of Python 3.7+)
+        self.channel_ifs = []
+        self.if_filter_bw = []
 
         for device_key, device_config in devices.items():
             if not isinstance(device_config, dict):
@@ -157,19 +165,24 @@ class USRPBackend(Backend):
                     f"Expected device configuration to be a dict but got {type(device_config)} instead"
                 )
             
-            self.usrp_configs[device_key] = USRPConfiguration.from_dict('USRPConfiguration', device_config)
+            cfg = USRPConfiguration.from_dict('USRPConfiguration', device_config)
+            self.usrp_configs[device_key] = cfg
             self.usrp_handlers[device_key] = None 
             self.usrp_states[device_key] = DeviceStatus.DISCONNECTED
             self.transmit_workers[device_key] = None 
             self.receive_workers[device_key] = None 
-        
+
+            # Load channel IFs and IF_Filter_BW
+            self.channel_ifs.extend(cfg.get_param('if_freq'))
+            self.if_filter_bw.extend(cfg.get_param('if_filter_bw'))
+
         # Create data source mapping for client
         self.data_sources = []
         self.populate_data_sources()
 
         # Saving parameters 
         self.save_worker = None 
-        self.save_queue = mp.Queue()
+        self.save_queue = queue.Queue()
 
         if self.enable_save and self.save_path is not None:
             self.save_worker = SaveWorker(
@@ -179,32 +192,34 @@ class USRPBackend(Backend):
                 log_event = self.log_event
             )
 
-        # Display parameters
-        self.display_worker = None 
+        # Setup display
+        self.display_queue = queue.Queue()
         self.display_sources = display_sources
 
-        if self.display:
-            self.display_worker = DisplayWorker(
-                display_ds = display_ds,
-                display_filter = {}, 
-                data_queue = self.processed_queue, # Input data 
-                display_queue = self.display_data_queue # Processed data to display
-            )
-            self.display_worker.log_event = self.log_event
-
-        ############ REWORK ################
-        # Make workers for saving/display
-        self.process_worker = ProcessWorker(
-            config=self.config,
-            channel_ifs=self.channel_ifs,
-            if_filter_bw=self.if_filter_bw,
-            data_sources=self.data_sources,
-            rx_queues=[x.rx_queue for x in self.handler.values()],
-            save_queue=self.save_queue,
-            disp_queue=self.display_queue,
-            running=True,
+        self.display_worker = DisplayWorker(
+            display_ds = display_ds,
+            display_filter = {}, 
+            display_sources = self.display_sources,             
+            data_queue = self.display_queue, # Gets data from ProcessWorker
+            cmd_queue = self.command_queue,
+            data_ready = self.data_ready, # Puts data into shared display_data_queue
+            log_event = self.log_event,
         )
-        self.process_worker.log_event = self.log_event
+
+        # Setup processing 
+        self.process_worker = ProcessWorker(
+            samp_rate = self.samp_rate, 
+            channel_ifs = self.channel_ifs,
+            if_filter_bw = self.if_filter_bw,
+            num_channels = self.num_channels,
+            rx_queues = self.rx_data_queue,
+            save_queue = self.save_queue,
+            disp_queue = self.display_queue,
+            save_imaginary = self.save_imaginary, 
+            save_iq = self.save_iq, 
+            display_imaginary = self.display_imaginary,
+            log_event = self.log_event
+        )
 
     def initialize(self):
         if self.discovered_devices is None: 
@@ -248,18 +263,20 @@ class USRPBackend(Backend):
                     # Save objects
                     self.usrp_handlers[device_key] = response['usrp']
                     
-                    self.rx_command_queue[device_key] = mp.Queue()
+                    self.rx_data_queue[device_key] = queue.Queue()
+                    self.rx_command_queue[device_key] = queue.Queue()
+                    
                     self.receive_workers[device_key] = ReceiveWorker(
                         usrp = response['usrp'],
                         rx_gain = rx_gain,
                         rx_channels = rx_channels,
                         rx_streamer = response['rx_streamer'],
-                        rx_queue = self.save_data_queue,
-                        cmd_queue = self.rx_command_queue,
+                        rx_queue = self.rx_data_queue[device_key],
+                        cmd_queue = self.rx_command_queue[device_key],
                         log_event = self.log_event 
                     )
 
-                    self.tx_command_queue[device_key] = mp.Queue()
+                    self.tx_command_queue[device_key] = queue.Queue()
                     self.transmit_workers[device_key] = TransmitWorker(
                         usrp = response['usrp'], 
                         tx_gain = tx_gain, 
@@ -313,6 +330,7 @@ class USRPBackend(Backend):
         for worker in self.transmit_workers.values(): 
             worker.stop() 
 
+    # TODO: Fix
     def populate_data_sources(self):
         """
         We can arrange multiple USRPs in a variety of configurations, including -
@@ -356,14 +374,26 @@ class USRPBackend(Backend):
                 channel_ifs[abs_idx] = dev_cfg.if_freq[idx]
         self.channel_ifs = channel_ifs
 
-    def _on_state_update(self, device, new_state):
-        self.state[device] = new_state
+    def disconnect(self):
+        # Stop streaming 
+        self.stop_streaming() 
 
-        inited = True
-        for _, dev_state in self.state.items():
-            if dev_state != DeviceStatus.CONNECTED:
-                inited = False
-                break
+        # Disconnect
+        for device_key in self.usrp_handlers.keys():
+            # Close all object handlers 
+            self.usrp_handlers[device_key] = None 
+            self.usrp_states[device_key] = DeviceStatus.DISCONNECTED
 
-        if inited:
-            emit_signal(self.connection_state_changed, DeviceStatus.CONNECTED)
+            self.transmit_workers[device_key] = None 
+            self.receive_workers[device_key] = None 
+
+            # Close all device queues 
+            self.rx_data_queue = None 
+            self.rx_command_queue = None 
+
+            # Inform UI
+            self.status_changed(DeviceStatus.DISCONNECTED, device_key)
+        
+        # Clear common queues
+        self.display_queue.clear()
+        self.save_queue.clear()
