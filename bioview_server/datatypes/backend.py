@@ -66,7 +66,7 @@ class Backend(mp.Process):
         
         # Signals 
         self.log_event = lambda x, y: log_event(self.response_queue, x, y)
-        self.status_changed = lambda x: device_status_changed(self.response_queue, self.id, x)
+        self.status_changed = lambda x, y = None: device_status_changed(self.response_queue, group_id = self.id, status = x, device_id = y)
         self.data_ready = lambda x, y: data_ready(self.display_data_queue, x, y)     
 
         # Handle save 

@@ -24,11 +24,13 @@ def log_event(response_queue, level, message):
     except queue.Full: 
         print('Unable to add to response queue as it is full.')
 
-def device_status_changed(response_queue, device_id, status: DeviceStatus):
+def device_status_changed(response_queue, group_id: str, status: DeviceStatus, device_id: str = None):
+    # Device groups may have >=1 devices. For >1, we may pass device_id to be able to show UI updates correctly 
     response = {
         'type': Response.DEVICE_STATUS_CHANGED,
         'payload': {
-            'device_id': device_id, 
+            'group_id': group_id,
+            'device_id': device_id,  
             'status': status.value
         }
     }

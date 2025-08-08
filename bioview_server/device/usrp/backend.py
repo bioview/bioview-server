@@ -144,9 +144,12 @@ class USRPBackend(Backend):
         self.usrp_handlers = {}
         self.usrp_states = {}
 
-        # Create helper workers 
+        # Create helper workers and queues 
         self.transmit_workers = {}
+        self.tx_command_queue = {}
         self.receive_workers = {} 
+        self.rx_command_queue = {}
+
 
         for device_key, device_config in devices.items():
             if not isinstance(device_config, dict):
@@ -245,6 +248,7 @@ class USRPBackend(Backend):
                     # Save objects
                     self.usrp_handlers[device_key] = response['usrp']
                     
+                    self.rx_command_queue[device_key] = mp.Queue()
                     self.receive_workers[device_key] = ReceiveWorker(
                         usrp = response['usrp'],
                         rx_gain = rx_gain,
@@ -255,6 +259,7 @@ class USRPBackend(Backend):
                         log_event = self.log_event 
                     )
 
+                    self.tx_command_queue[device_key] = mp.Queue()
                     self.transmit_workers[device_key] = TransmitWorker(
                         usrp = response['usrp'], 
                         tx_gain = tx_gain, 
@@ -263,16 +268,18 @@ class USRPBackend(Backend):
                         samp_rate = self.samp_rate,
                         if_freq = device_config.get('if_freq'),
                         tx_streamer = response['tx_streamer'],
-                        cmd_queue = self.tx_command_queue,
+                        cmd_queue = self.tx_command_queue[device_key],
                         log_event = self.log_event 
                     ) 
 
-                    # TODO: Broadcast state change
+                    # Broadcast state change
+                    self.status_changed(DeviceStatus.CONNECTED, device_key)
+                    
                     # Save state 
                     self.usrp_states[device_key] = DeviceStatus.CONNECTED
             except Exception as e:
                 self.usrp_states[device_key] = DeviceStatus.DISCONNECTED
-                emit_signal(self.init_failed, f"Unable to initialize device: {e}")
+                self.log_event('error', f"Unable to initialize device: {e}")
 
     def start_streaming(self): 
         # Start transmit threads 
