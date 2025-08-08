@@ -3,6 +3,7 @@ import os
 import wmi 
 import json
 from pathlib import Path
+from ctypes import byref, c_double, c_int
 
 from .constants import BIOPAC_VENDOR_ID, BIOPAC_CONNECTION_CODES
 
@@ -86,6 +87,32 @@ def load_mpdev_dll(custom_loc: str = None):
 
     return None
 
+# Wrappers for BIOPAC operations 
+def connect_biopac_device(mpdev_handler, device_code: int = 103, connection_code: int = 10):
+    result_code = mpdev_handler.connectMPDev(c_int(device_code), c_int(connection_code), b"auto")
+    if BIOPAC_CONNECTION_CODES.get(result_code, None)  != "MPSUCCESS":
+        raise Exception(f"BIOPAC Connection Failed with Error Code: {result_code}")
+    
+def configure_biopac_device(mpdev_handler, channels, sample_rate):
+    # Set channels 
+    result_code = mpdev_handler.setAcqChannels(byref(channels))
+    if BIOPAC_CONNECTION_CODES.get(result_code, None)  != "MPSUCCESS":
+        raise Exception(f"BIOPAC Channel Configuration Failed with Error Code: {result_code}")
+    
+    # Set sample rate 
+    result_code = mpdev_handler.setSampleRate(c_double(1/sample_rate))
+    if BIOPAC_CONNECTION_CODES.get(result_code, None)  != "MPSUCCESS":
+        raise Exception(f"BIOPAC Sample Rate Configuration Failed with Error Code: {result_code}")
+
+def start_acquisition(mpdev_handler): 
+    result_code = mpdev_handler.startAcquisition()
+    if BIOPAC_CONNECTION_CODES.get(result_code, None)  != "MPSUCCESS":
+        raise Exception(f"BIOPAC Acquisition Start Failed with Error Code: {result_code}")
+    
+def stop_acquisition(mpdev_handler): 
+    result_code = mpdev_handler.stopAcquisition()
+    if BIOPAC_CONNECTION_CODES.get(result_code, None)  != "MPSUCCESS":
+        raise Exception(f"BIOPAC Acquisition Stopping Failed with Error Code: {result_code}")
 
 def wrap_result_code(result, stage=""):
     result_code = BIOPAC_CONNECTION_CODES.get(result, "INVALID_CODE")

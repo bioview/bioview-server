@@ -1,6 +1,5 @@
 from bioview_server.datatypes import Configuration
 
-
 class BiopacConfiguration(Configuration):
     def __init__(
         self,

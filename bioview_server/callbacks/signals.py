@@ -24,7 +24,7 @@ def log_event(response_queue, level, message):
     except queue.Full: 
         print('Unable to add to response queue as it is full.')
 
-def connection_state_changed(response_queue, device_id, status: DeviceStatus):
+def device_status_changed(response_queue, device_id, status: DeviceStatus):
     response = {
         'type': Response.DEVICE_STATUS_CHANGED,
         'payload': {

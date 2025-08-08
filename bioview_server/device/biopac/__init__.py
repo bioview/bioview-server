@@ -1,11 +1,7 @@
 from .backend import BIOPACBackend
-from .device import BIOPACDevice
-
-from .config import BiopacConfiguration
-
-
+from .utils import discover_devices
 
 __all__ = [
     "BIOPACBackend",
-    "BIOPACDevice"
+    "discover_devices"
 ]

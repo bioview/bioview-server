@@ -1,8 +1,45 @@
+'''
+A common spec shared by all device specific Backend subclasses, in order to provide
+a semblance of sanity for every future stage of the codebase. While each device 
+will have their own specific implementation, every backend is expected to provide a 
+shared set of functionality, listed below. 
+
+Queues:
+- Display Data Queue: 
+- Command Queue: 
+- Response Queue: 
+
+
+Functions: 
+1. Device Control
+- initialize()
+- start_streaming()
+- stop_streaming() 
+- disconnect()
+
+2. Parameter Handling
+- get_param()
+- set_param()
+
+
+Signals: 
+- status_changed(STATUS)
+- log_event(LOG_LEVEL, LOG_MESSAGE)
+- data_ready(DATA)
+
+
+Variables: 
+- id: str
+- status: DeviceStatus
+- display_sources: List[DataSource]
+- enable_save: bool
+- save_path: str 
+'''
+
 import multiprocessing as mp
 
 from bioview_common import DataSource, DeviceStatus 
-
-from bioview_server.callbacks import connection_state_changed, data_ready, log_event
+from bioview_server.callbacks import device_status_changed, data_ready, log_event
 
 class Backend(mp.Process):
     def __init__(
@@ -25,15 +62,12 @@ class Backend(mp.Process):
         self.response_queue = response_queue # Sends to client
         
         # State 
-        self.state = DeviceStatus.NOINIT
+        self.status = DeviceStatus.DISCONNECTED
         
         # Signals 
         self.log_event = lambda x, y: log_event(self.response_queue, x, y)
-        self.connection_state_changed = lambda x, y: connection_state_changed(self.response_queue, x, y)
+        self.status_changed = lambda x: device_status_changed(self.response_queue, self.id, x)
         self.data_ready = lambda x, y: data_ready(self.display_data_queue, x, y)     
-
-        # Handle streaming state
-        self.is_streaming = False
 
         # Handle save 
         self.enable_save = enable_save
@@ -41,52 +75,31 @@ class Backend(mp.Process):
         
     def populate_data_sources(self):
         raise NotImplementedError 
+
+    # Device Control
+    def initialize(self): 
+        raise NotImplementedError
     
-    def initialize(self, config): 
-        # Basically, init the device with a config 
-        self.data_sources = self.get_data_sources() 
-        self.state = DeviceStatus.CONNECTING
-
-        # TODO: Add code for connecting 
-        self.state = DeviceStatus.CONNECTED
-
-    def get_device_param(self):
-        pass 
-
-    def set_device_param(self): 
-        pass
-
     def start_streaming(self): 
-        self.is_streaming = True
-        pass 
+        raise NotImplementedError 
 
     def stop_streaming(self): 
-        pass 
+        raise NotImplementedError
 
     def disconnect(self):
-        self.device.disconnect()
-        self.state = DeviceStatus.DISCONNECTED
+        raise NotImplementedError
     
-    # Implement saving, which is usually common for all devices 
-    def saving_thread(self): 
-        while self.is_streaming: 
-            pass 
+    # Parameter handling 
+    def get_param(self, param, default_value):
+        try:
+            value = getattr(self, param)
+        except AttributeError:
+            value = default_value
+        return value
 
-    # Utility functions 
-
-    # def update_param(self, param, value): 
-    #     current_type = type(getattr(self, param, None))
-    #     if current_type is not None:
-    #         setattr(self, param, current_type(value))
-    #     else:
-    #         setattr(self, param, value)
-        
-    # def update_config(self, param, value):
-    #     self.config.set_param(param, value) 
-            
-    # def _on_connect_success(self):
-    #     emit_signal(self.connection_state_changed, ConnectionStatus.CONNECTED)
-
-    # def _on_connect_failure(self, msg):
-    #     emit_signal(self.log_event, "error", msg)
-    #     emit_signal(self.connection_state_changed, ConnectionStatus.DISCONNECTED)
+    def set_param(self, param, value): 
+        current_type = type(getattr(self, param, None))
+        if current_type is not None:
+            setattr(self, param, current_type(value))
+        else:
+            setattr(self, param, value)

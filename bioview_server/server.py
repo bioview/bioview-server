@@ -266,7 +266,9 @@ class Server:
         try: 
             for device_id, device_config in params.items(): 
                 config = Configuration.from_dict(device_config)
-        
+
+                # Here, we pass config to a handler which is responsible for creating the Backend object and returning to us
+                
         # TODO: These should not be part of the device handling
         # exp_config = Configuration.from_json(params['exp_config'])
         # save = params.get('save', False)

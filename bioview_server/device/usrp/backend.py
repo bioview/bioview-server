@@ -1,12 +1,12 @@
 import uhd 
 import multiprocessing as mp
-from typing import Dict
+from typing import Dict, List
 
 from bioview_server.datatypes import Backend
 from bioview_server.common import DisplayWorker, SaveWorker
 from bioview_server.utils import emit_signal
 
-from bioview_common import DeviceStatus
+from bioview_common import DeviceStatus, DataSource
 
 from .config import USRPConfiguration
 from .process import ProcessWorker
@@ -18,25 +18,6 @@ from .utils import discover_devices, setup_pps, setup_ref, check_channels, updat
 SETTLING_TIME = 0.3
 FILLING_TIME = 0.35
 SAVE_BUFFER_SIZE = 20  # This is a good balance between real time display and spikes
-
-'''
-USRPDevice is essentially a wrapper for a  USRP device group. 
-
-Inputs:
-- common_params
-- device_params
-
-# (Commonly available in device)
-- display_data_queue
-- command_queue
-- response_queue
-
-Provides: 
-- initialize()
-- start_streaming()
-- stop_streaming() 
-- disconnect()
-'''
 
 def initialize_usrp_device(
     serial, 
@@ -125,7 +106,8 @@ class USRPBackend(Backend):
         self,
         id: str,
         samp_rate: int,
-        devices: Dict, 
+        devices: Dict,
+        display_sources: List[DataSource],  
         display_data_queue: mp.Queue,
         command_queue: mp.Queue, 
         response_queue: mp.Queue, 
@@ -197,6 +179,7 @@ class USRPBackend(Backend):
 
         # Display parameters
         self.display_worker = None 
+        self.display_sources = display_sources
 
         if self.display:
             self.display_worker = DisplayWorker(
