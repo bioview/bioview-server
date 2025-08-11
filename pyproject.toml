@@ -28,4 +28,51 @@ build-backend = "poetry.core.masonry.api"
 
 [tool.poetry.group.dev.dependencies]
 pre-commit = "^4.2.0"
+ruff = "^0.12.8"
 
+[tool.ruff]
+line-length = 89
+target-version = "py38"
+extend-exclude = [
+    ".git",
+    "__pycache__",
+    "docs/source/conf.py",
+    "old",
+    "build",
+    "dist",
+    ".venv"
+]
+
+[tool.ruff.lint]
+# Enable pycodestyle (`E`) and Pyflakes (`F`) codes by default
+# Plus isort (`I`) for import sorting
+select = ["E", "W", "F", "I", "UP", "B", "SIM", "C90"]
+ignore = [
+    "E203",  # whitespace before ':'
+]
+
+# Allow fix for all enabled rules (when `--fix`) is provided
+fixable = ["ALL"]
+unfixable = []
+
+# Allow unused variables when underscore-prefixed
+dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.ruff.lint.isort]
+known-first-party = ["your_package"]  # Replace with your actual package name
+force-single-line = false
+force-sort-within-sections = false
+lines-after-imports = 2
+
+[tool.ruff.format]
+# Like Black, use double quotes for strings
+quote-style = "double"
+# Like Black, indent with spaces, rather than tabs
+indent-style = "space"
+# Like Black, respect magic trailing commas
+skip-magic-trailing-comma = false
+# Like Black, automatically detect the appropriate line ending
+line-ending = "auto"
