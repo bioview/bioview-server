@@ -203,7 +203,7 @@ class USRPBackend(Backend):
             data_queue = self.display_queue, # Gets data from ProcessWorker
             cmd_queue = self.command_queue,
             data_ready = self.data_ready, # Puts data into shared display_data_queue
-            log_event = self.log_event,
+            log_event = self.log_event
         )
 
         # Setup processing 

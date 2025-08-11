@@ -2,6 +2,7 @@ import uhd
 import queue
 from threading import Thread
 import numpy as np
+from typing import Callable, List
 
 from bioview_server.utils import emit_signal
 
@@ -12,12 +13,12 @@ class ReceiveWorker(Thread):
     def __init__(
         self,
         usrp,
-        rx_gain,
-        rx_channels,
+        rx_gain: List[float],
+        rx_channels: List[int],
         rx_streamer,
-        rx_queue,
-        cmd_queue, 
-        log_event, 
+        rx_queue: queue.Queue,
+        cmd_queue: queue.Queue, 
+        log_event: Callable, 
         running: bool = False 
     ):
         super().__init__()

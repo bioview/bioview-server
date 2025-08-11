@@ -6,7 +6,7 @@ import numpy as np
 
 from typing import Callable
 
-from bioview_server.utils import init_save_file, update_save_file, emit_signal
+from bioview_server.utils import emit_signal
 
 def init_save_file(file_path, num_channels: int, chunk_size: int = 500):
     with h5py.File(file_path, "w") as f:

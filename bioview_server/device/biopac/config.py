@@ -1,4 +1,4 @@
-from bioview_server.datatypes import Configuration
+from bioview_common import Configuration
 
 class BiopacConfiguration(Configuration):
     def __init__(

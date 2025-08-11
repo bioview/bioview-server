@@ -89,6 +89,10 @@ class Backend(mp.Process):
     def disconnect(self):
         raise NotImplementedError
     
+    # Status 
+    def get_device_status(self):
+        raise NotImplementedError
+
     # Parameter handling 
     def get_param(self, param, default_value):
         try:

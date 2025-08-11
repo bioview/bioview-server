@@ -3,6 +3,7 @@ import math
 import queue 
 from threading import Thread
 import numpy as np
+from typing import Callable, List
 
 INIT_DELAY = 0.05  # 50mS initial delay before transmit
 
@@ -12,19 +13,19 @@ class TransmitWorker(Thread):
     def __init__(
         self,
         usrp,
-        tx_gain,
-        tx_amplitude, 
-        tx_channels, 
-        samp_rate, 
-        if_freq, 
+        tx_gain: List[float],
+        tx_amplitude: List[float], 
+        tx_channels: List[int], 
+        samp_rate: int,  
+        if_freq: float, 
         tx_streamer,
-        cmd_queue, 
-        log_event, 
+        cmd_queue: queue.Queue, 
+        log_event: Callable, 
         running: bool = False
     ):
         super().__init__()
         # Signals 
-        self.log_event = None 
+        self.log_event = log_event
         
         # Modifiable params
         self.tx_gain = tx_gain

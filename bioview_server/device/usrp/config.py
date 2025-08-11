@@ -1,4 +1,4 @@
-from bioview_server.datatypes import Configuration
+from bioview_common import Configuration
 
 """
 We make some general assumptions, specifically -

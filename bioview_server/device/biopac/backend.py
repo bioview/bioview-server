@@ -65,10 +65,11 @@ class BIOPACBackend(Backend):
         )
         self.display_worker.data_ready = self.data_ready
         self.display_worker.log_event = self.log_event
-    
-            
 
-    def _populate_data_sources(self):
+        # Initialize
+        self.initialize()
+
+    def populate_data_sources(self):
         # Generate channel labels:data queue index mapping alongwith absolute channel numbers
         for idx, _ in enumerate(self.config.channels):
             label = f"Ch{idx + 1}"
