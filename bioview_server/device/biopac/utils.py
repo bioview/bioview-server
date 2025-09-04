@@ -2,6 +2,8 @@ import ctypes
 import os
 import wmi 
 import json
+import logging
+import importlib
 from pathlib import Path
 from ctypes import byref, c_double, c_int
 
@@ -12,9 +14,24 @@ from bioview_server.utils import get_cache_file
 def discover_devices(): 
     # Discover BIOPAC devices connected over USB.
     discovered_devices = []
-    
-    c = wmi.WMI()
+    coinit = False
+    pythoncom = None
     try:
+        # Try to initialise COM for this thread so WMI works when called
+        # from worker threads. If pythoncom isn't available, continue and
+        # let wmi raise a helpful error.
+        try:
+            pythoncom = importlib.import_module("pythoncom")
+            # Prefer CoInitializeEx for safety; fallback to CoInitialize
+            if hasattr(pythoncom, "CoInitializeEx"):
+                pythoncom.CoInitializeEx(0x2)  # COINIT_MULTITHREADED
+            else:
+                pythoncom.CoInitialize()
+            coinit = True
+        except Exception:
+            pythoncom = None
+
+        c = wmi.WMI()
         # Query USB devices from WMI
         for device in c.Win32_PnPEntity():
             if device.DeviceID and 'USB' in device.DeviceID:
@@ -40,14 +57,30 @@ def discover_devices():
                     'pid': pid
                 }
 
+                # Normalise VID for numeric comparison
+                vid_int = None
+                if vid is not None:
+                    try:
+                        vid_int = int(vid, 16)
+                    except Exception:
+                        vid_int = None
+
                 # Validate and add to list
-                if device_info['vid'] == BIOPAC_VENDOR_ID or \
-                'biopac' in device_info['manufacturer'].lower() or \
-                'biopac' in device_info['name'].lower():  
+                if vid_int == BIOPAC_VENDOR_ID or \
+                'biopac' in (device_info['manufacturer'] or '').lower() or \
+                'biopac' in (device_info['name'] or '').lower():  
                     discovered_devices.append(device_info)
-                    
     except Exception as e:
-        print(f"Unable to discover BIOPAC devices: {e}")
+        logging.getLogger(__name__).error("Unable to discover BIOPAC devices: %s", e)
+
+    finally:
+        # Uninitialize pythoncom if we initialized it here
+        if coinit and pythoncom is not None:
+            try:
+                if hasattr(pythoncom, "CoUninitialize"):
+                    pythoncom.CoUninitialize()
+            except Exception:
+                pass
 
     return discovered_devices
 

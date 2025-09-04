@@ -1,12 +1,6 @@
 # Try to load all backends and provide 
 import sys 
-import importlib
 from bioview_server.utils import suppress_stdout
-
-_submodules = [
-    "biopac",
-    "usrp"
-]
 
 __all__ = []
 
@@ -18,8 +12,8 @@ try:
     
     # Ensure device is importable 
     from . import usrp
-        
-    __all__.append['usrp']
+    
+    __all__.append('usrp')
     AVAILABLE_BACKENDS['usrp'] = usrp
 except Exception as e: 
     print(f'USRP backend not available: {e}')
@@ -36,7 +30,7 @@ try:
         if biopac.load_mpdev_dll() == None:
             raise ValueError('mpdev.dll not found')
     
-    __all__.append['biopac']
+    __all__.append('biopac')
     AVAILABLE_BACKENDS['biopac'] = biopac
 except Exception as e:  
     print(f'BIOPAC backend not available: {e}')
