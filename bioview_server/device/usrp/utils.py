@@ -1,48 +1,53 @@
 """
 Ref: uhd examples
 """
-import uhd 
+import json
 import time
-import json 
 from datetime import datetime, timedelta
-import numpy as np
 
+import numpy as np
+import uhd
 from bioview_common import DataSource
+
 from bioview_server.utils import get_cache_file
+
 
 CLOCK_TIMEOUT = 1000  # 1000ms timeout for external clock locking
 
-def update_device_firmware():
-    pass 
 
-def discover_devices(): 
-    '''
-    Devices discovered using uhd.find contain the following keys - 
+def update_device_firmware():
+    pass
+
+
+def discover_devices():
+    """
+    Devices discovered using uhd.find contain the following keys -
     - 'type': eg. b200
     - 'name': eg. MyB210
     - 'serial'
     - 'product': 'B210'
 
     These props are wrapped into an appropriate payload
-    '''
+    """
     discovered_devices = []
 
-    try:     
+    try:
         device_list = uhd.find("")
 
-        for device in device_list: 
+        for device in device_list:
             device_dict = dict(device)
             discovered_devices.append(device_dict)
 
-            # Update in cache 
-            update_usrp_address(device_dict['name'], device_dict['serial'])
-    except Exception as e: 
-        print(f'Error occured in UHD device discovery: {e}')
-        
+            # Update in cache
+            update_usrp_address(device_dict["name"], device_dict["serial"])
+    except Exception as e:
+        print(f"Error occured in UHD device discovery: {e}")
+
     return discovered_devices
 
+
 def _check_pairing(r_idx, t_idx, rx_cumsum, tx_cumsum, pair_list):
-    fn = lambda x, y: (np.where(x - y < 0))[0][0]
+    fn = lambda x, y: (np.where(x - y < 0))[0][0]  # noqa: E731
     rx_dev = fn(r_idx, rx_cumsum)
     tx_dev = fn(t_idx, tx_cumsum)
 
@@ -77,8 +82,8 @@ def get_channel_map(
     num_txs = tx_cumsum[-1]
 
     if balance:
-        rx_enabled = [True if r % 2 == 0 else False for r in range(2 * n_devices)]
-        tx_enabled = [True if r % 2 == 0 else False for r in range(2 * n_devices)]
+        rx_enabled = [r % 2 == 0 for r in range(2 * n_devices)]
+        tx_enabled = [r % 2 == 0 for r in range(2 * n_devices)]
     else:
         rx_enabled = [True for _ in range(num_rxs)]
         tx_enabled = [True for _ in range(num_txs)]
@@ -160,16 +165,15 @@ def setup_ref(usrp, ref, num_mboards):
 
 
 def check_channels(usrp, rx_channels, tx_channels):
-    """Check that the device has sufficient RX and TX channels available."""
-    # Check that each Rx channel specified is less than the number of total number of rx channels
-    # the device can support
+    # Check that each Rx channel specified is less than the total number
+    # of rx channels that the device can support
     dev_rx_channels = usrp.get_rx_num_channels()
     if not all(map((lambda chan: chan < dev_rx_channels), rx_channels)):
         print("Invalid RX channel(s) specified.")
         return [], []
 
-    # Check that each Tx channel specified is less than the number of total number of tx channels
-    # the device can support
+    # Check that each Tx channel specified is less than the total number
+    # of tx channels that the device can support
     dev_tx_channels = usrp.get_tx_num_channels()
     if not all(map((lambda chan: chan < dev_tx_channels), tx_channels)):
         print("Invalid TX channel(s) specified.")
@@ -177,14 +181,15 @@ def check_channels(usrp, rx_channels, tx_channels):
 
     return rx_channels, tx_channels
 
+
 def get_usrp_address(device_name: str):
     cache_file = get_cache_file("usrp_serial_numbers")
     map_dict = {}
 
     try:
-        with open(cache_file, "r") as fobj:
+        with open(cache_file) as fobj:
             map_dict = json.load(fobj)
-    except Exception as e:
+    except Exception:
         print("Cache is empty")
         return None
 
@@ -196,9 +201,9 @@ def update_usrp_address(device_name: str, device_serial: str):
     map_dict = {}
 
     try:
-        with open(cache_file, "r") as fobj:
+        with open(cache_file) as fobj:
             map_dict = json.load(fobj)
-    except Exception as e:
+    except Exception:
         print("Cache does not exist currently. Creating new cache file.")
 
     map_dict[device_name] = device_serial

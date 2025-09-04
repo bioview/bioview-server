@@ -1,32 +1,35 @@
-import uhd 
 import math
-import queue 
+import queue
 from threading import Thread
-import numpy as np
 from typing import Callable, List
+
+import numpy as np
+import uhd
+
+from bioview_server.utils import emit_signal
+
 
 INIT_DELAY = 0.05  # 50mS initial delay before transmit
 
-from bioview_server.utils import emit_signal
 
 class TransmitWorker(Thread):
     def __init__(
         self,
         usrp,
         tx_gain: List[float],
-        tx_amplitude: List[float], 
-        tx_channels: List[int], 
-        samp_rate: int,  
-        if_freq: float, 
+        tx_amplitude: List[float],
+        tx_channels: List[int],
+        samp_rate: int,
+        if_freq: float,
         tx_streamer,
-        cmd_queue: queue.Queue, 
-        log_event: Callable, 
-        running: bool = False
+        cmd_queue: queue.Queue,
+        log_event: Callable,
+        running: bool = False,
     ):
         super().__init__()
-        # Signals 
+        # Signals
         self.log_event = log_event
-        
+
         # Modifiable params
         self.tx_gain = tx_gain
         self.tx_amplitude = tx_amplitude
@@ -53,8 +56,9 @@ class TransmitWorker(Thread):
 
     def _generate_tx_waveforms(self):
         """
-        Generate sine waves for each Tx channel, using as minimum a buffer size as possible.
-        The buffer is made larger in length to be able to read circularly without causing overflow issues
+        Generate sine waves for each Tx channel, using as minimum a buffer size
+        as possible. The buffer is made larger in length to be able to read
+        circularly without causing overflow issues.
         """
 
         if len(self.if_freq) == 1:
@@ -67,9 +71,7 @@ class TransmitWorker(Thread):
 
         len_buf = 20 * self.tx_waveform_size
 
-        self.tx_waveform = np.zeros(
-            (len(self.tx_channels), len_buf), dtype=np.complex64
-        )
+        self.tx_waveform = np.zeros((len(self.tx_channels), len_buf), dtype=np.complex64)
 
         # Generate IQ Modulated IF signals
         for idx, _ in enumerate(self.tx_channels):
@@ -95,33 +97,43 @@ class TransmitWorker(Thread):
 
         while self.running:
             # Check for updated parameters
-            try: 
+            try:
                 current_command = self.cmd_queue.pop()
-                
-                # Command here will just tell adjustable params and will make changes 
-                param = current_command['param']
-                val = current_command['value']
-                
-                if param == 'tx_gain': 
+
+                # Command here will just tell adjustable params and will make changes
+                param = current_command["param"]
+                val = current_command["value"]
+
+                if param == "tx_gain":
                     if val != self.tx_gain:
                         for chan in self.tx_channels:
                             self.usrp.set_tx_gain(val[chan], chan)
-                    
-                    emit_signal(self.log_event, "debug", f"Tx gain updated to {val}. Current {self.tx_gain}")
+
+                    emit_signal(
+                        self.log_event,
+                        "debug",
+                        f"Tx gain updated to {val}. Current {self.tx_gain}",
+                    )
                     self.tx_gain = val
-                elif param == 'tx_amplitude': 
-                    curr_tx_amplitude = self.tx_amplitude       
-                    if val != curr_tx_amplitude: 
-                        for idx in range(len(self.tx_channels)): 
-                            self.tx_waveform[idx] = self.tx_waveform[idx] * val / curr_tx_amplitude[idx]
-                    
-                    emit_signal(self.log_event, "debug", f"Tx amplitude updated to {val}. Current {self.tx_amplitude}")
-                    self.tx_amplitude = val 
-                # NOTE: Any other modifiable parameters may be added here 
-                else: 
-                    pass              
-            except queue.Empty: 
-                pass 
+                elif param == "tx_amplitude":
+                    curr_tx_amplitude = self.tx_amplitude
+                    if val != curr_tx_amplitude:
+                        for idx in range(len(self.tx_channels)):
+                            self.tx_waveform[idx] = (
+                                self.tx_waveform[idx] * val / curr_tx_amplitude[idx]
+                            )
+
+                    emit_signal(
+                        self.log_event,
+                        "debug",
+                        f"Tx amplitude updated to {val}. Current {self.tx_amplitude}",
+                    )
+                    self.tx_amplitude = val
+                # NOTE: Any other modifiable parameters may be added here
+                else:
+                    pass
+            except queue.Empty:
+                pass
 
             try:
                 # Send samples
@@ -136,7 +148,9 @@ class TransmitWorker(Thread):
             tx_metadata.has_time_spec = False
 
             if num_samps < self.tx_buffer_size:
-                emit_signal(self.log_event, "warning", f"Tx Sent only {num_samps} samples")
+                emit_signal(
+                    self.log_event, "warning", f"Tx Sent only {num_samps} samples"
+                )
 
         # End transmission
         tx_metadata.end_of_burst = True

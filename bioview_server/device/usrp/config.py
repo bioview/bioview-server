@@ -1,5 +1,6 @@
 from bioview_common import Configuration
 
+
 """
 We make some general assumptions, specifically -
 * Each device has two working channels
@@ -22,6 +23,7 @@ BASE_USRP_CONFIG = {
     "save_ds": 100,
     "disp_ds": 10,
 }
+
 
 class USRPConfiguration(Configuration):
     def __init__(
@@ -70,9 +72,7 @@ class USRPConfiguration(Configuration):
         self.absolute_channel_nums = self.tx_channels
 
     def get_filter_bw(self):
-        if not (
-            isinstance(self.if_filter_bw, list) or isinstance(self.if_filter_bw, tuple)
-        ):
+        if not isinstance(self.if_filter_bw, (list, tuple)):
             return [self.if_filter_bw for _ in self.tx_channels]
         elif len(self.if_filter_bw) == len(self.tx_channels):
             return self.if_filter_bw

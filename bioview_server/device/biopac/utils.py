@@ -1,17 +1,21 @@
+import contextlib
 import ctypes
-import os
-import wmi 
 import json
+import os 
 import logging
 import importlib
 from pathlib import Path
 from ctypes import byref, c_double, c_int
+from pathlib import Path
 
-from .constants import BIOPAC_VENDOR_ID, BIOPAC_CONNECTION_CODES
+import wmi
 
 from bioview_server.utils import get_cache_file
 
-def discover_devices(): 
+from .constants import BIOPAC_CONNECTION_CODES, BIOPAC_VENDOR_ID
+
+
+def discover_devices():
     # Discover BIOPAC devices connected over USB.
     discovered_devices = []
     coinit = False
@@ -34,27 +38,25 @@ def discover_devices():
         c = wmi.WMI()
         # Query USB devices from WMI
         for device in c.Win32_PnPEntity():
-            if device.DeviceID and 'USB' in device.DeviceID:
+            if device.DeviceID and "USB" in device.DeviceID:
                 vid = pid = None
-                if 'VID_' in device.DeviceID and 'PID_' in device.DeviceID:
-                    try:
-                        vid_start = device.DeviceID.find('VID_') + 4
-                        vid = device.DeviceID[vid_start:vid_start + 4]
-                        pid_start = device.DeviceID.find('PID_') + 4
-                        pid = device.DeviceID[pid_start:pid_start + 4]
-                    except:
-                        pass
-                
+                if "VID_" in device.DeviceID and "PID_" in device.DeviceID:
+                    with contextlib.suppress(Exception):
+                        vid_start = device.DeviceID.find("VID_") + 4
+                        vid = device.DeviceID[vid_start : vid_start + 4]
+                        pid_start = device.DeviceID.find("PID_") + 4
+                        pid = device.DeviceID[pid_start : pid_start + 4]
+
                 device_info = {
-                    'device_id': device.DeviceID,
-                    'name': device.Name or 'Unknown',
-                    'description': device.Description or 'Unknown',
-                    'manufacturer': device.Manufacturer or 'Unknown',
-                    'service': device.Service or 'None',
-                    'status': device.Status or 'Unknown',
-                    'present': device.Present,
-                    'vid': vid,
-                    'pid': pid
+                    "device_id": device.DeviceID,
+                    "name": device.Name or "Unknown",
+                    "description": device.Description or "Unknown",
+                    "manufacturer": device.Manufacturer or "Unknown",
+                    "service": device.Service or "None",
+                    "status": device.Status or "Unknown",
+                    "present": device.Present,
+                    "vid": vid,
+                    "pid": pid,
                 }
 
                 # Normalise VID for numeric comparison
@@ -83,6 +85,7 @@ def discover_devices():
                 pass
 
     return discovered_devices
+
 
 def load_mpdev_dll(custom_loc: str = None):
     dll = None
@@ -120,32 +123,49 @@ def load_mpdev_dll(custom_loc: str = None):
 
     return None
 
-# Wrappers for BIOPAC operations 
-def connect_biopac_device(mpdev_handler, device_code: int = 103, connection_code: int = 10):
-    result_code = mpdev_handler.connectMPDev(c_int(device_code), c_int(connection_code), b"auto")
-    if BIOPAC_CONNECTION_CODES.get(result_code, None)  != "MPSUCCESS":
-        raise Exception(f"BIOPAC Connection Failed with Error Code: {result_code}")
-    
-def configure_biopac_device(mpdev_handler, channels, sample_rate):
-    # Set channels 
-    result_code = mpdev_handler.setAcqChannels(byref(channels))
-    if BIOPAC_CONNECTION_CODES.get(result_code, None)  != "MPSUCCESS":
-        raise Exception(f"BIOPAC Channel Configuration Failed with Error Code: {result_code}")
-    
-    # Set sample rate 
-    result_code = mpdev_handler.setSampleRate(c_double(1000.0/sample_rate))
-    if BIOPAC_CONNECTION_CODES.get(result_code, None)  != "MPSUCCESS":
-        raise Exception(f"BIOPAC Sample Rate Configuration Failed with Error Code: {result_code}")
 
-def start_acquisition(mpdev_handler): 
+# Wrappers for BIOPAC operations
+def connect_biopac_device(
+    mpdev_handler, device_code: int = 103, connection_code: int = 10
+):
+    result_code = mpdev_handler.connectMPDev(
+        c_int(device_code), c_int(connection_code), b"auto"
+    )
+    if BIOPAC_CONNECTION_CODES.get(result_code, None) != "MPSUCCESS":
+        raise Exception(f"BIOPAC Connection Failed with Error Code: {result_code}")
+
+
+def configure_biopac_device(mpdev_handler, channels, sample_rate):
+    # Set channels
+    result_code = mpdev_handler.setAcqChannels(byref(channels))
+    if BIOPAC_CONNECTION_CODES.get(result_code, None) != "MPSUCCESS":
+        raise Exception(
+            f"BIOPAC Channel Configuration Failed with Error Code: {result_code}"
+        )
+
+    # Set sample rate
+    result_code = mpdev_handler.setSampleRate(c_double(1000.0 / sample_rate))
+    if BIOPAC_CONNECTION_CODES.get(result_code, None) != "MPSUCCESS":
+        raise Exception(
+            f"BIOPAC Sample Rate Configuration Failed with Error Code: {result_code}"
+        )
+
+
+def start_acquisition(mpdev_handler):
     result_code = mpdev_handler.startAcquisition()
-    if BIOPAC_CONNECTION_CODES.get(result_code, None)  != "MPSUCCESS":
-        raise Exception(f"BIOPAC Acquisition Start Failed with Error Code: {result_code}")
-    
-def stop_acquisition(mpdev_handler): 
+    if BIOPAC_CONNECTION_CODES.get(result_code, None) != "MPSUCCESS":
+        raise Exception(
+            f"BIOPAC Acquisition Start Failed with Error Code: {result_code}"
+        )
+
+
+def stop_acquisition(mpdev_handler):
     result_code = mpdev_handler.stopAcquisition()
-    if BIOPAC_CONNECTION_CODES.get(result_code, None)  != "MPSUCCESS":
-        raise Exception(f"BIOPAC Acquisition Stopping Failed with Error Code: {result_code}")
+    if BIOPAC_CONNECTION_CODES.get(result_code, None) != "MPSUCCESS":
+        raise Exception(
+            f"BIOPAC Acquisition Stopping Failed with Error Code: {result_code}"
+        )
+
 
 def wrap_result_code(result, stage=""):
     result_code = BIOPAC_CONNECTION_CODES.get(result, "INVALID_CODE")
@@ -154,13 +174,14 @@ def wrap_result_code(result, stage=""):
     else:
         raise Exception(f"{stage} Failure - {result_code}")
 
+
 def get_mpdev_path():
     cache_file = get_cache_file("mpdev_path")
 
     try:
-        with open(cache_file, "r") as fobj:
+        with open(cache_file) as fobj:
             dll_path = json.load(fobj)
-    except Exception as e:
+    except Exception:
         print("mpdev path is not cached")
         return None
 
@@ -171,9 +192,9 @@ def update_mpdev_path(dll_path):
     cache_file = get_cache_file("mpdev_path")
 
     try:
-        with open(cache_file, "r") as fobj:
+        with open(cache_file) as fobj:
             dll_path = json.load(fobj)
-    except Exception as e:
+    except Exception:
         print("mpdev path is not cached currently. Storing in cache.")
 
     # Update

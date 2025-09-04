@@ -1,5 +1,6 @@
 from pathlib import Path
 
+
 def get_cache_file(file_name):
     cache_file = Path.home() / ".bioview" / file_name
 
@@ -8,6 +9,7 @@ def get_cache_file(file_name):
         cache_file.touch()
 
     return cache_file
+
 
 # TODO: Deprecated
 def get_unique_path(dirname, filename):

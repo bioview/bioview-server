@@ -1,9 +1,10 @@
 import numpy as np
 from scipy import signal
 
+
 """
-Filtering is done similar to our LabView implementation, 
-using cascaded sections of low-order Butterworth filter. 
+Filtering is done similar to our LabView implementation,
+using cascaded sections of low-order Butterworth filter.
 """
 
 

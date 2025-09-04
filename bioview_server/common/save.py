@@ -1,12 +1,12 @@
-import queue
 import multiprocessing as mp
+import queue
+from typing import Callable
 
 import h5py
 import numpy as np
 
-from typing import Callable
-
 from bioview_server.utils import emit_signal
+
 
 def init_save_file(file_path, num_channels: int, chunk_size: int = 500):
     with h5py.File(file_path, "w") as f:
@@ -17,6 +17,7 @@ def init_save_file(file_path, num_channels: int, chunk_size: int = 500):
             dtype="float64",
             chunks=(num_channels, chunk_size),
         )
+
 
 def update_save_file(file_path, chunk):
     save_chunk = np.vstack(
@@ -33,17 +34,17 @@ def update_save_file(file_path, chunk):
 
 class SaveWorker:
     def __init__(
-        self, 
-        save_path, 
-        data_queue: mp.Queue, 
-        num_channels: int, 
-        log_event: Callable = None, 
-        parent = None
+        self,
+        save_path,
+        data_queue: mp.Queue,
+        num_channels: int,
+        log_event: Callable = None,
+        parent=None,
     ):
         super().__init__(parent)
-        # Signals 
-        self.log_event = None 
-        
+        # Signals
+        self.log_event = None
+
         # Variables
         self.running = False
 
@@ -58,8 +59,8 @@ class SaveWorker:
         if self.data_queue is None:
             return
 
-        self.running = True 
-        
+        self.running = True
+
         while self.running:
             try:
                 data = self.data_queue.get()
