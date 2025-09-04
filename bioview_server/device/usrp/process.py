@@ -1,15 +1,16 @@
 import queue
 from threading import Thread
-import numpy as np
-
 from typing import Callable
 
+import numpy as np
+
 from bioview_server.utils import apply_filter, get_filter
+
 
 class ProcessWorker(Thread):
     def __init__(
         self,
-        samp_rate, 
+        samp_rate,
         channel_ifs,
         if_filter_bw,
         num_channels,
@@ -17,30 +18,30 @@ class ProcessWorker(Thread):
         save_queue: queue.Queue,
         display_queue: queue.Queue,
         save_imaginary: bool,
-        save_iq: bool, 
-        display_imaginary: bool, 
-        log_event: Callable
+        save_iq: bool,
+        display_imaginary: bool,
+        log_event: Callable,
     ):
         super().__init__()
-        
+
         # Signal
-        self.log_event = log_event 
-        
+        self.log_event = log_event
+
         self.num_channels = num_channels
 
-        # Variables 
-        self.samp_rate = samp_rate 
+        # Variables
+        self.samp_rate = samp_rate
         self.channel_ifs = channel_ifs
         self.save_imaginary = save_imaginary
         self.save_iq = save_iq
         self.display_imaginary = display_imaginary
 
-        # Queues 
+        # Queues
         self.rx_queues = rx_queues
         self.save_queue = save_queue
         self.display_queue = display_queue
 
-        # State 
+        # State
         self.running = False
 
         # Load IF filters
@@ -76,7 +77,9 @@ class ProcessWorker(Thread):
             # Check for significant discontinuity
             discontinuity = abs(data[0] - source.last_samples)
             if discontinuity > 3 * np.std(data[: min(100, len(data))]):
-                self.log_event("debug", f"Potential discontinuity detected in {source.channel}")
+                self.log_event(
+                    "debug", f"Potential discontinuity detected in {source.channel}"
+                )
 
         # Store last sample for next buffer
         if not hasattr(source, "last_samples"):
@@ -84,9 +87,7 @@ class ProcessWorker(Thread):
 
         # Stateful filtering
         current_filter_state = source.filter_state
-        filt_data, new_filter_state = apply_filter(
-            data, filter, zi=current_filter_state
-        )
+        filt_data, new_filter_state = apply_filter(data, filter, zi=current_filter_state)
         source.filter_state = new_filter_state
 
         # Get the current accumulated phase for this channel
@@ -203,7 +204,7 @@ class ProcessWorker(Thread):
 
                 # Add to display queue
                 try:
-                    # If we do not have an imaginary component, simply pass processed data
+                    # If we do not save imaginary components, pass processed data
                     if self.save_imaginary is False:
                         self.display_queue.put(processed)
                     else:

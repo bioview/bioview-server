@@ -1,6 +1,7 @@
-import os 
-import sys
 import contextlib
+import os
+import sys
+
 
 @contextlib.contextmanager
 def suppress_stdout():

@@ -1,13 +1,17 @@
-import uhd
 import queue
 from threading import Thread
-import numpy as np
 from typing import Callable, List
+
+import numpy as np
+import uhd
 
 from bioview_server.utils import emit_signal
 
+
 INIT_DELAY = 0.05  # 50mS initial delay before transmit
-SAVE_BUFFER_SIZE = 20  # This is a good balance between real time display and spikes
+# This is a good balance between real time display and spikes
+SAVE_BUFFER_SIZE = 20
+
 
 class ReceiveWorker(Thread):
     def __init__(
@@ -17,14 +21,14 @@ class ReceiveWorker(Thread):
         rx_channels: List[int],
         rx_streamer,
         rx_queue: queue.Queue,
-        cmd_queue: queue.Queue, 
-        log_event: Callable, 
-        running: bool = False 
+        cmd_queue: queue.Queue,
+        log_event: Callable,
+        running: bool = False,
     ):
         super().__init__()
-        # Signals 
-        self.log_event = log_event 
-        
+        # Signals
+        self.log_event = log_event
+
         # Modifiable params
         self.rx_gain = rx_gain
         self.rx_channels = rx_channels
@@ -32,14 +36,14 @@ class ReceiveWorker(Thread):
         # Device params
         self.usrp = usrp
         self.rx_streamer = rx_streamer
-        self.rx_queue = rx_queue # Data
-        self.cmd_queue = cmd_queue # Commands (such as gain change)
+        self.rx_queue = rx_queue  # Data
+        self.cmd_queue = cmd_queue  # Commands (such as gain change)
 
         self.running = running
 
     def run(self):
-        self.running = True 
-        
+        self.running = True
+
         emit_signal(self.log_event, "debug", "Receiving Started")
         if self.usrp is None or self.rx_streamer is None:
             emit_signal(self.log_event, "error", "USRP or Rx streamer not initialized.")
@@ -51,7 +55,8 @@ class ReceiveWorker(Thread):
         num_channels = self.rx_streamer.get_num_channels()
         max_samps_per_packet = self.rx_streamer.get_max_num_samps()
 
-        # Make receive buffer larger than max_samps_per_packet. This adds a latency of recv_buffer_size / sample_rate (in seconds)
+        # Make receive buffer larger than max_samps_per_packet.
+        # This adds a latency of recv_buffer_size / sample_rate (in seconds)
         recv_buffer_size = max_samps_per_packet * SAVE_BUFFER_SIZE
 
         recv_buffer = np.empty((num_channels, recv_buffer_size), dtype=np.complex64)
@@ -59,7 +64,8 @@ class ReceiveWorker(Thread):
         # Setup streaming using continuous saving mode by default
         stream_cmd = uhd.types.StreamCMD(uhd.types.StreamMode.start_cont)
 
-        # When using multiple devices, we need to set stream_now to False to align time edges of packets
+        # When using multiple devices, we need to set stream_now to False
+        # to align time edges of packets
         stream_cmd.stream_now = False
         stream_cmd.time_spec = uhd.types.TimeSpec(
             self.usrp.get_time_now().get_real_secs() + INIT_DELAY
@@ -80,26 +86,30 @@ class ReceiveWorker(Thread):
 
         while self.running:
             # Check for updated parameters
-            try: 
+            try:
                 current_command = self.cmd_queue.pop()
-                
-                # Command here will just tell adjustable params and will make changes 
-                param = current_command['param']
-                val = current_command['value']
-                
-                if param == 'rx_gain': 
+
+                # Make changes to adjustable params
+                param = current_command["param"]
+                val = current_command["value"]
+
+                if param == "rx_gain":
                     if val != self.rx_gain:
                         for chan in self.rx_channels:
                             self.usrp.set_rx_gain(val[chan], chan)
-                    
-                    emit_signal(self.log_event, "debug", f"Rx gain updated to {val}. Current {self.rx_gain}")
+
+                    emit_signal(
+                        self.log_event,
+                        "debug",
+                        f"Rx gain updated to {val}. Current {self.rx_gain}",
+                    )
                     self.rx_gain = val
-                # NOTE: Any other modifiable parameters may be added here 
-                else: 
-                    pass 
-                    
-            except queue.Empty: 
-                pass 
+                # NOTE: Any other modifiable parameters may be added here
+                else:
+                    pass
+
+            except queue.Empty:
+                pass
 
             try:
                 # Receive samples
@@ -128,19 +138,36 @@ class ReceiveWorker(Thread):
                     rx_metadata.time_spec.get_full_secs(),
                     rx_metadata.time_spec.get_frac_secs(),
                 )
-                emit_signal(self.log_event, "warning", f"Receiver Overflow: {rx_metadata.strerror()}")
+                emit_signal(
+                    self.log_event,
+                    "warning",
+                    f"Receiver Overflow: {rx_metadata.strerror()}",
+                )
             elif rx_metadata.error_code == uhd.types.RXMetadataErrorCode.late:
-                emit_signal(self.log_event, "warning", f"Receiver Late: {rx_metadata.strerror()}, restarting...")
-                # Radio core will be in the idle state. Issue stream command to restart streaming.
+                emit_signal(
+                    self.log_event,
+                    "warning",
+                    f"Receiver Late: {rx_metadata.strerror()}, restarting...",
+                )
+                # Radio core will be in the idle state.
+                # Issue stream command to restart streaming.
                 stream_cmd.time_spec = uhd.types.TimeSpec(
                     self.usrp.get_time_now().get_real_secs() + INIT_DELAY
                 )
                 stream_cmd.stream_now = num_channels == 1
                 self.rx_streamer.issue_stream_cmd(stream_cmd)
             elif rx_metadata.error_code == uhd.types.RXMetadataErrorCode.timeout:
-                emit_signal(self.log_event, "warning", f"Receiver Timeout: {rx_metadata.strerror()}")
+                emit_signal(
+                    self.log_event,
+                    "warning",
+                    f"Receiver Timeout: {rx_metadata.strerror()}",
+                )
             else:
-                emit_signal(self.log_event, "warning", f"Receiver Error: {rx_metadata.strerror()}")
+                emit_signal(
+                    self.log_event,
+                    "warning",
+                    f"Receiver Error: {rx_metadata.strerror()}",
+                )
 
             total_samps_received += num_rx_samps
 

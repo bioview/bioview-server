@@ -1,5 +1,6 @@
 from bioview_common import Configuration
 
+
 class BiopacConfiguration(Configuration):
     def __init__(
         self,
@@ -23,5 +24,6 @@ class BiopacConfiguration(Configuration):
         self.mpdev_path = mpdev_path
 
     def get_channels(self):
-        # Since the API expects 16 channels, ensure we always pad to return in the appropriate format
+        # Since the API expects 16 channels, ensure we always pad
+        # to return in the appropriate format
         return self.channels + [0] * (16 - len(self.channels))

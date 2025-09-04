@@ -628,7 +628,9 @@ class Server:
         dispatch_map = {
             Command.PING_SERVER.value: lambda: self.handle_ping(),
             Command.CONNECT_SERVER.value: lambda: self.handle_connect_to_client(payload),
-            Command.DISCOVER_DEVICES.value: lambda: self.handle_discover_devices(),
+            Command.DISCOVER_DEVICES.value: lambda: self.handle_discover_devices(
+                payload
+            ),
             Command.DISCONNECT_SERVER.value: (
                 lambda: self.handle_disconnect_from_client()
             ),
@@ -682,13 +684,23 @@ class Server:
         # save = params.get('save', False)
         pass
 
-    def handle_discover_devices(self):
-        # Call device.discover for all device backends
-        # Returns a list of devices along with handler objects (minimal init?)
+    def handle_discover_devices(self, requested: Dict = None):
+        """Discover devices and report which requested devices are present.
+
+        If `requested` is None, performs a full discovery and returns the
+        discovered devices per backend. If `requested` is provided as a mapping
+        of group_id -> Configuration (or dict describing devices), this will
+        return a per-group mapping of requested device_id -> found(boolean).
+        """
         logger.info("Starting device discovery")
 
         try:
-            for backend_type, backend_handler in AVAILABLE_BACKENDS.items():
+            # Populate discovered_devices from backends. Import device module at
+            # runtime so tests can monkeypatch AVAILABLE_BACKENDS on the module.
+            from bioview_server import device as _device
+
+            for backend_type, backend_handler in _device.AVAILABLE_BACKENDS.items():
+                # backend_handler.discover_devices() should return a list of dicts
                 self.discovered_devices[
                     backend_type
                 ] = backend_handler.discover_devices()
@@ -699,14 +711,79 @@ class Server:
                 "payload": {"message": f"Device discovery failed: {e}"},
             }
 
-        logger.info("Device discovery completed successfully")
-        return {
-            "type": Response.SUCCESS.value,
-            "payload": {
-                "message": f"Found {len(self.discovered_devices)} devices",
-                "devices": self.discovered_devices,
-            },
-        }
+        # If no specific request, return full discovery results
+        if not requested:
+            logger.info("Device discovery completed successfully")
+            num_devices = sum(len(v) for v in self.discovered_devices.values())
+            return {
+                "type": Response.SUCCESS.value,
+                "payload": {
+                    "message": f"Found {num_devices} devices",
+                    "devices": self.discovered_devices,
+                },
+            }
+
+        # Match requested device groups to discovered devices
+        try:
+            matched = self._match_requested_to_discovered(requested)
+            return {"type": Response.SUCCESS.value, "payload": {"devices": matched}}
+        except Exception as e:
+            logger.exception("Device matching failed")
+            return {
+                "type": Response.ERROR.value,
+                "payload": {"message": f"Device matching failed: {e}"},
+            }
+
+    def _match_requested_to_discovered(self, requested: Dict) -> Dict:
+        """Given a requested mapping of group_id -> device configs, return a
+        mapping group_id -> {device_id: True/False} indicating presence.
+
+        We assume requested is a dict where top-level keys are group_ids and
+        values are dicts mapping device_id -> Configuration-like dict.
+        Matching is performed by inspecting discovered devices for the
+        backend_type present in the configuration (Configuration.get_param)
+        and comparing device_id to discovered 'device_id' fields.
+        """
+        results = {}
+
+        for group_id, group_conf in requested.items():
+            results[group_id] = {}
+
+            # group_conf is expected to be a dict of device_id -> config
+            for device_id, conf in (
+                group_conf.items() if isinstance(group_conf, dict) else []
+            ):
+                # extract backend_type from provided configuration
+                backend_type = None
+                try:
+                    # allow Configuration-like objects with get_param
+                    backend_type = conf.get_param("backend_type")
+                except Exception:
+                    # fallback to dict-style
+                    backend_type = (
+                        conf.get("backend_type") if isinstance(conf, dict) else None
+                    )
+
+                found = False
+                # If backend_type provided, only check that backend; otherwise
+                # check across all backends (fallback)
+                backends_to_check = (
+                    [backend_type]
+                    if backend_type and backend_type in self.discovered_devices
+                    else list(self.discovered_devices.keys())
+                )
+                for b in backends_to_check:
+                    for dev in self.discovered_devices.get(b, []):
+                        # compare by device_id key on discovered device
+                        if str(dev.get("device_id")) == str(device_id):
+                            found = True
+                            break
+                    if found:
+                        break
+
+                results[group_id][device_id] = found
+
+        return results
 
     def handle_disconnect_from_client(self):
         # Disconnect clients from servers

@@ -1,59 +1,62 @@
 import queue
-import numpy as np
-from typing import List, Dict, Callable
+from typing import Callable, Dict, List
 
+import numpy as np
 from bioview_common import DataSource
-from bioview_server.utils import apply_filter, get_filter, emit_signal
+
+from bioview_server.utils import apply_filter, emit_signal, get_filter
+
 
 MODIFIABLE_PARAMS = [
-    'display_ds',
-    'display_filter_type',
-    'display_filter_f_low',
-    'display_filter_f_high'
+    "display_ds",
+    "display_filter_type",
+    "display_filter_f_low",
+    "display_filter_f_high",
 ]
 
-class DisplayWorker():
+
+class DisplayWorker:
     def __init__(
         self,
-        samp_rate: int, 
-        display_ds: int, 
-        display_filter: Dict, 
+        samp_rate: int,
+        display_ds: int,
+        display_filter: Dict,
         display_sources: List[DataSource],
-        data_queue: queue.Queue, # Data comes in
-        cmd_queue: queue.Queue, # To handle display filter changes, for example
-        data_ready: Callable, # Data pushed to client
+        data_queue: queue.Queue,  # Data comes in
+        cmd_queue: queue.Queue,  # To handle display filter changes, for example
+        data_ready: Callable,  # Data pushed to client
         log_event: Callable,
-        parent = None
+        parent=None,
     ):
         super().__init__(parent)
-        # Sources 
+        # Sources
         self.display_sources = display_sources
 
-        # Processing 
+        # Processing
         self.display_ds = display_ds
-        
+
         self.display_filter = get_filter(
-            bounds = display_filter['bounds'],
-            samp_rate = samp_rate,
-            btype = display_filter['btype'],
-            ftype = display_filter['ftype'],
+            bounds=display_filter["bounds"],
+            samp_rate=samp_rate,
+            btype=display_filter["btype"],
+            ftype=display_filter["ftype"],
         )
-        
-        # Queues 
+
+        # Queues
         self.data_queue = data_queue
         self.cmd_queue = cmd_queue
 
-        # State 
+        # State
         self.running = False
-        
-        # Signals 
+
+        # Signals
         self.data_ready = data_ready
         self.log_event = log_event
-        
+
     def process(self, data):
         # Downsample
         # NOTE: This may be replaced by scipy.decimate()
-        processed = data[:: self.display_ds] 
+        processed = data[:: self.display_ds]
 
         # Filter
         if self.display_filter is not None:
@@ -61,18 +64,20 @@ class DisplayWorker():
         return processed
 
     def run(self):
-        self.running = True 
+        self.running = True
 
         while self.running:
             # Get command from cmd queue
-            try: 
+            try:
                 current_command = self.cmd_queue.get()
-                if current_command['param'] == 'filter_type': 
-                    pass 
-                elif current_command['param'] == '':
-                    pass 
-            except queue.Empty: 
-                pass 
+                if current_command["param"] == "filter_type":
+                    # TODO: Filter Implementation
+                    pass
+                elif current_command["param"] == "":
+                    # TODO: Other implementation
+                    pass
+            except queue.Empty:
+                pass
 
             if len(self.display_sources) == 0:
                 continue
@@ -86,7 +91,7 @@ class DisplayWorker():
                     disp_samples = samples[source.channel, :]
                     processed = self.process(disp_samples)
 
-                    # Add to display queue 
+                    # Add to display queue
                     emit_signal(self.data_ready, np.array(processed), source)
             except queue.Empty:
                 emit_signal(self.log_event, "error", "Queue Empty")
