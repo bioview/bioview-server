@@ -1,4 +1,4 @@
-from bioview_common import Response
+from bioview_common import DeviceStatus, Response
 
 from bioview_server import device
 from bioview_server.server import Server
@@ -48,6 +48,6 @@ def test_discover_devices_matching(monkeypatch):
     assert resp["type"] == Response.SUCCESS.value
     devices = resp["payload"]["devices"]
 
-    assert devices["group1"]["C"] is True
-    assert devices["group1"]["E"] is False
-    assert devices["group2"]["A"] is True
+    assert devices["group1"]["C"] == DeviceStatus.CONNECTED.value
+    assert devices["group1"]["E"] == DeviceStatus.DISCONNECTED.value
+    assert devices["group2"]["A"] == DeviceStatus.CONNECTED.value

@@ -33,6 +33,7 @@ from bioview_common import (
     AuthenticationError,
     Command,
     Configuration,
+    DeviceStatus,
     Response,
     ServerStatus,
     get_app_info,
@@ -725,7 +726,16 @@ class Server:
 
         # Match requested device groups to discovered devices
         try:
-            matched = self._match_requested_to_discovered(requested)
+            # If the payload wraps groups under a 'groups' key (client sends
+            # {'config': ..., 'groups': {...}}), extract it. Otherwise assume
+            # the requested mapping is provided directly.
+            groups_payload = None
+            if isinstance(requested, dict) and "groups" in requested:
+                groups_payload = requested.get("groups") or {}
+            else:
+                groups_payload = requested
+
+            matched = self._match_requested_to_discovered(groups_payload)
             return {"type": Response.SUCCESS.value, "payload": {"devices": matched}}
         except Exception as e:
             logger.exception("Device matching failed")
@@ -736,7 +746,7 @@ class Server:
 
     def _match_requested_to_discovered(self, requested: Dict) -> Dict:
         """Given a requested mapping of group_id -> device configs, return a
-        mapping group_id -> {device_id: True/False} indicating presence.
+        mapping group_id -> {device_id: DeviceStatus.value} indicating presence.
 
         We assume requested is a dict where top-level keys are group_ids and
         values are dicts mapping device_id -> Configuration-like dict.
@@ -781,7 +791,12 @@ class Server:
                     if found:
                         break
 
-                results[group_id][device_id] = found
+                # Return numeric DeviceStatus.value for JSON-serializable status
+                results[group_id][device_id] = (
+                    DeviceStatus.CONNECTED.value
+                    if found
+                    else DeviceStatus.DISCONNECTED.value
+                )
 
         return results
 
@@ -819,8 +834,38 @@ class Server:
         any pre-existing configs.
         """
         try:
-            # Firstly, initialize a suitable backend handler
-            for device_id, device_config_dict in configurations.items():
+            # Accept either a flat mapping device_id->config or a group mapping
+            # group_id -> { device_id: config }
+            entries = []
+            if isinstance(configurations, dict) and all(
+                isinstance(v, dict) for v in configurations.values()
+            ):
+                # TODO: Validate for being dict of dicts
+                is_group = any(
+                    any(isinstance(iv, dict) for iv in v.values())
+                    if isinstance(v, dict)
+                    else False
+                    for v in configurations.values()
+                )
+                if is_group:
+                    # Flatten groups into (device_id, config) pairs.
+                    for group in configurations.values():
+                        if not isinstance(group, dict):
+                            continue
+                        for device_id, device_config_dict in group.items():
+                            # keep device_id as provided by client (inner key)
+                            entries.append((device_id, device_config_dict))
+                else:
+                    entries = list(configurations.items())
+            else:
+                entries = (
+                    list(configurations.items())
+                    if isinstance(configurations, dict)
+                    else []
+                )
+
+            # Initialize each device backend
+            for device_id, device_config_dict in entries:
                 # Make device configuration object
                 device_configuration = Configuration.from_dict(device_config_dict)
 
@@ -828,28 +873,23 @@ class Server:
                 backend_type = device_configuration.get_param("backend_type")
                 backend_module = AVAILABLE_BACKENDS[backend_type]
 
-                # Each handler will have its own way of parsing provided
-                # configuration but must be able to handle the following parameters
                 handler = backend_module.get_backend_handler(
-                    # Configuration
                     configuration=device_configuration,
-                    # Shared queues for data handling
                     display_data_queue=self.display_data_queue,
                     command_queue=self.command_queue,
                     response_queue=self.response_queue,
                 )
 
-                # Now, initialize the handler (which will also initialize the device)
                 handler.initialize()
 
-                # Lastly, store reference
+                # Store reference keyed by device_id
                 self.backends[device_id] = handler
 
-                # Communicate success
-                return {
-                    "type": Response.SUCCESS.value,
-                    "payload": {"message": "Device inited successfully"},
-                }
+            # Communicate success
+            return {
+                "type": Response.SUCCESS.value,
+                "payload": {"message": "Device(s) inited successfully"},
+            }
 
         except Exception as e:
             # Communicate failure
