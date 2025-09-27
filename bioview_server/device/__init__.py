@@ -14,7 +14,7 @@ try:
     # Ensure device is importable
     from . import usrp
 
-    __all__.append["usrp"]
+    __all__.append("usrp")
     AVAILABLE_BACKENDS["usrp"] = usrp
 except Exception as e:
     print(f"USRP backend not available: {e}")
@@ -31,9 +31,12 @@ try:
         if biopac.load_mpdev_dll() is None:
             raise ValueError("mpdev.dll not found")
 
-    __all__.append["biopac"]
+    __all__.append("biopac")
     AVAILABLE_BACKENDS["biopac"] = biopac
 except Exception as e:
     print(f"BIOPAC backend not available: {e}")
 
-__all__ = ["AVAILABLE_BACKENDS"]
+def get_device_group_handler(group_dict): 
+    pass 
+
+__all__ = ["AVAILABLE_BACKENDS", "get_device_group_handler"]

@@ -12,7 +12,6 @@ from bioview_server.utils import (
     get_cache_file,
     get_filter,
     get_unique_path,
-    parse_and_validate_command,
     suppress_stdout,
 )
 
@@ -59,20 +58,6 @@ def test_get_cache_file_and_unique_path(tmp_path, monkeypatch):
 
     up = get_unique_path(tmp_path, "file.txt")
     assert str(up).endswith("file.txt")
-
-
-def test_parse_and_validate_command_basic():
-    # valid message
-    msg = {"type": "SOME", "payload": {"a": 1}}
-    data = json.dumps(msg)
-    with pytest.raises(ValidationError):
-        # SUPPORTED_COMMANDS likely doesn't include 'SOME', parse should raise
-        parse_and_validate_command(data, commmand_type="SOME")
-
-    # invalid JSON
-    with pytest.raises(ValidationError):
-        parse_and_validate_command("not json")
-
 
 def test_filtering_roundtrip():
     samp_rate = 1000

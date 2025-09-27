@@ -11,122 +11,102 @@ access or whether each device should be considered as a different client
 connection. Subsequent experimentation and discussion will be pertinent
 for expanding functionality to handle the case for multiple clients.
 """
-import contextlib
-import hashlib
-import json
-import logging
-import multiprocessing as mp
-import secrets
-import socket
-import time
-import traceback
-from threading import Lock, Thread
-from typing import Dict, List
 
-from bioview_common import (
-    APP_VERSION,
-    AUTH_TIMEOUT,
-    CONTROL_PORT,
-    DATA_PORT,
-    MAX_BUFFER_SIZE,
-    RESPONSE_TIMEOUT,
+import time 
+import json
+import argparse
+import socket 
+import logging 
+import ipaddress
+import contextlib
+
+from threading import Thread
+
+from bioview_common import (    
     AuthenticationError,
-    Command,
-    Configuration,
-    DeviceStatus,
-    Response,
-    ServerStatus,
-    get_app_info,
-    get_ip,
+    DeviceStatus, 
+    get_app_info, 
+    MAX_BUFFER_SIZE,
+    CONTROL_PORT, DATA_PORT,
+    ServerStatus, 
+    Response, Command,
+    APP_VERSION,
+    log_print,
+    is_dict_of_dicts
 )
 
-from bioview_server.datatypes import Backend
-from bioview_server.device import AVAILABLE_BACKENDS
+from bioview_server.utils import (
+    send_response, 
+    generate_challenge, 
+    validate_token, 
+    parse_and_validate_command
+)
 
+from bioview_server.device import AVAILABLE_BACKENDS, get_device_group_handler
 
-try:
-    from bioview_client.utils.zeroconf_discovery import register_service
-except Exception:
-    register_service = None
-logger = logging.getLogger(__name__)
-logger.info("Available Backends: %s", list(AVAILABLE_BACKENDS.keys()))
-
-
-class Server:
+class Server: 
     def __init__(
         self,
-        control_port: int = CONTROL_PORT,
-        data_port: int = DATA_PORT,
-        # By default, run server using local-only mode for safety.
-        discoverable: bool = False,
-        auth_timeout: int = AUTH_TIMEOUT,
-        resp_timeout: int = RESPONSE_TIMEOUT,
-    ):
-        # Server network information
-        self.address = get_ip()
-        # Fetch app info and sanitize to JSON-serializable primitives only
-        raw_info = get_app_info() or {}
-        sanitized_info = {}
-        for k in ("hostname", "app_name", "app_version"):
-            v = raw_info.get(k)
-            try:
-                # allow simple serializable values
-                json.dumps({k: v})
-                sanitized_info[k] = v
-            except Exception:
-                sanitized_info[k] = str(v) if v is not None else ""
-        # include network address for convenience
-        sanitized_info["address"] = self.address
-        self.server_info = sanitized_info
+        local_only: bool, 
+        control_port: int,
+        data_port: int,
+        logger = None
+    ): 
+        # Keep track of local PC information for client communication 
+        self.info = get_app_info()
+        self.token = 42 # TODO: Load using secrets
 
-        # Server connection preference
-        self.auth_timeout = auth_timeout
-        self.resp_timeout = resp_timeout
-        self.discoverable = discoverable
-        # Ports
-        self.data_port = data_port
+        # Network info 
         self.control_port = control_port
+        self.data_port = data_port
+
+        # Server status 
+        self.status = ServerStatus.CLIENT_DISCONNECTED
+        self.running = False 
+
+        # Client handling 
+        self.local_only = local_only
+        self.discovered_clients = {} 
+        self.connected_client_info = {}
+        
+        # Device handling
+        self.device_group_states = {} 
+        self.device_group_handlers = {}
 
         # Sockets
         self.data_socket = None
+        self.data_conn = None 
         self.control_socket = None
+        self.control_conn = None 
 
-        # Clients
-        self.data_clients = []  # List of connected data clients
-        self.data_lock = Lock()
+        # Threaded workers 
+        self.cmd_thread = None 
 
-        # Server state
-        self.status = ServerStatus.DEFAULT
+        # Message logging
+        if not logger: 
+            self.logger = logging.getLogger(__name__)
+        else:
+            self.logger = logger 
 
-        # Device state
-        self.discovered_devices = {}
-        self.backends: List[Backend] = []
-        self.display_data_queue = mp.Queue()
-        # Application token used for challenge-response authentication.
-        # For now use a deterministic value (APP_VERSION) so tests can compute
-        # a stable expected token; in production this should be a secret.
-        try:
-            self.app_token = str(APP_VERSION)
-        except Exception:
-            # fallback to a random token if APP_VERSION isn't available
-            self.app_token = secrets.token_hex(16)
+    def start(self): 
+        log_print(self.logger, 'info' 'Starting server')
+        
+        # Open sockets 
+        self._create_sockets()
 
-    def start(self):
-        logger.info("Starting server on %s", self.server_info.get("hostname"))
-        try:
-            # Create and bind control/data sockets
-            self._setup_sockets()
-            # Optionally start discovery responder
-            self._maybe_start_discovery_responder()
-        except Exception:
-            logger.exception("Error occurred while starting server")
+        # Create listener threads 
+        self.running = True 
 
-        # Once clients have started, start listening
-        self.running = True
         try:
             # Start server threads
-            control_thread = Thread(target=self.handle_control_connection, daemon=True)
-            data_thread = Thread(target=self.handle_data_connection, daemon=True)
+            control_thread = Thread(
+                target=self._control_handler, 
+                daemon=True
+            )
+            data_thread = Thread(
+                target=self._data_handler, 
+                daemon=True
+            )
 
             control_thread.start()
             data_thread.start()
@@ -135,891 +115,434 @@ class Server:
             while self.running:
                 time.sleep(0.1)
         except Exception:
-            logger.exception("Server error")
+            log_print(self.logger, 'error', 'Unable to start server')
         finally:
             self.stop()
 
-    def _setup_sockets(self):
+    def _create_sockets(self):
         # Setup control socket
-        self.control_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.control_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.control_socket.bind(("0.0.0.0", self.control_port))
-        self.control_socket.listen(5)
-        logger.info("Control server listening on %s:%s", self.address, self.control_port)
+        try: 
+            self.control_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.control_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.control_socket.bind(("0.0.0.0", self.control_port))
+            self.control_socket.listen(5)
+            log_print(self.logger, 'info', 'Control socket connected')
+        except Exception as e: 
+            log_print(self.logger, 'error', f'Unable to create control socket: {e}')
 
         # Setup data socket
-        self.data_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.data_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.data_socket.bind(("0.0.0.0", self.data_port))
-        self.data_socket.listen(10)
-        logger.info("Data server listening on %s:%s", self.address, self.data_port)
+        try: 
+            self.data_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.data_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.data_socket.bind(("0.0.0.0", self.data_port))
+            self.data_socket.listen(10)
+            log_print(self.logger, 'info', 'Data socket connected')
+        except Exception as e: 
+            log_print(self.logger, 'error', f'Unable to create data socket: {e}')
 
-    def _maybe_start_discovery_responder(self):
-        if not self.discoverable:
-            return
-        # Register service if available and start responder thread.
-        self._register_service_if_available()
-        Thread(target=self._discovery_responder, daemon=True).start()
+    def _control_handler(self): 
+        while self.running:  
+            if self.status is ServerStatus.CLIENT_DISCONNECTED:
+                # Ensure that no other commands can be accepted 
+                if self.cmd_thread: 
+                    self.cmd_thread.join() 
+                    self.cmd_thread = None 
 
-    def _register_service_if_available(self):
-        with contextlib.suppress(Exception):
-            if not register_service:
-                return
-            props = self._discovery_props()
-            register_service(
-                self.server_info.get("hostname", "bioview"),
-                port=self.control_port,
-                properties=props,
-            )
+                # Accept incoming connections (blocks)
+                # Update socket reference to be able to accept
+                conn, addr = self.control_socket.accept()
+            
+                # Authenticate
+                if self._authenticate_client(conn, addr):
+                    # Update status 
+                    self.status = ServerStatus.CLIENT_CONNECTED
+                    self.control_conn = conn 
 
-    # --- Simple challenge/response helpers ---
-    def _generate_challenge(self) -> str:
-        """Return a short random challenge string."""
-        return secrets.token_hex(16)
+            # If authenticated, parse commands
+            if self.status is ServerStatus.CLIENT_CONNECTED:
+                # Ensure we do not spawn endless threads
+                if not self.cmd_thread: 
+                    print('starting thread now')
+                    self.cmd_thread = Thread(
+                        target=self._command_handler, 
+                        daemon=True 
+                    )
+                    self.cmd_thread.start()
 
-    def _discovery_responder(self):
-        """Actual discovery responder loop extracted to reduce complexity."""
-        try:
-            udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            udp.bind(("0.0.0.0", self.control_port))
-            while self.running:
-                try:
-                    data, addr = udp.recvfrom(4096)
-                    try:
-                        msg = json.loads(data.decode("utf-8"))
-                    except Exception:
-                        continue
-                    if msg.get("type") == "DISCOVER_REQUEST":
-                        server_info = {}
-                        raw = self.server_info or {}
-                        for k in ("hostname", "app_name", "app_version"):
-                            v = raw.get(k)
-                            try:
-                                json.dumps({k: v})
-                                server_info[k] = v
-                            except Exception:
-                                server_info[k] = str(v)
+                # Check if sockets are still alive and update status accordingly
+                time.sleep(1)
 
-                        resp = {
-                            "type": Response.INFO.value,
-                            "payload": {"server_info": server_info},
-                        }
-                        try:
-                            udp.sendto(
-                                json.dumps(self._sanitize_for_json(resp)).encode(
-                                    "utf-8"
-                                ),
-                                addr,
+    def _data_handler(self):
+        while self.running and self.status is ServerStatus.CLIENT_CONNECTED: 
+            with contextlib.suppress(Exception):
+                # Convert from listen() to accept() socket 
+                self.data_conn, _ = self.data_socket.accept()
+                # TODO: Complete
+
+    def _command_handler(self):
+        while self.running and self.status is ServerStatus.CLIENT_CONNECTED: 
+            try:
+                # Receive data continuously 
+                data = self.control_conn.recv(MAX_BUFFER_SIZE)
+
+                # Dispatch appropriate function 
+                cmd_type, payload = parse_and_validate_command(data)
+                log_print(self.logger, 'debug', f'Received {cmd_type} with {payload}')
+
+                match cmd_type:
+                    # Client commands
+                    case Command.PING_SERVER.name: 
+                        self._respond_to_ping() 
+                    case Command.DISCONNECT_SERVER.name: 
+                        self._close_client_connection()
+
+                    # Device commands 
+                    case Command.DISCOVER_DEVICES.name: 
+                        # Pass device configuration here 
+                        discovery_states = self._discover_devices(payload)
+                        if discovery_states:
+                            send_response(
+                                self.control_conn, 
+                                Response.SUCCESS, 
+                                params={"discovery_status": discovery_states}
                             )
-                        except Exception:
-                            continue
-                except Exception:
-                    continue
-        finally:
-            with contextlib.suppress(Exception):
-                udp.close()
+                        else:
+                            send_response(
+                                self.control_conn, 
+                                Response.ERROR, 
+                                params={"message": "Invalid configuration provided"})
+                    case Command.INITIALIZE_DEVICES.name: 
+                        self._initialize_devices(payload)
+                    case Command.DISCONNECT_DEVICES.name: 
+                        self._disconnect_devices()
+                        
+                    # Streaming 
+                    case Command.START_STREAMING.name: 
+                        self._start_streaming()
+                    case Command.STOP_STREAMING.name: 
+                        self._stop_streaming()
+            
+            except (ConnectionResetError, ConnectionAbortedError): 
+                # This will occur when client disconnects. Reset state 
+                log_print(self.logger, "warning", "Client connection unexpectedly terminated.")
+                self._close_client_connection()
 
-    def _discovery_props(self):
-        """Build sanitized props for zeroconf registration."""
-        props = {}
+    def _is_local_client(self, address):
         try:
-            props_raw = {
-                "app_name": self.server_info.get("app_name"),
-                "app_version": self.server_info.get("app_version"),
-            }
-            for k, v in props_raw.items():
-                try:
-                    json.dumps({k: v})
-                    props[k] = v
-                except Exception:
-                    props[k] = str(v)
-        except Exception:
-            props = {}
-        return props
+            if not isinstance(address, (list, tuple)):
+                # Python socket will provide a tuple (ip, port)
+                return False 
+            
 
-    def _compute_response(self, challenge: str, token: str) -> str:
-        """Compute expected response from challenge and shared token.
+            return ipaddress.ip_address(address[0]).is_private
+        except ipaddress.AddressValueError:
+            log_print(self.logger, 'error', f"{address} is not a valid IP address")
+            return False
 
-        Uses SHA-256 over "{challenge}:{token}" to produce a deterministic hex digest.
-        """
-        try:
-            m = hashlib.sha256()
-            m.update(f"{challenge}:{token}".encode())
-            return m.hexdigest()
-        except Exception:
-            # fallback to simple concatenation if hashlib unexpectedly fails
-            return f"{challenge}:{token}"
-
-    def stop(self):
-        logger.info("Stopping server")
-        self.running = False
-
-        self.handle_disconnect_from_client()
-        logger.info("BioView server stopped")
-
-    # Ensure connection validation for server security
-    def _handle_initial_client_message(self, client_socket, address):
-        try:
-            data = client_socket.recv(MAX_BUFFER_SIZE)
-            if not data:
-                client_socket.close()
-                return
-
-            command = json.loads(data.decode("utf-8"))
-            with contextlib.suppress(Exception):
-                # Print received raw command to console for debugging
-                print(f"[SERVER RECV] {address}: {command}")
-
-            cmd_type = command.get("type")
-            payload = command.get("payload", {})
-
-            # Discovery mode handling
-            if cmd_type == Command.PING_SERVER.value and self.discoverable:
-                response = self.handle_ping()
-                with contextlib.suppress(Exception):
-                    print(f"[SERVER SEND] {address}: {response}")
-
-                self.send_json_safe(client_socket, response)
-                client_socket.close()
-                return
-
-            # Full authentication path for control commands
-            if cmd_type == Command.CONNECT_SERVER.value:
-                self.client_info = self.validate_and_authenticate_client(
-                    client_socket, address, payload
-                )
-                Thread(
-                    target=self.handle_commands, args=(client_socket,), daemon=True
-                ).start()
-                return
-
-            # If we reach here, it's an invalid attempt
-            error_response = {
-                "type": Response.ERROR.value,
-                "payload": {"message": f"Command '{cmd_type}' requires authentication"},
-            }
-            with contextlib.suppress(Exception):
-                print(f"[SERVER SEND] {address}: {error_response}")
-
-            self.send_json_safe(client_socket, error_response)
+    def _authenticate_client(self, client_socket, address):
+        # If local only mode, reject non-local connections
+        if self.local_only and not self._is_local_client(address):
             client_socket.close()
-
-        except json.JSONDecodeError:
-            error = {
-                "type": Response.ERROR.value,
-                "payload": {"message": "Invalid JSON"},
-            }
-            with contextlib.suppress(Exception):
-                print(f"[SERVER RECV][INVALID_JSON] {address}")
-            with contextlib.suppress(Exception):
-                self.send_json_safe(client_socket, error)
+            return False
+        
+        data = client_socket.recv(MAX_BUFFER_SIZE)
+        if not data:
             client_socket.close()
-        except Exception:
-            logger.exception("Initial message handling error")
-            with contextlib.suppress(Exception):
-                client_socket.close()
+            return False
 
-    def validate_and_authenticate_client(
-        self, client_socket, client_address, initial_payload
-    ):
-        """
-        Authenticate after receiving CONNECT_SERVER.
-        initial_payload is already parsed from first message.
-        """
-        client_ip = client_address[0]
-        try:
-            client_socket.settimeout(self.auth_timeout)
-
-            client_info = {
-                "hostname": initial_payload.get("hostname"),
-                "app_name": initial_payload.get("app_name"),
-                # accept either 'app_version' or legacy 'version'
-                "app_version": initial_payload.get(
-                    "app_version", initial_payload.get("version")
-                ),
-            }
-            logger.info(
-                "Connection request received from %s", client_info.get("hostname")
-            )
-
-            # Validate timestamp and start challenge/response flow using small helpers
-            self._auth_validate_timestamp(initial_payload)
-
-            challenge = self._generate_challenge()
-            self._auth_send_challenge(client_socket, client_ip, challenge)
-
-            parsed = self._auth_recv_response(client_socket)
-            self._auth_validate_command_type(parsed)
-
-            client_response_payload = parsed.get("payload", {})
-
-            expected_token = self._compute_response(challenge, self.app_token)
-            # accept either 'token' (client) or 'auth_token' (legacy)
-            received_token = (
-                client_response_payload.get("token")
-                or client_response_payload.get("auth_token")
-                or ""
-            )
-
-            if not secrets.compare_digest(expected_token, received_token):
-                fail_msg = {
-                    "type": Response.AUTHENTICATION_FAILURE.value,
-                    "payload": {"message": "Invalid authentication token"},
-                }
-                self.send_json_safe(client_socket, fail_msg)
-                raise AuthenticationError("Invalid authentication token") from None
-
-            # Step 4: Send success confirmation
-            self._auth_send_success(client_socket)
-            logger.info("Successfully authenticated %s", client_info.get("hostname"))
-            return client_info
-
-        except socket.timeout:
-            raise AuthenticationError("Authentication timeout") from None
+        try: 
+            cmd_type, payload = parse_and_validate_command(data)
         except Exception as e:
-            logger.exception("Authentication error")
-            raise AuthenticationError(f"Authentication failed: {str(e)}") from e
+            log_print(self.logger, 'error', str(e))
+            return False 
+        
+        log_print(self.logger, 'debug', f'Received {cmd_type} with {payload}')
 
-    # --- Authentication helpers (small, focused helpers reduce complexity) ---
-    def _auth_validate_timestamp(self, initial_payload):
-        client_timestamp = initial_payload.get("timestamp", 0)
-        if abs(time.time() - client_timestamp) > AUTH_TIMEOUT * 60:
-            raise AuthenticationError(
-                "Client timestamp outside acceptable window"
-            ) from None
-
-    def _auth_send_challenge(self, client_socket, client_ip, challenge):
-        challenge_msg = {
-            "type": Response.SERVER_CHALLENGE.value,
-            "payload": {"challenge": challenge, "timestamp": time.time()},
-        }
-        with contextlib.suppress(Exception):
-            print(f"[SERVER SEND] {client_ip}: {challenge_msg}")
-        self.send_json_safe(client_socket, challenge_msg)
-
-    def _auth_recv_response(self, client_socket):
-        # Receive and parse client auth response; raise on invalid JSON
-        client_response_data = client_socket.recv(4096).decode("utf-8")
-        with contextlib.suppress(Exception):
-            print(f"[SERVER RECV] {client_response_data}")
-        try:
-            return json.loads(client_response_data)
-        except Exception:
-            # invalid JSON from client during auth
-            try:
-                err = {
-                    "type": Response.ERROR.value,
-                    "payload": {"message": "Invalid JSON in authentication payload"},
-                }
-                self.send_json_safe(client_socket, err)
-            except Exception:
-                pass
-            raise
-
-    def _auth_validate_command_type(self, parsed):
-        if parsed.get("type") != Command.AUTHENTICATE_CLIENT.value:
-            msg = f"Unexpected auth command type: {parsed.get('type')}"
-            raise AuthenticationError(msg) from None
-
-    def _auth_send_success(self, client_socket):
-        # prepare sanitized server_info for response
-        sanitized = {}
-        raw = self.server_info or {}
-        for k, v in raw.items():
-            try:
-                json.dumps({k: v})
-                sanitized[k] = v
-            except Exception:
-                sanitized[k] = str(v)
-
-        success_msg = {
-            "type": Response.AUTHENTICATION_SUCCESS.value,
-            "payload": {"server_info": sanitized, "timestamp": time.time()},
-        }
-        try:
-            self.send_json_safe(client_socket, success_msg)
-        except Exception:
-            logger.exception("Failed to send authentication success message")
-
-    def _generate_challenge(self) -> str:
-        """Return a random challenge string for clients to sign."""
-        return secrets.token_hex(16)
-
-    def _sanitize_for_json(self, obj):
-        """Recursively convert non-JSON-serializable objects to strings.
-
-        Keeps dicts, lists and primitives; everything else becomes str(obj).
-        """
-        # primitives
-        if obj is None or isinstance(obj, (str, int, float, bool)):
-            return obj
-        # dict
-        if isinstance(obj, dict):
-            return {str(k): self._sanitize_for_json(v) for k, v in obj.items()}
-        # list/tuple
-        if isinstance(obj, (list, tuple)):
-            return [self._sanitize_for_json(v) for v in obj]
-        # fallback: string representation
-        try:
-            return str(obj)
-        except Exception:
-            return repr(obj)
-
-    def send_json_safe(self, sock, obj):
-        """Sanitize and send a JSON object over the given socket.
-
-        If serialization fails, attempt to send a safe error response. If that
-        also fails, close the socket silently.
-        """
-        try:
-            safe = self._sanitize_for_json(obj)
-            data = json.dumps(safe).encode("utf-8")
-            sock.send(data)
-        except Exception:
-            logger.exception(
-                "Failed to serialize/send JSON response; sending fallback error"
+        if cmd_type == Command.DISCOVER_SERVERS.name:
+            # Respond with server details 
+            send_response(
+                sock = client_socket, 
+                response = Response.SUCCESS, 
+                params = self.info,  
+                logger = self.logger
             )
-            try:
-                fallback = {
-                    "type": Response.ERROR.value,
-                    "payload": {"message": "Internal server error"},
-                }
-                sock.send(json.dumps(self._sanitize_for_json(fallback)).encode("utf-8"))
-            except Exception:
-                with contextlib.suppress(Exception):
-                    sock.close()
+            client_socket.close() # Close connection for now
+            
+            # We are still not authenticated
+            return False 
 
-    def _compute_response(self, challenge: str, token: str) -> str:
-        """Compute the expected response token from a challenge and app token.
+        elif cmd_type == Command.CONNECT_SERVER.name:
+            # Send challenge 
+            challenge = generate_challenge()
 
-        Uses a simple SHA-256(challenge + token) hex digest. The client must
-        use the same computation to succeed.
-        """
-        if challenge is None:
-            return ""
-        data = f"{challenge}:{token}".encode()
-        return hashlib.sha256(data).hexdigest()
-
-    def handle_control_connection(self):
-        while self.running:
-            try:
-                client_socket, address = self.control_socket.accept()
-                Thread(
-                    target=self._handle_initial_client_message,
-                    args=(client_socket, address),
-                    daemon=True,
-                ).start()
-            except Exception:
-                if self.running:
-                    logger.exception("Error accepting control connection")
-
-    def handle_data_connection(self):
-        while self.running:
-            try:
-                client_socket, address = self.data_socket.accept()
-                logger.info("Data client connected from %s", address)
-
-                with self.data_lock:
-                    self.data_clients.append(client_socket)
-
-                # Handle client disconnect. Bind address into the monitor's default
-                # argument to avoid loop-variable closure issues.
-                def monitor_client(sock, addr=address):
-                    try:
-                        while self.running:
-                            # Send keepalive
-                            sock.send(b"")
-                            time.sleep(1)
-                    except Exception as e:
-                        with self.data_lock:
-                            if sock in self.data_clients:
-                                self.data_clients.remove(sock)
-                        with contextlib.suppress(Exception):
-                            sock.close()
-
-                        logger.info(f"Data client {addr} disconnected: {e}")
-
-                Thread(target=monitor_client, args=(client_socket,), daemon=True).start()
-
-            except Exception as e:
-                if self.running:
-                    logger.exception(f"Error accepting data connection: {e}")
-
-    def handle_commands(self, client_socket):
-        # Receives commands from clients and controls device handlers accordingly
-        try:
-            # Use a short recv timeout so we can check self.running periodically
-            with contextlib.suppress(Exception):
-                client_socket.settimeout(1.0)
-                # Some socket-like objects may not support settimeout
-
-            while self.running:
-                data = self._recv_command_data(client_socket)
-                if data is None:
-                    continue
-                if not data:
-                    break
-
-                try:
-                    command = json.loads(data.decode("utf-8"))
-                    # Log received command
-                    print(f"[SERVER RECV CMD] {client_socket.getpeername()}: {command}")
-
-                    response = self.process_command(command)
-                    # Log response we're about to send
-                    print(
-                        f"[SERVER SEND RESP] {client_socket.getpeername()}: {response}"
-                    )
-
-                    self.send_json_safe(client_socket, response)
-                except json.JSONDecodeError as e:
-                    error_response = {
-                        "type": Response.ERROR.value,
-                        "payload": {"message": f"Invalid JSON: {e}"},
-                    }
-                    self.send_json_safe(client_socket, error_response)
-                except Exception:
-                    # Any unexpected serialization or processing error should
-                    # still result in a valid JSON error response sent back.
-                    err = {
-                        "type": Response.ERROR.value,
-                        "payload": {"message": "Internal processing error"},
-                    }
-
-                    with contextlib.suppress(Exception):
-                        self.send_json_safe(client_socket, err)
-
-        except Exception:
-            logger.exception("Control client error")
-        finally:
-            with contextlib.suppress(Exception):
-                client_socket.close()
-
-    def _recv_command_data(self, client_socket):
-        """Receive raw data from command socket with timeout handling.
-
-        Returns:
-            bytes | None (if timeout occurred and loop should continue)
-        """
-        try:
-            data = client_socket.recv(MAX_BUFFER_SIZE)
-            return data
-        except (socket.timeout, TimeoutError):
-            # no data received within timeout; loop and check running flag
-            return None
-        except Exception:
-            # propagate other socket errors to outer handler
-            raise
-
-    def process_command(self, command):
-        # Redirect received command from client to the appropriate callback
-        cmd_type = command.get("type")
-        payload = command.get("payload", {})
-        try:
-            return self._dispatch_command(cmd_type, payload)
-        except Exception as e:
-            return {
-                "type": Response.ERROR.value,
-                "payload": {"message": f"Command processing error: {e}"},
-            }
-
-    def _dispatch_command(self, cmd_type, payload):
-        # Use a lookup table to simplify branching
-        dispatch_map = {
-            Command.PING_SERVER.value: lambda: self.handle_ping(),
-            Command.CONNECT_SERVER.value: lambda: self.handle_connect_to_client(payload),
-            Command.DISCOVER_DEVICES.value: lambda: self.handle_discover_devices(
-                payload
-            ),
-            Command.DISCONNECT_SERVER.value: (
-                lambda: self.handle_disconnect_from_client()
-            ),
-            Command.CONNECT_DEVICES.value: lambda: self.handle_connect_device(payload),
-            Command.GET_DEVICE_STATUS.value: (
-                lambda: self.handle_get_device_status(payload)
-            ),
-            Command.START_STREAMING.value: lambda: self.handle_start_streaming(),
-            Command.STOP_STREAMING.value: lambda: self.handle_stop_streaming(),
-            Command.UPDATE_RUNNING_PARAMETER.value: (
-                lambda: self.handle_update_runing_parameter(payload)
-            ),
-            Command.UPDATE_DEVICE_FIRMWARE.value: (
-                lambda: self.handle_update_device_firmware(payload)
-            ),
-            Command.DISCONNECT_DEVICES.value: lambda: self.handle_disconnect_device(),
-        }
-
-        handler = dispatch_map.get(cmd_type)
-        if handler is None:
-            return {
-                "type": Response.ERROR.value,
-                "payload": {"message": f"Unknown command: {cmd_type}"},
-            }
-
-        return handler()
-
-    # Server commands
-    def handle_ping(self):
-        # Return server status
-        return {
-            "type": Response.INFO.value,
-            "payload": {
-                "hostname": self.server_info.get("hostname"),
-                "version": self.server_info.get(
-                    "app_version", self.server_info.get("version")
-                ),
-                "status": self.status.value,
-            },
-        }
-
-    def handle_initialize_common_configuration(self, client_dict):
-        """
-        Server will only respond to commands if connected to a client.
-        This handler validates a client and switches server state to
-        be actually useful
-        """
-        # TODO: Initialize server common configuration
-        # TODO: These should not be part of the device handling
-        # exp_config = Configuration.from_json(params['exp_config'])
-        # save = params.get('save', False)
-        pass
-
-    def handle_discover_devices(self, requested: Dict = None):
-        """Discover devices and report which requested devices are present.
-
-        If `requested` is None, performs a full discovery and returns the
-        discovered devices per backend. If `requested` is provided as a mapping
-        of group_id -> Configuration (or dict describing devices), this will
-        return a per-group mapping of requested device_id -> found(boolean).
-        """
-        logger.info("Starting device discovery")
-
-        try:
-            # Populate discovered_devices from backends. Import device module at
-            # runtime so tests can monkeypatch AVAILABLE_BACKENDS on the module.
-            from bioview_server import device as _device
-
-            for backend_type, backend_handler in _device.AVAILABLE_BACKENDS.items():
-                # backend_handler.discover_devices() should return a list of dicts
-                self.discovered_devices[
-                    backend_type
-                ] = backend_handler.discover_devices()
-        except Exception as e:
-            logger.exception("Device discovery failed")
-            return {
-                "type": Response.ERROR.value,
-                "payload": {"message": f"Device discovery failed: {e}"},
-            }
-
-        # If no specific request, return full discovery results
-        if not requested:
-            logger.info("Device discovery completed successfully")
-            num_devices = sum(len(v) for v in self.discovered_devices.values())
-            return {
-                "type": Response.SUCCESS.value,
-                "payload": {
-                    "message": f"Found {num_devices} devices",
-                    "devices": self.discovered_devices,
+            send_response(
+                sock = client_socket, 
+                response = Response.SERVER_CHALLENGE, 
+                params = {
+                    "challenge": challenge, 
+                    "timestamp": time.time()
                 },
-            }
+                logger = self.logger
+            )
 
-        # Match requested device groups to discovered devices
-        try:
-            # If the payload wraps groups under a 'groups' key (client sends
-            # {'config': ..., 'groups': {...}}), extract it. Otherwise assume
-            # the requested mapping is provided directly.
-            groups_payload = None
-            if isinstance(requested, dict) and "groups" in requested:
-                groups_payload = requested.get("groups") or {}
-            else:
-                groups_payload = requested
+            # Parse response to challenge
+            try: 
+                client_response = client_socket.recv(MAX_BUFFER_SIZE)
+                client_cmd, client_payload = parse_and_validate_command(client_response)
 
-            matched = self._match_requested_to_discovered(groups_payload)
-            return {"type": Response.SUCCESS.value, "payload": {"devices": matched}}
-        except Exception as e:
-            logger.exception("Device matching failed")
-            return {
-                "type": Response.ERROR.value,
-                "payload": {"message": f"Device matching failed: {e}"},
-            }
-
-    def _match_requested_to_discovered(self, requested: Dict) -> Dict:
-        """Given a requested mapping of group_id -> device configs, return a
-        mapping group_id -> {device_id: DeviceStatus.value} indicating presence.
-
-        We assume requested is a dict where top-level keys are group_ids and
-        values are dicts mapping device_id -> Configuration-like dict.
-        Matching is performed by inspecting discovered devices for the
-        backend_type present in the configuration (Configuration.get_param)
-        and comparing device_id to discovered 'device_id' fields.
-        """
-        results = {}
-
-        for group_id, group_conf in requested.items():
-            results[group_id] = {}
-
-            # group_conf is expected to be a dict of device_id -> config
-            for device_id, conf in (
-                group_conf.items() if isinstance(group_conf, dict) else []
-            ):
-                # extract backend_type from provided configuration
-                backend_type = None
-                try:
-                    # allow Configuration-like objects with get_param
-                    backend_type = conf.get_param("backend_type")
-                except Exception:
-                    # fallback to dict-style
-                    backend_type = (
-                        conf.get("backend_type") if isinstance(conf, dict) else None
+                if client_cmd != Command.AUTHENTICATE_CLIENT.name:
+                    raise ValueError(f'Unexpected client command: {client_cmd}')
+            
+                auth_token = client_payload.get("token", "")
+                
+                if not validate_token(challenge, auth_token):
+                    send_response(
+                        sock = client_socket, 
+                        response = Response.AUTHENTICATION_FAILURE, 
+                        params = {
+                            "message": "Invalid authentication token"
+                        },
+                        logger = self.logger
                     )
-
-                found = False
-                # If backend_type provided, only check that backend; otherwise
-                # check across all backends (fallback)
-                backends_to_check = (
-                    [backend_type]
-                    if backend_type and backend_type in self.discovered_devices
-                    else list(self.discovered_devices.keys())
-                )
-                for b in backends_to_check:
-                    for dev in self.discovered_devices.get(b, []):
-                        # compare by device_id key on discovered device
-                        if str(dev.get("device_id")) == str(device_id):
-                            found = True
-                            break
-                    if found:
-                        break
-
-                # Return numeric DeviceStatus.value for JSON-serializable status
-                results[group_id][device_id] = (
-                    DeviceStatus.CONNECTED.value
-                    if found
-                    else DeviceStatus.DISCONNECTED.value
+                    raise AuthenticationError("Invalid authentication token") from None
+                
+                # If we are here, we have succeeded in authentication 
+                send_response(
+                    sock = client_socket, 
+                    response = Response.AUTHENTICATION_SUCCESS, 
+                    params = {
+                        "server_info": self.info, 
+                        "timestamp": time.time()
+                    },
+                    logger = self.logger
                 )
 
-        return results
+                # Store client info 
+                self.connected_client = {
+                    "ip": payload.get("ip", ""),
+                    "hostname": payload.get("hostname", ""),
+                    "name": payload.get("name", ""),
+                    "version": payload.get("version", ""),
+                }
+            except Exception as e: 
+                log_print(self.logger, 'error', f'Client authentication failed: {e}')
+                client_socket.close()
+                return False 
+            
+            return True
+        
+        else: 
+            return False 
 
-    def handle_disconnect_from_client(self):
-        # Disconnect clients from servers
-        logger.info("Disconnecting server from clients")
+    # Client command handling callbacks
+    def _respond_to_ping(self): 
+        msg = "Server ping succeeded"
+        log_print(self.logger, 'debug', msg)
+        send_response(self.control_conn, Response.SUCCESS, params={"message": msg})
 
+    def _close_client_connection(self): 
         try:
-            # Close sockets
-            if self.control_socket:
-                self.control_socket.close()
-            if self.data_socket:
-                self.data_socket.close()
+            # Close accepted sockets
+            if self.control_conn:
+                self.control_conn.close()
+            self.control_conn = None 
 
-            return {
-                "type": Response.SUCCESS.value,
-                "payload": {"message": "Server disconnected successfully"},
-            }
+            if self.data_conn:
+                self.data_conn.close()
+            self.data_conn = None 
+
+            log_print(self.logger, 'debug', "Server disconnected successfully")
         except Exception as e:
-            return {
-                "type": Response.ERROR.value,
-                "payload": {"message": f"Server disconnection error: {e}"},
-            }
+            log_print(self.logger, 'error', f"Server disconnection error: {e}")
+
         finally:
-            self.control_socket = None
-            self.data_socket = None
             self.status = ServerStatus.CLIENT_DISCONNECTED
 
-    # Device commands
-    def handle_connect_device(self, configurations: Dict = None):
-        """
-        Provided params will typically include device specific configurations,
-        using which all devices are initialized. Configurations provided by
-        the client are considered canonical (vis-a-vis values), regardless of
-        any pre-existing configs.
-        """
-        try:
-            # Accept either a flat mapping device_id->config or a group mapping
-            # group_id -> { device_id: config }
-            entries = []
-            if isinstance(configurations, dict) and all(
-                isinstance(v, dict) for v in configurations.values()
-            ):
-                # TODO: Validate for being dict of dicts
-                is_group = any(
-                    any(isinstance(iv, dict) for iv in v.values())
-                    if isinstance(v, dict)
-                    else False
-                    for v in configurations.values()
-                )
-                if is_group:
-                    # Flatten groups into (device_id, config) pairs.
-                    for group in configurations.values():
-                        if not isinstance(group, dict):
-                            continue
-                        for device_id, device_config_dict in group.items():
-                            # keep device_id as provided by client (inner key)
-                            entries.append((device_id, device_config_dict))
-                else:
-                    entries = list(configurations.items())
-            else:
-                entries = (
-                    list(configurations.items())
-                    if isinstance(configurations, dict)
-                    else []
-                )
+    # Device command handling callbacks 
+    def _discover_devices(self, payload): 
+        # Refresh list of discovered devices
+        self.discovered_devices = []
+        for backend_type, backend in AVAILABLE_BACKENDS.items(): 
+            try:
+                self.discovered_devices.extend(backend.discover_devices())
+            except Exception as e: 
+                msg = f'Device discovery failed for devices of type {backend_type} with error: {e}'
+                log_print(self.logger, 'warning', msg)
+        
+        log_print(self.logger, 'debug', f'Found {self.discovered_devices}')
+        
+        # Extract provided device configuration
+        device_groups = payload.get('device_groups', {})
+        if device_groups is {} or not is_dict_of_dicts(device_groups):
+            return None
 
-            # Initialize each device backend
-            for device_id, device_config_dict in entries:
-                # Make device configuration object
-                device_configuration = Configuration.from_dict(device_config_dict)
+        # Check if all devices in the device groups are present 
+        for group_id, group_dict in device_groups.items(): 
+            for device_id in group_dict.keys():
+                if device_id in self.discovered_devices:
+                    device_groups[group_id][device_id]['status'] = DeviceStatus.AVAILABLE.name
+                else: 
+                    device_groups[group_id][device_id]['status'] = DeviceStatus.UNAVAILABLE.name
 
-                # Create the backend handler
-                backend_type = device_configuration.get_param("backend_type")
-                backend_module = AVAILABLE_BACKENDS[backend_type]
+        
+        return device_groups
 
-                handler = backend_module.get_backend_handler(
-                    configuration=device_configuration,
-                    display_data_queue=self.display_data_queue,
-                    command_queue=self.command_queue,
-                    response_queue=self.response_queue,
-                )
+    def _initialize_devices(self, payload):
+        # For flexibility, we provide device configurations to both initialize and discover.
+        device_groups = self._discover_devices(payload)
+        
+        if not device_groups: 
+            send_response(self.control_conn, Response.ERROR, 
+                params={"message": "Invalid configuration provided"}) 
+            return 
 
+        response = Response.SUCCESS
+
+        # Now that we have a valid device configuration, try initializing 
+        self.device_group_states = {} # Refresh
+        self.device_group_handlers = {} # Refresh
+        
+        for group_id, group_dict in device_groups.items(): 
+            try:
+                # Get handler
+                handler = get_device_group_handler(group_dict)
+                # Initialize
                 handler.initialize()
+                # Store 
+                self.device_group_states[group_id] = DeviceStatus.CONNECTED.name
+                self.device_group_handlers[group_id] = handler
+            except Exception as e:
+                msg = f'Unable to initialize group: {group_id}. Error: {e}'
+                response = Response.WARNING
+                log_print(self.logger, 'error', msg)
 
-                # Store reference keyed by device_id
-                self.backends[device_id] = handler
-
-            # Communicate success
-            return {
-                "type": Response.SUCCESS.value,
-                "payload": {"message": "Device(s) inited successfully"},
-            }
-
-        except Exception as e:
-            # Communicate failure
-            return {
-                "type": Response.ERROR.value,
-                "payload": {
-                    "message": f"Device initialization failed: {e}",
-                    "traceback": traceback.format_exc(),
-                },
-            }
-
-    def handle_get_device_status(self, param_dict):
-        device_id = param_dict.get("device_id", None)
-        if not device_id:
-            return self.backends[device_id].get_device_status()
-
-    def handle_start_streaming(self):
-        # Order devices to start streaming
-        if len(self.backends) == 0:
-            return {
-                "type": Response.WARNING.value,
-                "payload": {"message": "No devices connected."},
-            }
-
-        try:
-            logger.info("Starting data streaming")
-
-            # Start your existing receive/transmit workers
-            for backend in self.backends.values():
-                backend.start_streaming()
-
-            self.status = ServerStatus.STREAMING
-
-            logger.info("Data streaming started")
-            return {
-                "type": Response.SUCCESS.value,
-                "payload": {"message": "Data streaming started"},
-            }
-        except Exception as e:
-            return {
-                "type": Response.ERROR.value,
-                "payload": {"message": f"Failed to start streaming: {e}"},
-            }
-
-    def handle_stop_streaming(self):
-        if self.status != ServerStatus.STREAMING:
-            return {
-                "type": Response.WARNING.value,
-                "payload": {"message": "Server is not currently streaming"},
-            }
-        try:
-            logger.info("Stopping data streaming")
-            for backend in self.backends.values():
-                backend.stop_streaming()
-
-            self.status = ServerStatus.DEVICES_CONNECTED
-
-            return {
-                "type": Response.SUCCESS.value,
-                "payload": {"message": "Data streaming stopped"},
-            }
-        except Exception as e:
-            return {
-                "type": Response.ERROR.value,
-                "payload": {"message": f"Failed to stop streaming: {e}"},
-            }
-
-    def handle_update_runing_parameter(self, param_dict):
-        # TODO: This simply looks like adding the payload to command queue
-        pass
-
-    # We are not sure if this is a thing to do currently
-    def handle_update_device_firmware(self):
-        raise NotImplementedError
-
-    def handle_disconnect_device(self):
-        # Disconnect all devices
-        try:
-            for backend in self.backends.values():
-                backend.disconnect()
-
-            logger.info("Devices disconnected")
-
-            self.status = ServerStatus.DEVICES_DISCONNECTED
-
-            return {
-                "type": Response.SUCCESS.value,
-                "payload": {"message": "Devices successfully disconnected"},
-            }
-        except Exception as e:
-            return {
-                "type": Response.ERROR.value,
-                "payload": {"message": f"Disconnect error: {e}"},
-            }
-
-    def handle_update_device_config(self, group_id, param, value, device_id=""):
-        if group_id not in self.backends:
-            return {
-                "type": Response.ERROR.value,
-                "message": f"Invalid device {group_id} specified for modification.",
-            }
-
-        backend = self.backends[group_id]  # type(BACKEND)
-
-        backend.command_queue.put(
-            {
-                "param": param,
-                "value": value,
-                # For device groups with multiple devices
-                "device_id": device_id,
+        # Send response (both discovered states as well as initialized devices)
+        send_response(
+            sock = self.control_conn, 
+            response = response, 
+            params = {
+                "discovered_devices": device_groups, 
+                "connection_states": self.device_group_states
             }
         )
 
+        
+    def _disconnect_devices(self):
+        if len(self.device_group_handlers) == 0:
+            msg = "Server has no initialized devices"
+            log_print(self.logger, 'warning', msg)
+            send_response(self.control_conn, Response.SUCCESS, params={"message": msg})
+        
+        try: 
+            for handler in self.device_group_handlers.values():
+                handler.disconnect()
 
-if __name__ == "__main__":
+            msg = "Devices disconnected successfully"
+            log_print(self.logger, 'info', msg)
+            send_response(self.control_conn, Response.SUCCESS, params={"message": msg})
+        except Exception as e:
+            msg = f"Failed to disconnect devices: {e}"
+            log_print(self.logger, 'error', msg)
+            send_response(self.control_conn, Response.ERROR, params={"message": msg})
+    
+    # Handle streaming 
+    def _start_streaming(self): 
+        if len(self.device_group_handlers) == 0: 
+            msg = "Server has no initialized devices"
+            log_print(self.logger, 'error', msg)
+            send_response(self.control_socket, Response.ERROR, params={"message": msg})
+
+        # Ask all backends to start
+        try:
+            log_print(self.logger, 'info', "Attempting to start data streaming")
+
+            # Start your existing receive/transmit workers
+            for handler in self.device_group_handlers.values():
+                handler.start_streaming()
+
+            self.status = ServerStatus.STREAMING
+
+            msg = "Data streaming started successfully"
+            log_print(self.logger, 'info', msg)
+            send_response(self.control_socket, Response.SUCCESS, params={"message": msg})
+        except Exception as e:
+            msg = f"Failed to start streaming: {e}"
+            log_print(self.logger, 'error', msg)
+            send_response(self.control_socket, Response.ERROR, params={"message": msg})
+
+    def _stop_streaming(self):
+        if len(self.device_group_handlers) == 0:
+            msg = "Server has no initialized devices"
+            log_print(self.logger, 'warning', msg)
+            send_response(self.control_conn, Response.SUCCESS, params={"message": msg})
+
+        try:
+            log_print(self.logger, 'info', "Attempting to stop data streaming")
+
+            for handler in self.device_group_handlers.values():
+                handler.stop_streaming()
+
+            self.status = ServerStatus.DEVICES_CONNECTED
+
+            msg = "Data streaming stopped successfully"
+            log_print(self.logger, 'info', msg)
+            send_response(self.control_conn, Response.SUCCESS, params={"message": msg})
+        except Exception as e:
+            msg = f"Failed to stop streaming: {e}"
+            log_print(self.logger, 'error', msg)
+            send_response(self.control_conn, Response.ERROR, params={"message": msg})
+
+    def stop(self): 
+        log_print(self.logger, 'debug', f"Attempting to shutdown server")
+        self.running = False
+        
+        self._close_client_connection()
+        log_print(self.logger, 'debug', f"Server shut down successfully")
+
+if __name__ == '__main__': 
+    parser = argparse.ArgumentParser(description="Launch BioView Backend Server")
+    parser.add_argument(
+        "--discoverable",
+        action="store_true", 
+        help="Flag to make non-local clients be able to discover the server"
+    )
+    parser.add_argument(
+        "--control-port",
+        help=f"Port number to use for control connections. Default: {CONTROL_PORT}",
+        required=False, 
+        default=CONTROL_PORT
+    )
+    parser.add_argument(
+        "--data-port",
+        help=f"Port number to use for data connections. Default: {DATA_PORT}",
+        required=False, 
+        default=DATA_PORT
+    )
+
     logger = logging.getLogger(__name__)
     logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+        level=logging.DEBUG, format="%(asctime)s %(name)s: (%(levelname)s) %(message)s",
+        datefmt='%m/%d %H:%M:%S'
     )
-    logger.info("BioView Device Server, Version: %s", APP_VERSION)
+    log_print(logger, 'info', f"BioView Device Server, Version: {APP_VERSION}")
 
-    server = Server(discoverable=True)  # TODO: Control via argparse
+    args = parser.parse_args() 
+
+    server = Server(
+        local_only = args.discoverable,   # TODO: Correct it to not args.discoverable
+        control_port = args.control_port,
+        data_port = args.data_port,
+        logger = logger
+    )
+
     try:
         server.start()
     except KeyboardInterrupt:
-        logger.info("Keyboard interrupt received")
+        log_print(logger, 'warning', "Keyboard interrupt received. Shutting down server...")
     except Exception:
-        logger.exception("Server error")
+        log_print(logger, 'error', "Server error. Shutting down server...")
     finally:
         try:
             server.stop()
         except Exception:
-            logger.exception("Error while stopping server")
+            log_print(logger, 'error', "Unable to shut down server. Exiting...")

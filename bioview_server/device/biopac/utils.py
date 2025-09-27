@@ -84,7 +84,7 @@ def discover_devices():
             except Exception:
                 pass
 
-    return discovered_devices
+        return discovered_devices
 
 
 def load_mpdev_dll(custom_loc: str = None):
