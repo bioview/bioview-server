@@ -6,8 +6,7 @@ from typing import Callable, List
 import numpy as np
 import uhd
 
-from bioview_server.utils import emit_signal
-
+from bioview_common import log_print
 
 INIT_DELAY = 0.05  # 50mS initial delay before transmit
 
@@ -23,12 +22,12 @@ class TransmitWorker(Thread):
         if_freq: float,
         tx_streamer,
         cmd_queue: queue.Queue,
-        log_event: Callable,
         running: bool = False,
+        logger = None 
     ):
         super().__init__()
         # Signals
-        self.log_event = log_event
+        self.logger = logger
 
         # Modifiable params
         self.tx_gain = tx_gain
@@ -86,7 +85,7 @@ class TransmitWorker(Thread):
 
     def run(self):
         self.running = True
-        emit_signal(self.log_event, "debug", "Transmission Started")
+        log_print(self.logger, "debug", "Transmission Started")
         tx_metadata = uhd.types.TXMetadata()
         tx_metadata.start_of_burst = True
         tx_metadata.end_of_burst = False
@@ -109,9 +108,8 @@ class TransmitWorker(Thread):
                         for chan in self.tx_channels:
                             self.usrp.set_tx_gain(val[chan], chan)
 
-                    emit_signal(
-                        self.log_event,
-                        "debug",
+                    log_print(
+                        self.logger, "debug",
                         f"Tx gain updated to {val}. Current {self.tx_gain}",
                     )
                     self.tx_gain = val
@@ -123,15 +121,12 @@ class TransmitWorker(Thread):
                                 self.tx_waveform[idx] * val / curr_tx_amplitude[idx]
                             )
 
-                    emit_signal(
-                        self.log_event,
-                        "debug",
+                    log_print(
+                        self.logger, "debug",
                         f"Tx amplitude updated to {val}. Current {self.tx_amplitude}",
                     )
                     self.tx_amplitude = val
                 # NOTE: Any other modifiable parameters may be added here
-                else:
-                    pass
             except queue.Empty:
                 pass
 
@@ -140,7 +135,7 @@ class TransmitWorker(Thread):
                 buffer_iter = self.tx_waveform
                 num_samps = self.tx_streamer.send(buffer_iter, tx_metadata)
             except RuntimeError as ex:
-                emit_signal(self.log_event, "error", f"Runtime error in transmit: {ex}")
+                log_print(self.logger, "error", f"Runtime error in transmit: {ex}")
                 continue
 
             # Continue transmission
@@ -148,14 +143,14 @@ class TransmitWorker(Thread):
             tx_metadata.has_time_spec = False
 
             if num_samps < self.tx_buffer_size:
-                emit_signal(
-                    self.log_event, "warning", f"Tx Sent only {num_samps} samples"
+                log_print(
+                    self.logger, "warning", f"Tx Sent only {num_samps} samples"
                 )
 
         # End transmission
         tx_metadata.end_of_burst = True
         self.tx_streamer.send(np.zeros_like(self.tx_waveform), tx_metadata)
-        emit_signal(self.log_event, "debug", "Transmission Stopped")
+        log_print(self.logger, "debug", "Transmission Stopped")
 
     def stop(self):
         self.running = False

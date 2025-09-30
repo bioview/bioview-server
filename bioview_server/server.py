@@ -13,7 +13,6 @@ for expanding functionality to handle the case for multiple clients.
 """
 
 import time 
-import json
 import argparse
 import socket 
 import logging 
@@ -21,6 +20,8 @@ import ipaddress
 import contextlib
 
 from threading import Thread
+
+import multiprocessing as mp 
 
 from bioview_common import (    
     AuthenticationError,
@@ -81,6 +82,9 @@ class Server:
 
         # Threaded workers 
         self.cmd_thread = None 
+
+        # Queues for overall logging
+        self.response_queue = mp.Queue() 
 
         # Message logging
         if not logger: 
@@ -162,7 +166,6 @@ class Server:
             if self.status is ServerStatus.CLIENT_CONNECTED:
                 # Ensure we do not spawn endless threads
                 if not self.cmd_thread: 
-                    print('starting thread now')
                     self.cmd_thread = Thread(
                         target=self._command_handler, 
                         daemon=True 
@@ -185,14 +188,16 @@ class Server:
                 # Receive data continuously 
                 data = self.control_conn.recv(MAX_BUFFER_SIZE)
 
+                if data == b'\x00':
+                    # if keep-alive ping 
+                    continue
+
                 # Dispatch appropriate function 
                 cmd_type, payload = parse_and_validate_command(data)
                 log_print(self.logger, 'debug', f'Received {cmd_type} with {payload}')
 
                 match cmd_type:
                     # Client commands
-                    case Command.PING_SERVER.name: 
-                        self._respond_to_ping() 
                     case Command.DISCONNECT_SERVER.name: 
                         self._close_client_connection()
 
@@ -335,11 +340,6 @@ class Server:
             return False 
 
     # Client command handling callbacks
-    def _respond_to_ping(self): 
-        msg = "Server ping succeeded"
-        log_print(self.logger, 'debug', msg)
-        send_response(self.control_conn, Response.SUCCESS, params={"message": msg})
-
     def _close_client_connection(self): 
         try:
             # Close accepted sockets
@@ -405,7 +405,7 @@ class Server:
         for group_id, group_dict in device_groups.items(): 
             try:
                 # Get handler
-                handler = get_device_group_handler(group_dict)
+                handler = get_device_group_handler(group_dict, self.response_queue)
                 # Initialize
                 handler.initialize()
                 # Store 

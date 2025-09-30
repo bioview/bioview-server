@@ -10,8 +10,7 @@ def get_cache_file(file_name):
 
     return cache_file
 
-
-# TODO: Deprecated
+# NOTE:DEPRECATED
 def get_unique_path(dirname, filename):
     f_path = Path(dirname) / filename
     base, ext = f_path.stem, f_path.suffix

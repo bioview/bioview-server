@@ -24,7 +24,7 @@ def send_response(sock, response, params, logger = None, buffer_size: int = MAX_
         sock.send(response_json)
     except Exception as e: 
         msg = f'Error occurred while sending response: {e}'
-        log_print(logger, 'error', msg, fallback=True)
+        log_print(logger, 'error', msg)
 
 def parse_and_validate_command(data: str) -> List:
     if not data:

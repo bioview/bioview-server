@@ -1,9 +1,8 @@
 import multiprocessing as mp
 import queue
 from ctypes import byref, c_double
-from typing import List
 
-from bioview_common import DataSource, DeviceStatus
+from bioview_common import DataSource, DeviceStatus, log_print
 
 from bioview_server.common import DisplayWorker, SaveWorker
 from bioview_server.datatypes import Backend
@@ -20,24 +19,16 @@ from .utils import (
 class BIOPACBackend(Backend):
     def __init__(
         self,
-        id,
+        group_id,
         samp_rate: int,
-        display_sources: List[DataSource],
-        display_data_queue: mp.Queue,
-        command_queue: mp.Queue,
         response_queue: mp.Queue,
-        enable_save: bool = False,
-        save_path: str = None,
         mpdev_path: str = None,  # Does not need to be specified in general
         device_code: int = 103,  # Default for MP36
+        logger = None
     ):
         super().__init__(
-            id=id,
-            display_data_queue=display_data_queue,
-            command_queue=command_queue,
-            response_queue=response_queue,
-            enable_save=enable_save,
-            save_path=save_path,
+            group_id=group_id,
+            response_queue=response_queue
         )
         # Store common variables
         self.samp_rate = samp_rate
@@ -47,36 +38,21 @@ class BIOPACBackend(Backend):
         self.mpdev_handler = load_mpdev_dll(mpdev_path)
 
         # Populate data sources
-        self.populate_data_sources()
-
-        # Saving parameters
-        self.save_worker = None
-        self.save_queue = mp.Queue()
-
-        if self.enable_save and self.save_path is not None:
-            self.save_worker = SaveWorker(
-                save_path=save_path,
-                data_queue=self.save_queue,
-                num_channels=len(self.data_sources),
-                log_event=self.log_event,
-            )
+        self.get_data_sources()
 
         # Display parameters
         # TODO: Run this in a function which is constantly providing new data_sources
         self.display_worker = None
-        self.display_sources = display_sources
         self.display_worker = DisplayWorker(
             config=self.config,
             data_queue=self.display_queue,
             running=True,
         )
         self.display_worker.data_ready = self.data_ready
-        self.display_worker.log_event = self.log_event
 
-        # Initialize
-        self.initialize()
+        self.logger = logger 
 
-    def populate_data_sources(self):
+    def get_data_sources(self):
         # Generate channel labels:data queue index mapping
         # alongwith absolute channel numbers
         for idx, _ in enumerate(self.config.channels):
@@ -102,11 +78,12 @@ class BIOPACBackend(Backend):
                 sample_rate=self.samp_rate,
             )
 
-            self.log_event("debug", "Successfully initialized BIOPAC device")
-            self.status_changed(DeviceStatus.CONNECTED)
+            self.status = DeviceStatus.CONNECTED
+            log_print(self.logger, "debug", "Successfully initialized BIOPAC device")
+            return True 
         except Exception as e:
-            self.log_event("error", f"Unable to initialize device: {e}")
-            self.status_changed(DeviceStatus.DISCONNECTED)
+            log_print(self.logger, "error", f"Unable to initialize device: {e}")
+            return False
 
     def start_streaming(self):
         self.status = DeviceStatus.STREAMING
@@ -133,18 +110,19 @@ class BIOPACBackend(Backend):
                     self.save_queue.put(sample)
 
                     # TODO: Only add samples from display_sources
+                    # TODO: This needs to call the super add to queue function honestly
                     self.display_data_queue.put(sample)
 
         except queue.Full:
-            self.log_event("warning", "Queues full. Data not being consumed correctly.")
+            log_print(self.logger, "warning", "Queues full. Data not being consumed correctly.")
         except Exception as e:
-            self.log_event("error", f"BIOPAC Streaming Error: {e}")
+            log_print(self.logger, "error", f"BIOPAC Streaming Error: {e}")
 
     def stop_streaming(self):
         try:
             stop_acquisition(self.mpdev_handler)
         except Exception as e:
-            self.log_event("error", f"BIOPAC Stopping Error: {e}")
+            log_print(self.logger, "error", f"BIOPAC Stopping Error: {e}")
 
         self.status = DeviceStatus.CONNECTED
 

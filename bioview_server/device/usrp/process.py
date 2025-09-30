@@ -1,37 +1,39 @@
 import queue
 from threading import Thread
-from typing import Callable
 
 import numpy as np
 
+from bioview_common import log_print
 from bioview_server.utils import apply_filter, get_filter
 
 
 class ProcessWorker(Thread):
     def __init__(
         self,
+        data_sources,
         samp_rate,
         channel_ifs,
         if_filter_bw,
-        num_channels,
         rx_queues: list[queue.Queue],
-        save_queue: queue.Queue,
-        display_queue: queue.Queue,
-        save_imaginary: bool,
-        save_iq: bool,
-        display_imaginary: bool,
-        log_event: Callable,
+        save_queue: queue.Queue = None,
+        display_queue: queue.Queue = None,
+        save_ds: int = 1, 
+        save_imaginary: bool = False, 
+        save_iq: bool = False,
+        display_imaginary: bool = False,
+        logger = None
     ):
         super().__init__()
 
         # Signal
-        self.log_event = log_event
+        self.logger = logger
 
-        self.num_channels = num_channels
+        self.data_sources = data_sources.copy()
 
         # Variables
         self.samp_rate = samp_rate
         self.channel_ifs = channel_ifs
+        self.save_ds = save_ds
         self.save_imaginary = save_imaginary
         self.save_iq = save_iq
         self.display_imaginary = display_imaginary
@@ -51,7 +53,7 @@ class ProcessWorker(Thread):
         ]
 
         # Keep track of phase and filter states for all data sources
-        for source in self.num_channels:
+        for source in self.data_sources.values():
             source.accumulated_phase = 0.0
             source.filter_state = None
 
@@ -77,7 +79,8 @@ class ProcessWorker(Thread):
             # Check for significant discontinuity
             discontinuity = abs(data[0] - source.last_samples)
             if discontinuity > 3 * np.std(data[: min(100, len(data))]):
-                self.log_event(
+                log_print(
+                    self.logger,
                     "debug", f"Potential discontinuity detected in {source.channel}"
                 )
 
@@ -130,7 +133,7 @@ class ProcessWorker(Thread):
 
     def _process_save(self, buffer):
         # Use numpy preallocated array for speed
-        num_sources = len(self.num_channels)
+        num_sources = len(self.data_sources)
         len_samples = int(buffer.shape[1] // self.save_ds)
 
         # We might not always want to save imaginary components
@@ -139,7 +142,7 @@ class ProcessWorker(Thread):
         else:
             save_list = np.empty((num_sources, len_samples))
 
-        for source in self.num_channels:
+        for source in self.data_sources.values():
             data = buffer[source.rx_idx, :]
             first_comp, second_comp = self._process_chunk(
                 data=data,
@@ -148,7 +151,7 @@ class ProcessWorker(Thread):
                 if_freq=self.channel_ifs[source.tx_idx],
             )
 
-            self.log_event("debug", f"Processed channel {source.channel}")
+            log_print(self.logger, "debug", f"Processed channel {source.channel}")
 
             if self.save_imaginary:
                 save_list[source.channel, :, 0] = first_comp
@@ -178,7 +181,7 @@ class ProcessWorker(Thread):
 
         # Return all processed samples
         return save_list
-
+    
     def run(self):
         # Preallocate empty buffer to get faster performance
         data_buf = None
@@ -194,13 +197,13 @@ class ProcessWorker(Thread):
                 buffer_data = np.transpose(np.vstack(data_buf))
                 processed = self._process_save(buffer_data)
 
-                # Add to save queue
+                # Add to save queue 
                 if self.save_queue is not None:
                     try:
                         self.save_queue.put(processed)
-                        self.log_event("debug", "[USRP] Added to save queue")
+                        log_print(self.logger, "debug", "[USRP] Added to save queue")
                     except queue.Full:
-                        self.log_event("debug", "[USRP] Save Queue Full")
+                        log_print(self.logger, "debug", "[USRP] Save Queue Full")
 
                 # Add to display queue
                 try:
@@ -213,21 +216,18 @@ class ProcessWorker(Thread):
                             self.display_queue.put(processed[:, :, 1])
                         else:
                             self.display_queue.put(processed[:, :, 0])
-                        self.log_event("debug", "[USRP] Added to display queue")
+                        log_print(self.logger, "debug", "[USRP] Added to display queue")
                 except queue.Full:
-                    self.log_event("debug", "[USRP] Display Queue Full")
+                    log_print(self.logger, "debug", "[USRP] Display Queue Full")
 
             except queue.Empty:
-                self.log_event("debug", "[USRP] Rx Queue Empty")
-                continue
+                log_print(self.logger, "debug", "[USRP] Rx Queue Empty")
             except queue.Full:
-                self.log_event("debug", "[USRP] Rx Queue Full")
-                continue
+                log_print(self.logger, "debug", "[USRP] Rx Queue Full")
             except Exception as e:
-                self.log_event("error", f"[USRP] Processing error: {e}")
-                continue
+                log_print(self.logger, "error", f"[USRP] Processing error: {e}")
 
-        self.log_event("debug", "[USRP] Processing stopped")
+        log_print(self.logger, "debug", "[USRP] Processing stopped")
 
     def stop(self):
         self.running = False

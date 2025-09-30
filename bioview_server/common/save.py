@@ -5,8 +5,6 @@ from typing import Callable
 import h5py
 import numpy as np
 
-from bioview_server.utils import emit_signal
-
 
 def init_save_file(file_path, num_channels: int, chunk_size: int = 500):
     with h5py.File(file_path, "w") as f:
@@ -38,13 +36,12 @@ class SaveWorker:
         save_path,
         data_queue: mp.Queue,
         num_channels: int,
-        log_event: Callable = None,
         parent=None,
+        logger = None 
     ):
         super().__init__(parent)
-        # Signals
-        self.log_event = None
-
+        self.logger = logger
+        
         # Variables
         self.running = False
 
@@ -65,7 +62,6 @@ class SaveWorker:
             try:
                 data = self.data_queue.get()
             except queue.Empty:
-                emit_signal(self.logEvent, "debug", "No data to save")
                 continue
 
             update_save_file(self.save_path, data)

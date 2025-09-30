@@ -2,10 +2,9 @@ import queue
 from typing import Callable, Dict, List
 
 import numpy as np
-from bioview_common import DataSource
 
+from bioview_common import DataSource, log_print
 from bioview_server.utils import apply_filter, emit_signal, get_filter
-
 
 MODIFIABLE_PARAMS = [
     "display_ds",
@@ -20,27 +19,29 @@ class DisplayWorker:
         self,
         samp_rate: int,
         display_ds: int,
-        display_filter: Dict,
         display_sources: List[DataSource],
         data_queue: queue.Queue,  # Data comes in
         cmd_queue: queue.Queue,  # To handle display filter changes, for example
         data_ready: Callable,  # Data pushed to client
-        log_event: Callable,
-        parent=None,
+        display_filter: Dict = None,
+        logger = None 
     ):
-        super().__init__(parent)
+        super().__init__()
         # Sources
         self.display_sources = display_sources
 
         # Processing
         self.display_ds = display_ds
 
-        self.display_filter = get_filter(
-            bounds=display_filter["bounds"],
-            samp_rate=samp_rate,
-            btype=display_filter["btype"],
-            ftype=display_filter["ftype"],
-        )
+        if display_filter:
+            self.display_filter = get_filter(
+                bounds=display_filter["bounds"],
+                samp_rate=samp_rate,
+                btype=display_filter["btype"],
+                ftype=display_filter["ftype"],
+            )
+        else: 
+            self.display_filter = None
 
         # Queues
         self.data_queue = data_queue
@@ -51,7 +52,7 @@ class DisplayWorker:
 
         # Signals
         self.data_ready = data_ready
-        self.log_event = log_event
+        self.logger = logger 
 
     def process(self, data):
         # Downsample
@@ -59,8 +60,8 @@ class DisplayWorker:
         processed = data[:: self.display_ds]
 
         # Filter
-        if self.display_filter is not None:
-            processed, _ = apply_filter(processed, self.disp_filter)
+        if self.display_filter:
+            processed, _ = apply_filter(processed, self.display_filter)
         return processed
 
     def run(self):
@@ -94,13 +95,13 @@ class DisplayWorker:
                     # Add to display queue
                     emit_signal(self.data_ready, np.array(processed), source)
             except queue.Empty:
-                emit_signal(self.log_event, "error", "Queue Empty")
+                log_print(self.logger, "warning", "Queue Empty")
                 continue
             except Exception as e:
-                emit_signal(self.log_event, "error", f"Display error: {e}")
+                log_print(self.logger, "warning", f"Display error: {e}")
                 continue
 
-        emit_signal(self.log_event, "debug", "Display stopped")
+        log_print(self.logger, "debug", "Display stopped")
 
     def stop(self):
         self.running = False

@@ -6,13 +6,13 @@ shared set of functionality, listed below.
 
 Queues:
 - Display Data Queue:
-- Command Queue:
 - Response Queue:
 
 
 Functions:
 1. Device Control
 - initialize()
+- queue_param_update()
 - start_streaming()
 - stop_streaming()
 - disconnect()
@@ -23,66 +23,128 @@ Functions:
 
 
 Signals:
-- status_changed(STATUS)
-- log_event(LOG_LEVEL, LOG_MESSAGE)
 - data_ready(DATA)
 
 
-Variables:
-- id: str
+Properties:
+- group_id: str
 - status: DeviceStatus
-- display_sources: List[DataSource]
 - enable_save: bool
 - save_path: str
 """
-
+import contextlib
 import multiprocessing as mp
+
+from typing import Dict, List 
 
 from bioview_common import DataSource, DeviceStatus
 
-from bioview_server.callbacks import data_ready, device_status_changed, log_event
+from bioview_server.common import SaveWorker
+from bioview_server.callbacks import data_ready, log_event
 
 
 class Backend(mp.Process):
     def __init__(
         self,
-        id: str,
-        display_data_queue: mp.Queue,
-        command_queue: mp.Queue,
-        response_queue: mp.Queue,
-        enable_save: bool = True,
-        save_path: str = None,
+        group_id: str,
+        response_queue: mp.Queue
     ):
         super().__init__()
         # Parameters
-        self.id = id
-        self.data_sources: list[DataSource] = []
+        self.group_id = group_id
+        self.data_sources: Dict[DataSource] = []
+        self.display_sources: List[DataSource] = [] 
 
-        # Queues
-        self.display_data_queue = display_data_queue  # Sends to client
-        self.command_queue = command_queue  # Gets from client
+        # Queues        
+        self.save_queue = None     
+        self.display_queue = None 
         self.response_queue = response_queue  # Sends to client
-
+        
+        self.enable_save = False
+            
         # State
         self.status = DeviceStatus.DISCONNECTED
 
         # Signals
-        self.log_event = lambda x, y: log_event(self.response_queue, x, y)
-        self.status_changed = lambda x, y=None: device_status_changed(
-            self.response_queue, group_id=self.id, status=x, device_id=y
-        )
-        self.data_ready = lambda x, y: data_ready(self.display_data_queue, x, y)
+        self.data_ready = lambda x, y: data_ready(self.display_queue, x, y)
 
-        # Handle save
-        self.enable_save = enable_save
+    # Common setup 
+    def setup_saving(self, save_path: str = None): 
+        '''
+        Sets up workers to save data in a common format
+        '''    
+        self.enable_save = True
         self.save_path = save_path
+        
+        self.save_worker = None
+        
+        if not self.save_queue:
+            self.save_queue = mp.Queue()
+        else:
+            # Flush 
+            while not self.save_queue.empty():
+                self.save_queue.get_nowait()
 
-    def populate_data_sources(self):
-        raise NotImplementedError
+        if self.enable_save and self.save_path is not None:
+            self.save_worker = SaveWorker(
+                save_path=save_path,
+                data_queue=self.save_queue,
+                num_channels=len(self.data_sources)
+            )
+
+        # Any other specific functionality can be implemented by subclasses
+
+    def stop_saving(self): 
+        self.enable_save = False
+        self.save_worker.stop()
+        
+        # Flush save queue 
+        while not self.save_queue.empty():
+            self.save_queue.get_nowait()
 
     # Device Control
     def initialize(self):
         raise NotImplementedError
+
+    def queue_param_update(self): 
+        ''' 
+        Backends that implement this function will be able to handle 
+        real-time update of parameters by implementing multiprocessing 
+        queues internally
+        '''
+        raise NotImplementedError
+    
+    def populate_data_sources(self):
+        raise NotImplementedError
+    
+    def get_data_sources(self):
+        return self.data_sources
+        
+    def get_display_sources(self):
+        '''
+        Broadcasts available display sources to server handler which can 
+        then choose to enable/disable on a per-device basis, as specified
+        by the client handler
+        '''
+        return self.display_sources
+    
+    def add_display_source(self, display_queue, source_id):
+        '''
+        On the basis of client requests, provides the handler with a 
+        mechanism to register different sources from which to send display 
+        information
+        '''
+        if not self.display_queue and display_queue: 
+            self.display_queue = display_queue
+            self.display_sources.append(source_id)
+    
+    def remove_display_source(self, source_id):
+        '''
+        Removes a display source if specified by the calling handler, typically
+        because a client wants to replace it with something else
+        '''
+        with contextlib.suppress(Exception):
+            self.display_sources.remove(source_id) 
 
     def start_streaming(self):
         raise NotImplementedError
