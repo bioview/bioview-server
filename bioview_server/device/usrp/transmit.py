@@ -1,7 +1,7 @@
 import math
 import queue
 from threading import Thread
-from typing import Callable, List
+from typing import List
 
 import numpy as np
 import uhd
@@ -9,7 +9,6 @@ import uhd
 from bioview_common import log_print
 
 INIT_DELAY = 0.05  # 50mS initial delay before transmit
-
 
 class TransmitWorker(Thread):
     def __init__(
@@ -26,6 +25,9 @@ class TransmitWorker(Thread):
         logger = None 
     ):
         super().__init__()
+
+        self.daemon = True
+
         # Signals
         self.logger = logger
 
@@ -97,7 +99,7 @@ class TransmitWorker(Thread):
         while self.running:
             # Check for updated parameters
             try:
-                current_command = self.cmd_queue.pop()
+                current_command = self.cmd_queue.get()
 
                 # Command here will just tell adjustable params and will make changes
                 param = current_command["param"]

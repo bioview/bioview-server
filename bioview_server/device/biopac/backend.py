@@ -1,10 +1,10 @@
-import multiprocessing as mp
 import queue
+import multiprocessing as mp
 from ctypes import byref, c_double
 
 from bioview_common import DataSource, DeviceStatus, log_print
 
-from bioview_server.common import DisplayWorker, SaveWorker
+from bioview_server.common import SaveWorker
 from bioview_server.datatypes import Backend
 
 from .utils import (
@@ -22,13 +22,14 @@ class BIOPACBackend(Backend):
         group_id,
         samp_rate: int,
         response_queue: mp.Queue,
+        data_output_queue: mp.Queue = None, 
         mpdev_path: str = None,  # Does not need to be specified in general
-        device_code: int = 103,  # Default for MP36
-        logger = None
+        device_code: int = 103  # Default for MP36
     ):
         super().__init__(
             group_id=group_id,
-            response_queue=response_queue
+            response_queue=response_queue,
+            data_output_queue=data_output_queue
         )
         # Store common variables
         self.samp_rate = samp_rate
@@ -38,21 +39,9 @@ class BIOPACBackend(Backend):
         self.mpdev_handler = load_mpdev_dll(mpdev_path)
 
         # Populate data sources
-        self.get_data_sources()
+        self.populate_data_sources()
 
-        # Display parameters
-        # TODO: Run this in a function which is constantly providing new data_sources
-        self.display_worker = None
-        self.display_worker = DisplayWorker(
-            config=self.config,
-            data_queue=self.display_queue,
-            running=True,
-        )
-        self.display_worker.data_ready = self.data_ready
-
-        self.logger = logger 
-
-    def get_data_sources(self):
+    def populate_data_sources(self):
         # Generate channel labels:data queue index mapping
         # alongwith absolute channel numbers
         for idx, _ in enumerate(self.config.channels):
@@ -109,9 +98,7 @@ class BIOPACBackend(Backend):
                     sample = [data_buffer[i] for i in range(num_channels + 1)]
                     self.save_queue.put(sample)
 
-                    # TODO: Only add samples from display_sources
-                    # TODO: This needs to call the super add to queue function honestly
-                    self.display_data_queue.put(sample)
+                    self.display_queue.put(sample)
 
         except queue.Full:
             log_print(self.logger, "warning", "Queues full. Data not being consumed correctly.")

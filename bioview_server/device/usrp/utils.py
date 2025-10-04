@@ -3,11 +3,12 @@ Ref: uhd examples
 """
 import json
 import time
+import contextlib
 from datetime import datetime, timedelta
 
 import numpy as np
 import uhd
-from bioview_common import DataSource
+from bioview_common import DataSource, log_print
 
 from bioview_server.utils import get_cache_file
 
@@ -17,7 +18,6 @@ CLOCK_TIMEOUT = 1000  # 1000ms timeout for external clock locking
 
 def update_device_firmware():
     pass
-
 
 def discover_devices():
     """
@@ -29,14 +29,15 @@ def discover_devices():
 
     These props are wrapped into an appropriate payload
     """
-    discovered_devices = []
+    discovered_devices = {}
 
     try:
         device_list = uhd.find("")
 
         for device in device_list:
             device_dict = dict(device)
-            discovered_devices.append(device_dict)
+            device_id = device_dict.get('name', 'invalid_usrp_device')
+            discovered_devices[device_id] = device_dict
 
             # Update in cache
             update_usrp_address(device_dict["name"], device_dict["serial"])
@@ -196,15 +197,13 @@ def get_usrp_address(device_name: str):
     return map_dict[device_name]
 
 
-def update_usrp_address(device_name: str, device_serial: str):
+def update_usrp_address(device_name: str, device_serial: str, logger = None):
     cache_file = get_cache_file("usrp_serial_numbers")
     map_dict = {}
 
-    try:
+    with contextlib.suppress(Exception):
         with open(cache_file) as fobj:
             map_dict = json.load(fobj)
-    except Exception:
-        print("Cache does not exist currently. Creating new cache file.")
 
     map_dict[device_name] = device_serial
 
@@ -214,5 +213,3 @@ def update_usrp_address(device_name: str, device_serial: str):
             json.dump(map_dict, fobj)
     except Exception as e:
         print(f"Error updating cache: {e}")
-    finally:
-        print("Cache updated successfully")

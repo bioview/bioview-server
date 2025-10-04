@@ -1,6 +1,6 @@
 import multiprocessing as mp
 import queue
-from typing import Callable
+from threading import Thread 
 
 import h5py
 import numpy as np
@@ -30,16 +30,14 @@ def update_save_file(file_path, chunk):
         dset[:, cur_cols:new_cols] = save_chunk
 
 
-class SaveWorker:
+class SaveWorker(Thread):
     def __init__(
         self,
         save_path,
         data_queue: mp.Queue,
         num_channels: int,
-        parent=None,
         logger = None 
     ):
-        super().__init__(parent)
         self.logger = logger
         
         # Variables

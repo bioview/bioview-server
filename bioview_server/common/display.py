@@ -1,9 +1,10 @@
 import queue
-from typing import Callable, Dict, List
+from threading import Thread
+from typing import Callable, Dict
 
 import numpy as np
 
-from bioview_common import DataSource, log_print
+from bioview_common import log_print
 from bioview_server.utils import apply_filter, emit_signal, get_filter
 
 MODIFIABLE_PARAMS = [
@@ -14,21 +15,17 @@ MODIFIABLE_PARAMS = [
 ]
 
 
-class DisplayWorker:
+class DisplayWorker(Thread):
     def __init__(
         self,
         samp_rate: int,
-        display_ds: int,
-        display_sources: List[DataSource],
+        display_ds: int, 
         data_queue: queue.Queue,  # Data comes in
-        cmd_queue: queue.Queue,  # To handle display filter changes, for example
         data_ready: Callable,  # Data pushed to client
         display_filter: Dict = None,
         logger = None 
     ):
         super().__init__()
-        # Sources
-        self.display_sources = display_sources
 
         # Processing
         self.display_ds = display_ds
@@ -45,7 +42,6 @@ class DisplayWorker:
 
         # Queues
         self.data_queue = data_queue
-        self.cmd_queue = cmd_queue
 
         # State
         self.running = False
@@ -56,7 +52,7 @@ class DisplayWorker:
 
     def process(self, data):
         # Downsample
-        # NOTE: This may be replaced by scipy.decimate()
+        # TODO: This may be replaced by scipy.decimate()
         processed = data[:: self.display_ds]
 
         # Filter

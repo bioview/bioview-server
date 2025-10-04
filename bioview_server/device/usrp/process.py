@@ -81,7 +81,7 @@ class ProcessWorker(Thread):
             if discontinuity > 3 * np.std(data[: min(100, len(data))]):
                 log_print(
                     self.logger,
-                    "debug", f"Potential discontinuity detected in {source.channel}"
+                    "debug", f"[USRP] Potential discontinuity detected in {source.channel}"
                 )
 
         # Store last sample for next buffer
@@ -151,7 +151,7 @@ class ProcessWorker(Thread):
                 if_freq=self.channel_ifs[source.tx_idx],
             )
 
-            log_print(self.logger, "debug", f"Processed channel {source.channel}")
+            log_print(self.logger, "debug", f"[USRP] Processed channel {source.channel}")
 
             if self.save_imaginary:
                 save_list[source.channel, :, 0] = first_comp
@@ -187,10 +187,13 @@ class ProcessWorker(Thread):
         data_buf = None
         samples = [None] * len(self.rx_queues)
 
+        self.running = True 
+        
         while self.running:
             try:
                 # Get from all queues
-                for idx, rx_q in enumerate(self.rx_queues):
+                for idx, key in enumerate(self.rx_queues):
+                    rx_q = self.rx_queues[rx_q]
                     samples[idx] = rx_q.get()
                 data_buf = np.transpose(np.vstack(samples))
 

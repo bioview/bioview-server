@@ -1,12 +1,19 @@
-import multiprocessing as mp
 import queue
+import multiprocessing as mp
+
+from threading import Thread
 from typing import Dict, List
 
-import uhd
-from bioview_common import log_print, DeviceStatus, Configuration, DeviceType
+import os
+# Set the environment variable to suppress non-critical messages
+# 'error' will only show errors. 'fatal' will show even less.
+os.environ['UHD_LOG_LEVEL'] = 'error'
 
-from bioview_server.common import DisplayWorker
+import uhd
+from bioview_common import log_print, DeviceStatus, Configuration, DeviceType, silence_function
+
 from bioview_server.datatypes import Backend
+
 
 from .process import ProcessWorker
 from .receive import ReceiveWorker
@@ -25,7 +32,7 @@ FILLING_TIME = 0.35
 # This is a good balance between real time display and spikes
 SAVE_BUFFER_SIZE = 20
 
-
+@silence_function
 def initialize_usrp_device(
     serial,
     tx_subdev,
@@ -112,14 +119,15 @@ class USRPBackend(Backend):
         samp_rate: int,
         devices: Dict,
         response_queue: mp.Queue,
+        data_output_queue: mp.Queue = None,
         display_ds: int = 10,
         display_imaginary: bool = False,
-        discovered_devices: List = None,
-        logger = None 
+        discovered_devices: List = None
     ):
         super().__init__(
             group_id=group_id, 
-            response_queue=response_queue
+            response_queue=response_queue,
+            data_output_queue=data_output_queue
         )
         # Store common variables
         self.samp_rate = samp_rate
@@ -139,11 +147,10 @@ class USRPBackend(Backend):
         self.transmit_workers = {}
         self.tx_command_queue = {}
         self.receive_workers = {}
+        
         # Get decoded instructions from overall command queue
         self.rx_command_queue = {}
         self.display_command_queue = None
-
-        self.logger = logger
 
         self.discovered_devices = discovered_devices 
 
@@ -156,7 +163,7 @@ class USRPBackend(Backend):
         for device_key, device_config in devices.items():
             if not isinstance(device_config, dict):
                 raise ValueError(
-                    f"Expected device configuration to be a dict \
+                    f"[USRP] Expected device configuration to be a dict \
                       but got {type(device_config)} instead"
                 )
 
@@ -176,16 +183,7 @@ class USRPBackend(Backend):
 
         # Setup display
         self.display_queue = queue.Queue()
-
-        self.display_worker = DisplayWorker(
-            samp_rate=self.samp_rate,
-            display_sources=self.display_sources,
-            display_ds=display_ds,
-            display_filter={},
-            data_queue=self.display_queue,  # Gets data from ProcessWorker
-            cmd_queue=self.display_command_queue,
-            data_ready=self.data_ready,  # Puts data into shared display_data_queue
-        )
+        self.display_worker = None
 
         # Setup processing
         self.process_worker = ProcessWorker(
@@ -198,21 +196,20 @@ class USRPBackend(Backend):
             display_imaginary = self.display_imaginary,
         )
 
+    @silence_function
     def initialize(self):
         if self.discovered_devices is None:
             self.discovered_devices = discover_devices()
 
         for device_key, device_config in self.usrp_configs.items():
             device_serial = ""
-            discovered_names = [v['name'] for v in self.discovered_devices]
-            
-            if device_config.device_name not in discovered_names:
+                    
+            if device_config.device_name not in self.discovered_devices:
                 msg = f"Device {device_config.device_name} not connected to PC.",
                 log_print(self.logger, "error", msg)
                 return
 
-            idx = discovered_names.index(device_config.device_name)
-            device_serial = self.discovered_devices[idx]["serial"]
+            device_serial = self.discovered_devices[device_key]["serial"]
 
             try:
                 rx_gain = device_config.get_param("rx_gain")
@@ -262,10 +259,10 @@ class USRPBackend(Backend):
                     self.transmit_workers[device_key] = TransmitWorker(
                         usrp=response["usrp"],
                         tx_gain=tx_gain,
-                        tx_amplitude=device_config.get("tx_amplitude"),
+                        tx_amplitude=device_config.get_param("tx_amplitude"),
                         tx_channels=tx_channels,
                         samp_rate=self.samp_rate,
-                        if_freq=device_config.get("if_freq"),
+                        if_freq=device_config.get_param("if_freq"),
                         tx_streamer=response["tx_streamer"],
                         cmd_queue=self.tx_command_queue[device_key],
                     )
@@ -304,25 +301,25 @@ class USRPBackend(Backend):
             worker.start()
 
         # Start receive threads
-        for worker in self.transmit_workers.values():
-            worker.stop()
+        for worker in self.receive_workers.values():
+            worker.start()
 
         # Start saving
         self.process_worker.start() 
 
-        if self.save_worker is not None:
+        if self.save_worker:
             self.save_worker.start()
 
         # Start display
-        if self.display_worker is not None:
+        if self.display_worker:
             self.display_worker.start()
 
     def stop_streaming(self):
-        if self.save_worker is not None:
-            self.save_worker.stop()
+        # Stops display
+        self.running = False 
 
-        if self.display_worker is not None:
-            self.display_worker.stop()
+        if self.save_worker:
+            self.save_worker.stop()
 
         self.process_worker.stop() 
 
@@ -331,7 +328,7 @@ class USRPBackend(Backend):
             worker.stop()
 
         # Stop receive threads
-        for worker in self.transmit_workers.values():
+        for worker in self.receive_workers.values():
             worker.stop()
 
     def populate_data_sources(self):

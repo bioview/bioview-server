@@ -25,6 +25,9 @@ class ReceiveWorker(Thread):
         logger = None
     ):
         super().__init__()
+
+        self.daemon = True
+
         # Signals
         self.logger = logger
 
@@ -86,7 +89,7 @@ class ReceiveWorker(Thread):
         while self.running:
             # Check for updated parameters
             try:
-                current_command = self.cmd_queue.pop()
+                current_command = self.cmd_queue.get()
 
                 # Make changes to adjustable params
                 param = current_command["param"]

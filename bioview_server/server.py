@@ -25,6 +25,7 @@ import multiprocessing as mp
 
 from bioview_common import (    
     AuthenticationError,
+    ValidationError, 
     DeviceStatus, 
     get_app_info, 
     MAX_BUFFER_SIZE,
@@ -89,6 +90,10 @@ class Server:
         # Message logging
         if not logger: 
             self.logger = logging.getLogger(__name__)
+            logging.basicConfig(
+                level=logging.DEBUG, format="%(asctime)s %(name)s: (%(levelname)s) %(message)s",
+                datefmt='%m/%d %H:%M:%S'
+            )
         else:
             self.logger = logger 
 
@@ -130,7 +135,7 @@ class Server:
             self.control_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.control_socket.bind(("0.0.0.0", self.control_port))
             self.control_socket.listen(5)
-            log_print(self.logger, 'info', 'Control socket connected')
+            log_print(self.logger, 'debug', 'Control socket connected')
         except Exception as e: 
             log_print(self.logger, 'error', f'Unable to create control socket: {e}')
 
@@ -140,7 +145,7 @@ class Server:
             self.data_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.data_socket.bind(("0.0.0.0", self.data_port))
             self.data_socket.listen(10)
-            log_print(self.logger, 'info', 'Data socket connected')
+            log_print(self.logger, 'debug', 'Data socket connected')
         except Exception as e: 
             log_print(self.logger, 'error', f'Unable to create data socket: {e}')
 
@@ -188,7 +193,7 @@ class Server:
                 # Receive data continuously 
                 data = self.control_conn.recv(MAX_BUFFER_SIZE)
 
-                if data == b'\x00':
+                if data.count(b'\x00') == len(data):
                     # if keep-alive ping 
                     continue
 
@@ -204,18 +209,21 @@ class Server:
                     # Device commands 
                     case Command.DISCOVER_DEVICES.name: 
                         # Pass device configuration here 
-                        discovery_states = self._discover_devices(payload)
-                        if discovery_states:
+                        self._discover_devices(payload)
+
+                        # Send response here since we don't want to send this response during init 
+                        if self.device_group_states != {}: 
                             send_response(
                                 self.control_conn, 
                                 Response.SUCCESS, 
-                                params={"discovery_status": discovery_states}
+                                params={"device_status": self.device_group_states}
                             )
                         else:
                             send_response(
                                 self.control_conn, 
                                 Response.ERROR, 
-                                params={"message": "Invalid configuration provided"})
+                                params={"message": "Specified devices not found: \
+                                    Are you sure they are plugged in and drivers are installed?"})
                     case Command.INITIALIZE_DEVICES.name: 
                         self._initialize_devices(payload)
                     case Command.DISCONNECT_DEVICES.name: 
@@ -227,10 +235,12 @@ class Server:
                     case Command.STOP_STREAMING.name: 
                         self._stop_streaming()
             
-            except (ConnectionResetError, ConnectionAbortedError): 
+            except (ConnectionResetError, ConnectionAbortedError) as e:  
                 # This will occur when client disconnects. Reset state 
-                log_print(self.logger, "warning", "Client connection unexpectedly terminated.")
+                log_print(self.logger, "warning", f"Client connection unexpectedly terminated: {e}")
                 self._close_client_connection()
+            except ValidationError as e: 
+                log_print(self.logger, "error", f"Error validating response: {e}")
 
     def _is_local_client(self, address):
         try:
@@ -277,6 +287,12 @@ class Server:
             return False 
 
         elif cmd_type == Command.CONNECT_SERVER.name:
+            client_info = payload.get('client_info', {})
+            hostname = client_info.get('hostname', None)
+            if not hostname:
+                hostname = client_info.get('ip', '')
+            log_print(self.logger, 'info', f'Incoming connection initiated by {hostname}')
+            
             # Send challenge 
             challenge = generate_challenge()
 
@@ -329,6 +345,8 @@ class Server:
                     "name": payload.get("name", ""),
                     "version": payload.get("version", ""),
                 }
+
+                log_print(self.logger, 'info', 'Successfully connected!')
             except Exception as e: 
                 log_print(self.logger, 'error', f'Client authentication failed: {e}')
                 client_socket.close()
@@ -351,7 +369,7 @@ class Server:
                 self.data_conn.close()
             self.data_conn = None 
 
-            log_print(self.logger, 'debug', "Server disconnected successfully")
+            log_print(self.logger, 'debug', "Client connection closed successfully")
         except Exception as e:
             log_print(self.logger, 'error', f"Server disconnection error: {e}")
 
@@ -360,6 +378,8 @@ class Server:
 
     # Device command handling callbacks 
     def _discover_devices(self, payload): 
+        log_print(self.logger, "info", "Discovering connected devices")
+        
         # Refresh list of discovered devices
         self.discovered_devices = []
         for backend_type, backend in AVAILABLE_BACKENDS.items(): 
@@ -377,54 +397,81 @@ class Server:
             return None
 
         # Check if all devices in the device groups are present 
+        self.device_group_states = {} # Refresh
+
         for group_id, group_dict in device_groups.items(): 
+            self.device_group_states[group_id] = {}
             for device_id in group_dict.keys():
+                # Avoid populating with metadata
+                if device_id == 'metadata':
+                    continue
+
                 if device_id in self.discovered_devices:
-                    device_groups[group_id][device_id]['status'] = DeviceStatus.AVAILABLE.name
+                    self.device_group_states[group_id][device_id] = DeviceStatus.AVAILABLE.value
                 else: 
-                    device_groups[group_id][device_id]['status'] = DeviceStatus.UNAVAILABLE.name
+                    self.device_group_states[group_id][device_id] = DeviceStatus.UNAVAILABLE.value
 
-        
-        return device_groups
-
+        log_print(self.logger, "info", "Device discovery completed successfully")
+    
     def _initialize_devices(self, payload):
         # For flexibility, we provide device configurations to both initialize and discover.
-        device_groups = self._discover_devices(payload)
+        self._discover_devices(payload)
         
-        if not device_groups: 
+        if self.device_group_states == {}: 
             send_response(self.control_conn, Response.ERROR, 
                 params={"message": "Invalid configuration provided"}) 
             return 
 
+        log_print(self.logger, "info", "Initializing devices")
+
         response = Response.SUCCESS
 
         # Now that we have a valid device configuration, try initializing 
-        self.device_group_states = {} # Refresh
         self.device_group_handlers = {} # Refresh
-        
-        for group_id, group_dict in device_groups.items(): 
+        uninit_groups = []
+
+        group_cfg_dict = payload.get("device_groups")
+
+        for group_id in self.device_group_states: 
+            self.device_group_handlers[group_id] = None 
+            
+            group_dict = group_cfg_dict[group_id]
             try:
                 # Get handler
                 handler = get_device_group_handler(group_dict, self.response_queue)
                 # Initialize
                 handler.initialize()
                 # Store 
-                self.device_group_states[group_id] = DeviceStatus.CONNECTED.name
+                for device_id in group_dict:
+                    if device_id == 'metadata':
+                        continue
+
+                    self.device_group_states[group_id][device_id] = DeviceStatus.CONNECTED.value
+                
+                # Ensure we can access group status overall 
+                self.device_group_states[group_id]["metadata"] = DeviceStatus.CONNECTED.value
+
+                # Store handler 
                 self.device_group_handlers[group_id] = handler
             except Exception as e:
                 msg = f'Unable to initialize group: {group_id}. Error: {e}'
                 response = Response.WARNING
                 log_print(self.logger, 'error', msg)
+                uninit_groups.append(group_id)
 
         # Send response (both discovered states as well as initialized devices)
         send_response(
             sock = self.control_conn, 
             response = response, 
             params = {
-                "discovered_devices": device_groups, 
-                "connection_states": self.device_group_states
+                "device_status": self.device_group_states
             }
         )
+
+        if len(uninit_groups) > 0:
+            log_print(self.logger, "warning", f"Device initialization failed for groups: {uninit_groups}")
+        else:
+            log_print(self.logger, "info", "All devices successfully initialized")
 
         
     def _disconnect_devices(self):
