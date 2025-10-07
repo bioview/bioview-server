@@ -181,16 +181,18 @@ class Server:
                 time.sleep(1)
 
     def _data_handler(self):
-        while self.running and self.status is ServerStatus.CLIENT_CONNECTED: 
+        # TODO: Fix
+        if self.running and self.status >= ServerStatus.CLIENT_CONNECTED: 
             with contextlib.suppress(Exception):
                 # Convert from listen() to accept() socket 
                 self.data_conn, _ = self.data_socket.accept()
                 # TODO: Complete
 
     def _command_handler(self):
-        while self.running and self.status is ServerStatus.CLIENT_CONNECTED: 
+        while self.running and self.status >= ServerStatus.CLIENT_CONNECTED: 
             try:
                 # Receive data continuously 
+                self.control_conn.settimeout(1.0)
                 data = self.control_conn.recv(MAX_BUFFER_SIZE)
 
                 if data.count(b'\x00') == len(data):
@@ -234,7 +236,9 @@ class Server:
                         self._start_streaming()
                     case Command.STOP_STREAMING.name: 
                         self._stop_streaming()
-            
+            except socket.timeout:
+                # Timeout is expected to allow checking for server running status
+                continue    
             except (ConnectionResetError, ConnectionAbortedError) as e:  
                 # This will occur when client disconnects. Reset state 
                 log_print(self.logger, "warning", f"Client connection unexpectedly terminated: {e}")
@@ -439,8 +443,11 @@ class Server:
             try:
                 # Get handler
                 handler = get_device_group_handler(group_dict, self.response_queue)
+                handler.start() # Start subprocess
+                
                 # Initialize
                 handler.initialize()
+                
                 # Store 
                 for device_id in group_dict:
                     if device_id == 'metadata':
@@ -497,7 +504,7 @@ class Server:
         if len(self.device_group_handlers) == 0: 
             msg = "Server has no initialized devices"
             log_print(self.logger, 'error', msg)
-            send_response(self.control_socket, Response.ERROR, params={"message": msg})
+            send_response(self.control_conn, Response.ERROR, params={"message": msg})
 
         # Ask all backends to start
         try:
@@ -511,11 +518,11 @@ class Server:
 
             msg = "Data streaming started successfully"
             log_print(self.logger, 'info', msg)
-            send_response(self.control_socket, Response.SUCCESS, params={"message": msg})
+            send_response(self.control_conn, Response.SUCCESS, params={"message": msg})
         except Exception as e:
             msg = f"Failed to start streaming: {e}"
             log_print(self.logger, 'error', msg)
-            send_response(self.control_socket, Response.ERROR, params={"message": msg})
+            send_response(self.control_conn, Response.ERROR, params={"message": msg})
 
     def _stop_streaming(self):
         if len(self.device_group_handlers) == 0:

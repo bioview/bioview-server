@@ -40,7 +40,7 @@ import multiprocessing as mp
 from typing import Dict, List 
 from threading import Thread 
 
-from bioview_common import DataSource, DeviceStatus, log_print
+from bioview_common import Command, DataSource, DeviceStatus, log_print
 
 from bioview_server.common import SaveWorker
 
@@ -58,6 +58,7 @@ class Backend(mp.Process):
         self.display_sources: List[DataSource] = [] 
 
         # Queues        
+        self.command_queue = mp.Queue() 
         self.save_queue = None     
         self.display_queue = mp.Queue() # Queue for internal data storage
 
@@ -72,14 +73,10 @@ class Backend(mp.Process):
 
         # State
         self.status = DeviceStatus.DISCONNECTED
+        self._running = mp.Event()
+        self._streaming = mp.Event()
 
-        # Create a new logger 
-        self.logger = logging.getLogger(__name__)
-        logging.basicConfig(
-           level=logging.DEBUG, format="%(asctime)s %(name)s: (%(levelname)s) %(message)s",
-            datefmt='%m/%d %H:%M:%S'
-        )
-
+    # Internal Implementations 
     # Common setup 
     def setup_saving(self, save_path: str = None): 
         '''
@@ -140,10 +137,10 @@ class Backend(mp.Process):
             self.display_queue.get_nowait()
 
     # Device Control
-    def initialize(self):
+    def _initialize(self):
         raise NotImplementedError
 
-    def queue_param_update(self): 
+    def _queue_param_update(self): 
         ''' 
         Backends that implement this function will be able to handle 
         real-time update of parameters by implementing multiprocessing 
@@ -189,7 +186,7 @@ class Backend(mp.Process):
         The only role of display worker in the server is to keep polling
         for data in the display_queue and add it to the sending queue
         '''
-        while self.running:
+        while self._running.is_set():
             if len(self.data_sources) == 0: 
                 continue 
 
@@ -209,13 +206,13 @@ class Backend(mp.Process):
             except Exception as e: 
                 log_print(self.logger, 'error', 'Error occurred: {e}')
 
-    def start_streaming(self):
+    def _start_streaming(self):
         raise NotImplementedError
 
-    def stop_streaming(self):
+    def _stop_streaming(self):
         raise NotImplementedError
 
-    def disconnect(self):
+    def _disconnect(self):
         raise NotImplementedError
 
     # Status
@@ -236,3 +233,112 @@ class Backend(mp.Process):
             setattr(self, param, current_type(value))
         else:
             setattr(self, param, value)
+
+    # Handle multiprocessing
+    def run(self):
+        # Create a new logger
+        self.logger = logging.getLogger(__name__)
+        logging.basicConfig(
+           level=logging.DEBUG, format="%(asctime)s %(name)s: (%(levelname)s) %(message)s",
+            datefmt='%m/%d %H:%M:%S'
+        )
+
+        self._running.set()
+
+        while self._running.is_set():
+            try:
+                # Process commands from parent
+                cmd_data = self.command_queue.get(timeout=1)
+                self._handle_command(cmd_data)
+                
+                # Stream if active
+                if self._streaming.is_set():
+                    self._do_streaming()        
+            except queue.Empty:
+                continue          
+            except Exception as e:
+                self.logger.error(f"Error in subprocess: {e}")
+
+    def _handle_command(self, data):
+        try:
+            cmd = data['command']
+            cmd_args = data.get('args', {})
+
+            match cmd:
+                case Command.CONNECT_DEVICES:
+                    result = self._initialize()
+                    self.response_queue.put({'status': 'success', 'result': result})
+                
+                case Command.START_STREAMING:
+                    result = self._start_streaming()
+                    self.response_queue.put({'status': 'success', 'result': result})
+                    self._streaming.set()
+                
+                case Command.STOP_STREAMING:
+                    self._streaming.clear()
+                    result = self._stop_streaming()
+                    self.response_queue.put({'status': 'success', 'result': result})
+                
+                case Command.DISCONNECT_DEVICES:
+                    result = self._disconnect()
+                    self.response_queue.put({'status': 'success', 'result': result})
+                
+                case Command.UPDATE_RUNNING_PARAMETER:
+                    self._queue_param_update(cmd_args)
+                    self.response_queue.put({'status': 'success'})
+                
+                case Command.SHUTDOWN:
+                    self._running.clear()
+                    self.response_queue.put({'status': 'shutdown'})
+                
+        except Exception as e:
+            log_print(self.logger, 'error', f"Command {cmd} failed: {e}")
+            self.response_queue.put({'status': 'error', 'message': str(e)})
+    
+    def _do_streaming(self):
+        # TODO: Implement (send data to display)
+        try:
+            # Example: read from device, process data
+            print("I am here two")
+            # Put in display queue
+            
+        except Exception as e:
+            self.logger.error(f"Streaming error: {e}")
+    
+    # Public API for non-blocking calls
+    def initialize(self, **kwargs):
+        self.command_queue.put({
+            'command': Command.CONNECT_DEVICES,
+            'args': kwargs
+        })
+        response = self.response_queue.get(timeout=150)
+        return response
+    
+    def start_streaming(self):
+        self.command_queue.put({'command': Command.START_STREAMING})
+        response = self.response_queue.get(timeout=10)
+        return response
+    
+    def stop_streaming(self):
+        self.command_queue.put({'command': Command.STOP_STREAMING})
+        response = self.response_queue.get(timeout=10)
+        return response
+    
+    def queue_param_update(self, **params):
+        self.command_queue.put({
+            'command': Command.UPDATE_RUNNING_PARAMETER,
+            'args': params
+        })
+        # Don't wait for response for real-time updates
+        # TODO: Fix
+    
+    def disconnect(self):
+        self.command_queue.put({'command': Command.DISCONNECT_DEVICES})
+        response = self.response_queue.get(timeout=5)
+        return response
+    
+    def shutdown(self):
+        self.command_queue.put({'command': Command.SHUTDOWN})
+        self.join(timeout=5)
+        if self.is_alive():
+            self.terminate()

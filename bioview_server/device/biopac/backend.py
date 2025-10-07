@@ -52,7 +52,7 @@ class BIOPACBackend(Backend):
             self.absolute_channel_nums[idx] = idx
 
     # Essential functions for backend
-    def initialize(self):
+    def _initialize(self):
         if self.mpdev_handler is None:
             raise ValueError("A valid reference to mpdev.dll was not found")
 
@@ -74,7 +74,7 @@ class BIOPACBackend(Backend):
             log_print(self.logger, "error", f"Unable to initialize device: {e}")
             return False
 
-    def start_streaming(self):
+    def _start_streaming(self):
         self.status = DeviceStatus.STREAMING
 
         # Start saving
@@ -105,7 +105,7 @@ class BIOPACBackend(Backend):
         except Exception as e:
             log_print(self.logger, "error", f"BIOPAC Streaming Error: {e}")
 
-    def stop_streaming(self):
+    def _stop_streaming(self):
         try:
             stop_acquisition(self.mpdev_handler)
         except Exception as e:
@@ -113,7 +113,7 @@ class BIOPACBackend(Backend):
 
         self.status = DeviceStatus.CONNECTED
 
-    def disconnect(self):
+    def _disconnect(self):
         if self.save_worker is not None:
             self.save_worker.stop()
 

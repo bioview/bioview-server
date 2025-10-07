@@ -19,7 +19,7 @@ CLOCK_TIMEOUT = 1000  # 1000ms timeout for external clock locking
 def update_device_firmware():
     pass
 
-def discover_devices():
+def discover_devices(logger = None):
     """
     Devices discovered using uhd.find contain the following keys -
     - 'type': eg. b200
@@ -42,7 +42,7 @@ def discover_devices():
             # Update in cache
             update_usrp_address(device_dict["name"], device_dict["serial"])
     except Exception as e:
-        print(f"Error occured in UHD device discovery: {e}")
+        log_print(logger, "error", f"Error occured in UHD device discovery: {e}")
 
     return discovered_devices
 
@@ -119,14 +119,11 @@ def get_channel_map(
     return data_sources
 
 
-def setup_pps(usrp, pps, num_mboards):
+def setup_pps(usrp, pps, num_mboards, logger = None):
     """Setup the PPS source."""
     if pps == "mimo":
         if num_mboards != 2:
-            print(
-                'ref = "mimo" implies 2 motherboards; ' "your system has %d boards",
-                num_mboards,
-            )
+            log_print(logger, "error", f'ref = "mimo" implies 2 motherboards; your system has {num_mboards} boards')
             return False
         # make mboard 1 a slave over the MIMO Cable
         usrp.set_time_source("mimo", 1)
@@ -135,14 +132,11 @@ def setup_pps(usrp, pps, num_mboards):
     return True
 
 
-def setup_ref(usrp, ref, num_mboards):
+def setup_ref(usrp, ref, num_mboards, logger = None):
     """Setup the reference clock."""
     if ref == "mimo":
         if num_mboards != 2:
-            print(
-                'ref = "mimo" implies 2 motherboards; ' "your system has %d boards",
-                num_mboards,
-            )
+            log_print(logger, "error", f'ref = "mimo" implies 2 motherboards; your system has {num_mboards} boards')
             return False
         usrp.set_clock_source("mimo", 1)
     else:
@@ -150,7 +144,7 @@ def setup_ref(usrp, ref, num_mboards):
 
     # Lock onto clock signals for all mboards
     if ref != "internal":
-        print("Now confirming lock on clock signals...")
+        log_print(logger, "debug", "Now confirming lock on clock signals...")
         end_time = datetime.now() + timedelta(milliseconds=CLOCK_TIMEOUT)
         for i in range(num_mboards):
             if ref == "mimo" and i == 0:
@@ -160,30 +154,30 @@ def setup_ref(usrp, ref, num_mboards):
                 time.sleep(1e-3)
                 is_locked = usrp.get_mboard_sensor("ref_locked", i)
             if not is_locked:
-                print("Unable to confirm clock signal locked on board %d", i)
+                log_print(logger, "error", f"Unable to confirm clock signal locked on board {i}")
                 return False
     return True
 
 
-def check_channels(usrp, rx_channels, tx_channels):
+def check_channels(usrp, rx_channels, tx_channels, logger = None):
     # Check that each Rx channel specified is less than the total number
     # of rx channels that the device can support
     dev_rx_channels = usrp.get_rx_num_channels()
     if not all(map((lambda chan: chan < dev_rx_channels), rx_channels)):
-        print("Invalid RX channel(s) specified.")
+        log_print(logger, "warning", "Invalid RX channel(s) specified.")
         return [], []
 
     # Check that each Tx channel specified is less than the total number
     # of tx channels that the device can support
     dev_tx_channels = usrp.get_tx_num_channels()
     if not all(map((lambda chan: chan < dev_tx_channels), tx_channels)):
-        print("Invalid TX channel(s) specified.")
+        log_print(logger, "warning", "Invalid TX channel(s) specified.")
         return [], []
 
     return rx_channels, tx_channels
 
 
-def get_usrp_address(device_name: str):
+def get_usrp_address(device_name: str, logger = None):
     cache_file = get_cache_file("usrp_serial_numbers")
     map_dict = {}
 
@@ -191,7 +185,7 @@ def get_usrp_address(device_name: str):
         with open(cache_file) as fobj:
             map_dict = json.load(fobj)
     except Exception:
-        print("Cache is empty")
+        log_print(logger, "error", "Cache is empty")
         return None
 
     return map_dict[device_name]
@@ -212,4 +206,4 @@ def update_usrp_address(device_name: str, device_serial: str, logger = None):
         with open(cache_file, "w") as fobj:
             json.dump(map_dict, fobj)
     except Exception as e:
-        print(f"Error updating cache: {e}")
+        log_print(logger, "error", f"Error updating cache: {e}")

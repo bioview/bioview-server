@@ -180,30 +180,14 @@ class USRPBackend(Backend):
 
         # Populate data source mapping for client
         self.populate_data_sources()
-
-        # Setup display
-        self.display_queue = queue.Queue()
-        self.display_worker = None
-
-        # Setup processing
-        self.process_worker = ProcessWorker(
-            data_sources = self.data_sources, 
-            samp_rate = self.samp_rate,
-            channel_ifs = self.channel_ifs,
-            if_filter_bw = self.if_filter_bw,
-            rx_queues = self.rx_data_queue,
-            display_queue = self.display_queue,
-            display_imaginary = self.display_imaginary,
-        )
-
-    @silence_function
-    def initialize(self):
+ 
+    def _initialize(self):
         if self.discovered_devices is None:
             self.discovered_devices = discover_devices()
 
         for device_key, device_config in self.usrp_configs.items():
             device_serial = ""
-                    
+
             if device_config.device_name not in self.discovered_devices:
                 msg = f"Device {device_config.device_name} not connected to PC.",
                 log_print(self.logger, "error", msg)
@@ -269,11 +253,22 @@ class USRPBackend(Backend):
 
                     # Save state
                     self.usrp_states[device_key] = DeviceStatus.CONNECTED
-                
-                    return True 
             except Exception as e:
                 log_print(self.logger, "error", f"Unable to initialize device: {e}")
                 return False
+
+        # Instantiate processing
+        self.process_worker = ProcessWorker(
+            data_sources = self.data_sources, 
+            samp_rate = self.samp_rate,
+            channel_ifs = self.channel_ifs,
+            if_filter_bw = self.if_filter_bw,
+            rx_queues = self.rx_data_queue,
+            display_queue = self.display_queue,
+            display_imaginary = self.display_imaginary,
+        )
+
+        return True 
 
     def setup_saving(
         self, 
@@ -295,7 +290,7 @@ class USRPBackend(Backend):
         self.process_worker.save_ds = save_ds
         self.process_worker.save_queue = self.save_queue
 
-    def start_streaming(self):
+    def _start_streaming(self):
         # Start transmit threads
         for worker in self.transmit_workers.values():
             worker.start()
@@ -314,7 +309,7 @@ class USRPBackend(Backend):
         if self.display_worker:
             self.display_worker.start()
 
-    def stop_streaming(self):
+    def _stop_streaming(self):
         # Stops display
         self.running = False 
 
@@ -374,7 +369,7 @@ class USRPBackend(Backend):
                 channel_ifs[abs_idx] = dev_cfg.if_freq[idx]
         self.channel_ifs = channel_ifs
 
-    def disconnect(self):
+    def _disconnect(self):
         # Stop streaming
         self.stop_streaming()
 
