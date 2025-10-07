@@ -272,22 +272,18 @@ class USRPBackend(Backend):
 
     def setup_saving(
         self, 
-        enable_save: bool = False, 
-        save_path: str = None,
-        save_ds: int = 100,
-        save_iq: bool = True,
-        save_imaginary: bool = True,
+        save_config: Dict
     ):        
-        super().setup_saving(enable_save, save_path)
+        super().setup_saving(save_config)
 
-        self.save_ds = save_ds
-        self.save_iq = save_iq
-        self.save_imaginary = save_imaginary
+        self.save_ds = save_config.get('save_ds', 1)
+        self.save_iq = save_config.get('save_iq', False)
+        self.save_imaginary = save_config.get('save_imaginary', True)
 
         # Provide params to ProcessWorker
-        self.process_worker.save_imaginary = save_imaginary
-        self.process_worker.save_iq = save_iq
-        self.process_worker.save_ds = save_ds
+        self.process_worker.save_imaginary = self.save_imaginary
+        self.process_worker.save_iq = self.save_iq
+        self.process_worker.save_ds = self.save_ds
         self.process_worker.save_queue = self.save_queue
 
     def _start_streaming(self):

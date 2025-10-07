@@ -41,6 +41,7 @@ except Exception as e:
 def get_device_group_handler(
         group_dict, 
         response_queue: mp.Queue, 
+        data_output_queue: mp.Queue,
         logger = None
     ): 
     '''
@@ -78,7 +79,8 @@ def get_device_group_handler(
                 group_id = group_id, 
                 samp_rate = metadata.get('samp_rate'),  
                 devices = {k: v for k, v in group_dict.items() if k != "metadata"},
-                response_queue = response_queue
+                response_queue = response_queue,
+                data_output_queue = data_output_queue
             )
         
         case DeviceType.BIOPAC.value: 
@@ -92,7 +94,8 @@ def get_device_group_handler(
                 response_queue = response_queue, 
                 samp_rate = device_cfg.get_param('samp_rate'),  
                 mpdev_path = device_cfg.get_param('mpdev_path'), 
-                device_code = device_cfg.get_param('device_code')
+                device_code = device_cfg.get_param('device_code'),
+                data_output_queue = data_output_queue
             )
         
     return handler  

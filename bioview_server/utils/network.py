@@ -1,3 +1,4 @@
+import time 
 import json
 from typing import List
 
@@ -26,6 +27,19 @@ def send_response(sock, response, params, logger = None, buffer_size: int = MAX_
         msg = f'Error occurred while sending response: {e}'
         log_print(logger, 'error', msg)
 
+def send_datachunk(sock, datachunk, logger = None, buffer_size: int = MAX_BUFFER_SIZE): 
+    try:
+        # Try to serialize
+        data_dict = {
+            'datachunk': datachunk,
+            'timestamp': time.time()
+        }
+        data_json = json.dumps(data_dict).encode("utf-8")
+        sock.send(data_json)
+    except Exception as e: 
+        msg = f'Error occurred while sending data: {e}'
+        log_print(logger, 'error', msg)
+    
 def parse_and_validate_command(data: str) -> List:
     if not data:
         raise ValidationError("Client provided an empty command")

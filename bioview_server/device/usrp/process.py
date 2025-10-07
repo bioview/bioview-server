@@ -1,5 +1,6 @@
 import queue
 from threading import Thread
+from typing import List 
 
 import numpy as np
 
@@ -14,7 +15,7 @@ class ProcessWorker(Thread):
         samp_rate,
         channel_ifs,
         if_filter_bw,
-        rx_queues: list[queue.Queue],
+        rx_queues: List[queue.Queue],
         save_queue: queue.Queue = None,
         display_queue: queue.Queue = None,
         save_ds: int = 1, 

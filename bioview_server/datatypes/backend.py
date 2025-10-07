@@ -78,12 +78,12 @@ class Backend(mp.Process):
 
     # Internal Implementations 
     # Common setup 
-    def setup_saving(self, save_path: str = None): 
+    def setup_saving(self, save_config: Dict = None): 
         '''
         Sets up workers to save data in a common format
         '''    
-        self.enable_save = True
-        self.save_path = save_path
+        self.enable_save = save_config.get('enable_save', False)
+        self.save_path = save_config.get('save_path', None)
         
         if not self.save_queue:
             self.save_queue = mp.Queue()
@@ -94,7 +94,7 @@ class Backend(mp.Process):
 
         if self.enable_save and self.save_path:
             self.save_worker = SaveWorker(
-                save_path=save_path,
+                save_path=self.save_path,
                 data_queue=self.save_queue,
                 num_channels=len(self.data_sources),
                 logger = self.logger
@@ -110,7 +110,7 @@ class Backend(mp.Process):
         if self.save_queue and not self.save_queue.empty():
             self.save_queue.get_nowait()
 
-    def setup_display(self): 
+    def setup_display(self, display_config: Dict = None): 
         '''
         Sets up workers to save data in a common format
         '''    
@@ -121,6 +121,10 @@ class Backend(mp.Process):
             while not self.data_output_queue.empty():
                 self.data_output_queue.get_nowait()
 
+        display_sources = display_config.get('sources', [])
+        for source in display_sources:
+            self.add_display_source(source)
+            
         self.display_worker = Thread(
             target = self.display_handler,
             daemon = True
@@ -186,7 +190,7 @@ class Backend(mp.Process):
         The only role of display worker in the server is to keep polling
         for data in the display_queue and add it to the sending queue
         '''
-        while self._running.is_set():
+        while self._streaming.is_set():
             if len(self.data_sources) == 0: 
                 continue 
 
@@ -203,8 +207,8 @@ class Backend(mp.Process):
                 log_print(self.logger, 'debug', 'No data available to send for display')
             except queue.Full:
                 log_print(self.logger, 'warning', 'Display queue filled up. Unable to add any more data.')
-            except Exception as e: 
-                log_print(self.logger, 'error', 'Error occurred: {e}')
+            except Exception as e:
+                log_print(self.logger, 'error', f'Error occurred: {e}')
 
     def _start_streaming(self):
         raise NotImplementedError
@@ -213,10 +217,6 @@ class Backend(mp.Process):
         raise NotImplementedError
 
     def _disconnect(self):
-        raise NotImplementedError
-
-    # Status
-    def get_device_status(self):
         raise NotImplementedError
 
     # Parameter handling
@@ -245,15 +245,12 @@ class Backend(mp.Process):
 
         self._running.set()
 
+        # Start thread to handle display
         while self._running.is_set():
             try:
                 # Process commands from parent
                 cmd_data = self.command_queue.get(timeout=1)
-                self._handle_command(cmd_data)
-                
-                # Stream if active
-                if self._streaming.is_set():
-                    self._do_streaming()        
+                self._handle_command(cmd_data)                
             except queue.Empty:
                 continue          
             except Exception as e:
@@ -294,16 +291,6 @@ class Backend(mp.Process):
         except Exception as e:
             log_print(self.logger, 'error', f"Command {cmd} failed: {e}")
             self.response_queue.put({'status': 'error', 'message': str(e)})
-    
-    def _do_streaming(self):
-        # TODO: Implement (send data to display)
-        try:
-            # Example: read from device, process data
-            print("I am here two")
-            # Put in display queue
-            
-        except Exception as e:
-            self.logger.error(f"Streaming error: {e}")
     
     # Public API for non-blocking calls
     def initialize(self, **kwargs):

@@ -4,6 +4,7 @@ Ref: uhd examples
 import json
 import time
 import contextlib
+from typing import List
 from datetime import datetime, timedelta
 
 import numpy as np
@@ -62,10 +63,10 @@ def _check_pairing(r_idx, t_idx, rx_cumsum, tx_cumsum, pair_list):
 def get_channel_map(
     group_id,
     n_devices: int,
-    rx_per_dev: list,
-    tx_per_dev: list,
+    rx_per_dev: List,
+    tx_per_dev: List,
     balance: bool = False,
-    multi_pairs: list = None,
+    multi_pairs: List = None,
 ):
     """
     Provide base implementations of channel mappings for the following use-cases

@@ -13,11 +13,11 @@ for expanding functionality to handle the case for multiple clients.
 """
 
 import time 
+import queue 
 import argparse
 import socket 
 import logging 
 import ipaddress
-import contextlib
 
 from threading import Thread
 
@@ -39,6 +39,7 @@ from bioview_common import (
 
 from bioview_server.utils import (
     send_response, 
+    send_datachunk,
     generate_challenge, 
     validate_token, 
     parse_and_validate_command
@@ -83,9 +84,13 @@ class Server:
 
         # Threaded workers 
         self.cmd_thread = None 
+        self.data_thread = None
 
-        # Queues for overall logging
+        # Queue for overall logging
         self.response_queue = mp.Queue() 
+
+        # Queue for data output
+        self.data_queue = mp.Queue()
 
         # Message logging
         if not logger: 
@@ -112,13 +117,8 @@ class Server:
                 target=self._control_handler, 
                 daemon=True
             )
-            data_thread = Thread(
-                target=self._data_handler, 
-                daemon=True
-            )
 
             control_thread.start()
-            data_thread.start()
 
             # Keep main thread alive
             while self.running:
@@ -157,6 +157,10 @@ class Server:
                     self.cmd_thread.join() 
                     self.cmd_thread = None 
 
+                if self.data_thread: 
+                    self.data_thread.join()
+                    self.data_thread = None 
+
                 # Accept incoming connections (blocks)
                 # Update socket reference to be able to accept
                 conn, addr = self.control_socket.accept()
@@ -166,6 +170,10 @@ class Server:
                     # Update status 
                     self.status = ServerStatus.CLIENT_CONNECTED
                     self.control_conn = conn 
+
+                    # Connect data socket 
+                    conn, addr = self.data_socket.accept()
+                    self.data_conn = conn
 
             # If authenticated, parse commands
             if self.status is ServerStatus.CLIENT_CONNECTED:
@@ -177,16 +185,25 @@ class Server:
                     )
                     self.cmd_thread.start()
 
+                if not self.data_thread: 
+                    self.data_thread = Thread(
+                        target=self._data_handler, 
+                        daemon=True
+                    )
+                    self.data_thread.start()
+
                 # Check if sockets are still alive and update status accordingly
                 time.sleep(1)
 
     def _data_handler(self):
-        # TODO: Fix
-        if self.running and self.status >= ServerStatus.CLIENT_CONNECTED: 
-            with contextlib.suppress(Exception):
-                # Convert from listen() to accept() socket 
-                self.data_conn, _ = self.data_socket.accept()
-                # TODO: Complete
+        while self.running and self.status >= ServerStatus.STREAMING: 
+            try: 
+                buff = self.data_queue.get()
+                send_datachunk(self.data_conn, buff)
+            except queue.Empty:
+                continue
+            except Exception as e:
+                log_print(self.logger, 'error', f'Error sending data: {e}')
 
     def _command_handler(self):
         while self.running and self.status >= ServerStatus.CLIENT_CONNECTED: 
@@ -232,8 +249,9 @@ class Server:
                         self._disconnect_devices()
                         
                     # Streaming 
-                    case Command.START_STREAMING.name: 
-                        self._start_streaming()
+                    case Command.START_STREAMING.name:
+                        # Specify streaming parameters, typically pertaining to saving/display 
+                        self._start_streaming(payload)
                     case Command.STOP_STREAMING.name: 
                         self._stop_streaming()
             except socket.timeout:
@@ -442,7 +460,7 @@ class Server:
             group_dict = group_cfg_dict[group_id]
             try:
                 # Get handler
-                handler = get_device_group_handler(group_dict, self.response_queue)
+                handler = get_device_group_handler(group_dict, self.response_queue, self.data_queue)
                 handler.start() # Start subprocess
                 
                 # Initialize
@@ -500,7 +518,10 @@ class Server:
             send_response(self.control_conn, Response.ERROR, params={"message": msg})
     
     # Handle streaming 
-    def _start_streaming(self): 
+    def _start_streaming(self, payload): 
+        save_cfg = payload.get('save_config', {})
+        display_cfg = payload.get('display_config', {})
+
         if len(self.device_group_handlers) == 0: 
             msg = "Server has no initialized devices"
             log_print(self.logger, 'error', msg)
@@ -512,6 +533,11 @@ class Server:
 
             # Start your existing receive/transmit workers
             for handler in self.device_group_handlers.values():
+                if save_cfg:
+                    handler.setup_saving(save_cfg)
+                if display_cfg: 
+                    handler.setup_display(display_cfg)                
+                
                 handler.start_streaming()
 
             self.status = ServerStatus.STREAMING

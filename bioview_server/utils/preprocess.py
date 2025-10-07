@@ -1,5 +1,6 @@
 import numpy as np
 from scipy import signal
+from typing import List
 
 
 """
@@ -23,7 +24,7 @@ def apply_filter(data, filter, zi=None):
 
 
 def get_filter(
-    bounds: list[float],
+    bounds: List[float],
     samp_rate: int,
     ftype: str = "ellip",
     btype: str = "band",

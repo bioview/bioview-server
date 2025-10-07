@@ -2,7 +2,7 @@ from .authentication import generate_challenge, validate_token
 from .console import suppress_stdout
 from .io import get_cache_file, get_unique_path
 from .ipc import emit_signal
-from .network import parse_and_validate_command, send_response
+from .network import parse_and_validate_command, send_response, send_datachunk
 from .preprocess import apply_filter, get_filter
 
 
@@ -15,6 +15,7 @@ __all__ = [
     "emit_signal",
     "parse_and_validate_command",
     "send_response",
+    "send_datachunk",
     "apply_filter",
     "get_filter",
 ]
