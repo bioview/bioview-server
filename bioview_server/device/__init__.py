@@ -80,7 +80,13 @@ def get_device_group_handler(
                 samp_rate = metadata.get('samp_rate'),  
                 devices = {k: v for k, v in group_dict.items() if k != "metadata"},
                 response_queue = response_queue,
-                data_output_queue = data_output_queue
+                data_output_queue = data_output_queue,
+                display_ds = metadata.get('display_ds', 10),
+                display_imaginary = metadata.get('display_imaginary', False),
+                save_ds = metadata.get('save_ds', 1),
+                save_iq = metadata.get('save_iq', False),
+                save_imaginary = metadata.get('save_imaginary', True),
+                discovered_devices = None
             )
         
         case DeviceType.BIOPAC.value: 

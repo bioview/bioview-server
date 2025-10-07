@@ -122,6 +122,9 @@ class USRPBackend(Backend):
         data_output_queue: mp.Queue = None,
         display_ds: int = 10,
         display_imaginary: bool = False,
+        save_ds: int = 10, 
+        save_iq: bool = False, 
+        save_imaginary: bool = True,
         discovered_devices: List = None
     ):
         super().__init__(
@@ -137,6 +140,11 @@ class USRPBackend(Backend):
         # Configuration for processing data to be displayed
         self.display_ds = display_ds
         self.display_imaginary = display_imaginary
+
+        # Saving specific parameters 
+        self.save_ds = save_ds
+        self.save_iq = save_iq
+        self.save_imaginary = save_imaginary
 
         # Populate variables pertaining to device
         self.usrp_configs = {}
@@ -275,10 +283,6 @@ class USRPBackend(Backend):
         save_config: Dict
     ):        
         super().setup_saving(save_config)
-
-        self.save_ds = save_config.get('save_ds', 1)
-        self.save_iq = save_config.get('save_iq', False)
-        self.save_imaginary = save_config.get('save_imaginary', True)
 
         # Provide params to ProcessWorker
         self.process_worker.save_imaginary = self.save_imaginary

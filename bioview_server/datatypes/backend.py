@@ -121,10 +121,10 @@ class Backend(mp.Process):
             while not self.data_output_queue.empty():
                 self.data_output_queue.get_nowait()
 
-        display_sources = display_config.get('sources', [])
+        display_sources = display_config.get('display_sources', [])
         for source in display_sources:
             self.add_display_source(source)
-            
+
         self.display_worker = Thread(
             target = self.display_handler,
             daemon = True
