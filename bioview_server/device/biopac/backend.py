@@ -78,12 +78,18 @@ class BIOPACBackend(Backend):
         self.status = DeviceStatus.STREAMING
 
         # Start saving
-        if self.save_worker is not None:
-            self.save_worker.start()
+        if self.save_worker:
+            if self.save_worker._started.is_set():
+                self.save_worker.running = True 
+            else:
+                self.save_worker.start() 
 
         # Start display
         if self.display_worker is not None:
-            self.display_worker.start()
+            if self.display_worker._started.is_set():
+                self.display_worker.running = True 
+            else:
+                self.display_worker.start() 
 
         try:
             start_acquisition(self.mpdev_handler)

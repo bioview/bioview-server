@@ -519,9 +519,6 @@ class Server:
     
     # Handle streaming 
     def _start_streaming(self, payload): 
-        save_cfg = payload.get('save_config', {})
-        display_cfg = payload.get('display_config', {})
-
         if len(self.device_group_handlers) == 0: 
             msg = "Server has no initialized devices"
             log_print(self.logger, 'error', msg)
@@ -533,12 +530,7 @@ class Server:
 
             # Start your existing receive/transmit workers
             for handler in self.device_group_handlers.values():
-                if save_cfg:
-                    handler.setup_saving(save_cfg)
-                if display_cfg: 
-                    handler.setup_display(display_cfg)                
-                
-                handler.start_streaming()
+                handler.start_streaming(payload)
 
             self.status = ServerStatus.STREAMING
 

@@ -78,7 +78,7 @@ class Backend(mp.Process):
 
     # Internal Implementations 
     # Common setup 
-    def setup_saving(self, save_config: Dict = None): 
+    def _setup_saving(self, save_config: Dict = None): 
         '''
         Sets up workers to save data in a common format
         '''    
@@ -110,7 +110,7 @@ class Backend(mp.Process):
         if self.save_queue and not self.save_queue.empty():
             self.save_queue.get_nowait()
 
-    def setup_display(self, display_config: Dict = None): 
+    def _setup_display(self, display_config: Dict = None): 
         '''
         Sets up workers to save data in a common format
         '''    
@@ -261,12 +261,24 @@ class Backend(mp.Process):
             cmd = data['command']
             cmd_args = data.get('args', {})
 
+            # TODO: Update to put conditionnal checks for responses 
             match cmd:
                 case Command.CONNECT_DEVICES:
                     result = self._initialize()
+                    if not result:
+                        raise RuntimeError("Unable to initialize device")
                     self.response_queue.put({'status': 'success', 'result': result})
                 
                 case Command.START_STREAMING:
+                    save_cfg = cmd_args.get('save_config', {})
+                    display_cfg = cmd_args.get('display_config', {})
+
+                    if save_cfg:
+                        self._setup_saving(save_cfg)
+                    
+                    if display_cfg: 
+                        self._setup_display(display_cfg)
+                    
                     result = self._start_streaming()
                     self.response_queue.put({'status': 'success', 'result': result})
                     self._streaming.set()
@@ -283,11 +295,7 @@ class Backend(mp.Process):
                 case Command.UPDATE_RUNNING_PARAMETER:
                     self._queue_param_update(cmd_args)
                     self.response_queue.put({'status': 'success'})
-                
-                case Command.SHUTDOWN:
-                    self._running.clear()
-                    self.response_queue.put({'status': 'shutdown'})
-                
+                    
         except Exception as e:
             log_print(self.logger, 'error', f"Command {cmd} failed: {e}")
             self.response_queue.put({'status': 'error', 'message': str(e)})
@@ -300,9 +308,12 @@ class Backend(mp.Process):
         })
         response = self.response_queue.get(timeout=150)
         return response
-    
-    def start_streaming(self):
-        self.command_queue.put({'command': Command.START_STREAMING})
+
+    def start_streaming(self, cfg_dict: Dict = None):
+        self.command_queue.put({
+            'command': Command.START_STREAMING,
+            'args': cfg_dict
+        })
         response = self.response_queue.get(timeout=10)
         return response
     

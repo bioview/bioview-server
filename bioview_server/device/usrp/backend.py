@@ -278,11 +278,11 @@ class USRPBackend(Backend):
 
         return True 
 
-    def setup_saving(
+    def _setup_saving(
         self, 
         save_config: Dict
     ):        
-        super().setup_saving(save_config)
+        super()._setup_saving(save_config)
 
         # Provide params to ProcessWorker
         self.process_worker.save_imaginary = self.save_imaginary
@@ -293,21 +293,37 @@ class USRPBackend(Backend):
     def _start_streaming(self):
         # Start transmit threads
         for worker in self.transmit_workers.values():
-            worker.start()
+            if not worker._started.is_set():
+                worker.start()
+            else: 
+                worker.running = True
 
         # Start receive threads
         for worker in self.receive_workers.values():
-            worker.start()
+            if not worker._started.is_set():
+                worker.start()
+            else: 
+                worker.running = True
 
         # Start saving
-        self.process_worker.start() 
+        if self.process_worker:
+            if self.process_worker._started.is_set():
+                self.process_worker.running = True 
+            else:
+                self.process_worker.start() 
 
         if self.save_worker:
-            self.save_worker.start()
+            if self.save_worker._started.is_set():
+                self.save_worker.running = True 
+            else:
+                self.save_worker.start() 
 
         # Start display
         if self.display_worker:
-            self.display_worker.start()
+            if self.display_worker._started.is_set():
+                self.display_worker.running = True 
+            else:
+                self.display_worker.start() 
 
     def _stop_streaming(self):
         # Stops display
