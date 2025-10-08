@@ -1,14 +1,13 @@
 import queue
-from threading import Thread
 from typing import List 
 
 import numpy as np
 
-from bioview_common import log_print
+from bioview_common import log_print, PausableWorker
 from bioview_server.utils import apply_filter, get_filter
 
 
-class ProcessWorker(Thread):
+class ProcessWorker(PausableWorker):
     def __init__(
         self,
         data_sources,
@@ -183,14 +182,12 @@ class ProcessWorker(Thread):
         # Return all processed samples
         return save_list
     
-    def run(self):
+    def work(self):
         # Preallocate empty buffer to get faster performance
         data_buf = None
         samples = [None] * len(self.rx_queues)
 
-        self.running = True 
-        
-        while self.running:
+        while self.is_running:
             try:
                 # Get from all queues
                 for idx, key in enumerate(self.rx_queues):
@@ -233,5 +230,4 @@ class ProcessWorker(Thread):
 
         log_print(self.logger, "debug", "[USRP] Processing stopped")
 
-    def stop(self):
-        self.running = False
+    # TODO: Confirm if we need any cleanup

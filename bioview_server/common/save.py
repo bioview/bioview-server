@@ -1,10 +1,10 @@
 import multiprocessing as mp
 import queue
-from threading import Thread 
 
 import h5py
 import numpy as np
 
+from bioview_common import PausableWorker
 
 def init_save_file(file_path, num_channels: int, chunk_size: int = 500):
     with h5py.File(file_path, "w") as f:
@@ -30,7 +30,7 @@ def update_save_file(file_path, chunk):
         dset[:, cur_cols:new_cols] = save_chunk
 
 
-class SaveWorker(Thread):
+class SaveWorker(PausableWorker):
     def __init__(
         self,
         save_path,
@@ -38,10 +38,8 @@ class SaveWorker(Thread):
         num_channels: int,
         logger = None 
     ):
+        super().__init__()  
         self.logger = logger
-        
-        # Variables
-        self.running = False
 
         # Load output file
         self.save_path = save_path
@@ -50,13 +48,11 @@ class SaveWorker(Thread):
         if self.saving:
             init_save_file(file_path=self.save_path, num_channels=num_channels)
 
-    def run(self):
+    def work(self):
         if self.data_queue is None:
             return
 
-        self.running = True
-
-        while self.running:
+        while self.is_running:
             try:
                 data = self.data_queue.get()
             except queue.Empty:
@@ -64,5 +60,4 @@ class SaveWorker(Thread):
 
             update_save_file(self.save_path, data)
 
-    def stop(self):
-        self.running = False
+    # TODO: Check - Do we need any cleanup?

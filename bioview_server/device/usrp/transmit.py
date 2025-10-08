@@ -1,16 +1,15 @@
 import math
 import queue
-from threading import Thread
 from typing import List
 
 import numpy as np
 import uhd
 
-from bioview_common import log_print
+from bioview_common import log_print, PausableWorker
 
 INIT_DELAY = 0.05  # 50mS initial delay before transmit
 
-class TransmitWorker(Thread):
+class TransmitWorker(PausableWorker):
     def __init__(
         self,
         usrp,
@@ -25,8 +24,6 @@ class TransmitWorker(Thread):
         logger = None 
     ):
         super().__init__()
-
-        self.daemon = True
 
         # Signals
         self.logger = logger
@@ -85,8 +82,7 @@ class TransmitWorker(Thread):
                 waveform="sine",
             )
 
-    def run(self):
-        self.running = True
+    def work(self):
         log_print(self.logger, "debug", "Transmission Started")
         tx_metadata = uhd.types.TXMetadata()
         tx_metadata.start_of_burst = True
@@ -96,10 +92,10 @@ class TransmitWorker(Thread):
             self.usrp.get_time_now().get_real_secs() + INIT_DELAY
         )
 
-        while self.running:
+        while self.is_running:
             # Check for updated parameters
             try:
-                current_command = self.cmd_queue.get()
+                current_command = self.cmd_queue.get_nowait()
 
                 # Command here will just tell adjustable params and will make changes
                 param = current_command["param"]
@@ -154,5 +150,13 @@ class TransmitWorker(Thread):
         self.tx_streamer.send(np.zeros_like(self.tx_waveform), tx_metadata)
         log_print(self.logger, "debug", "Transmission Stopped")
 
-    def stop(self):
-        self.running = False
+    def cleanup(self):
+        """Cleanup when thread terminates or pauses - end the burst properly"""
+        if self.tx_metadata is not None:
+            try:
+                # End transmission burst
+                self.tx_metadata.end_of_burst = True
+                self.tx_streamer.send(np.zeros_like(self.tx_waveform), self.tx_metadata)
+                log_print(self.logger, "debug", "Transmission burst ended cleanly")
+            except Exception as ex:
+                log_print(self.logger, "error", f"Error ending transmission burst: {ex}")

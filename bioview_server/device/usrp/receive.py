@@ -1,18 +1,17 @@
 import queue
-from threading import Thread
-from typing import Callable, List
+from typing import List
 
 import numpy as np
 import uhd
 
-from bioview_common import log_print
+from bioview_common import log_print, PausableWorker
 
 INIT_DELAY = 0.05  # 50mS initial delay before transmit
 # This is a good balance between real time display and spikes
 SAVE_BUFFER_SIZE = 20
 
 
-class ReceiveWorker(Thread):
+class ReceiveWorker(PausableWorker):
     def __init__(
         self,
         usrp,
@@ -25,8 +24,6 @@ class ReceiveWorker(Thread):
         logger = None
     ):
         super().__init__()
-
-        self.daemon = True
 
         # Signals
         self.logger = logger
@@ -43,9 +40,7 @@ class ReceiveWorker(Thread):
 
         self.running = running
 
-    def run(self):
-        self.running = True
-
+    def work(self):
         log_print(self.logger, "debug", "Receiving Started")
         if self.usrp is None or self.rx_streamer is None:
             log_print(self.logger, "error", "USRP or Rx streamer not initialized.")
@@ -86,7 +81,7 @@ class ReceiveWorker(Thread):
 
         rate = self.usrp.get_rx_rate()
 
-        while self.running:
+        while self.is_running:
             # Check for updated parameters
             try:
                 current_command = self.cmd_queue.get()
@@ -183,5 +178,12 @@ class ReceiveWorker(Thread):
         self.rx_streamer.issue_stream_cmd(stream_cmd)
         log_print(self.logger, "debug", "Receiving Stopped")
 
-    def stop(self):
-        self.running = False
+    def cleanup(self):
+        if self.rx_streamer is not None:
+            try:
+                # End receiving burst
+                stream_cmd = uhd.types.StreamCMD(uhd.types.StreamMode.stop_cont)
+                self.rx_streamer.issue_stream_cmd(stream_cmd)
+                log_print(self.logger, "debug", "Receiving stopped cleanly")
+            except Exception as ex:
+                log_print(self.logger, "error", f"Error stopping receiving: {ex}")

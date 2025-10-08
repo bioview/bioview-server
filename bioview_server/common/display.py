@@ -1,10 +1,9 @@
 import queue
-from threading import Thread
 from typing import Callable, Dict
 
 import numpy as np
 
-from bioview_common import log_print
+from bioview_common import log_print, PausableWorker
 from bioview_server.utils import apply_filter, emit_signal, get_filter
 
 MODIFIABLE_PARAMS = [
@@ -15,7 +14,7 @@ MODIFIABLE_PARAMS = [
 ]
 
 
-class DisplayWorker(Thread):
+class DisplayWorker(PausableWorker):
     def __init__(
         self,
         samp_rate: int,
@@ -60,10 +59,8 @@ class DisplayWorker(Thread):
             processed, _ = apply_filter(processed, self.display_filter)
         return processed
 
-    def run(self):
-        self.running = True
-
-        while self.running:
+    def work(self):
+        while self.is_running:
             # Get command from cmd queue
             try:
                 current_command = self.cmd_queue.get()
@@ -99,5 +96,4 @@ class DisplayWorker(Thread):
 
         log_print(self.logger, "debug", "Display stopped")
 
-    def stop(self):
-        self.running = False
+    # TODO: Check if we need cleanup

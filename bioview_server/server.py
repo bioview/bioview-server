@@ -382,6 +382,10 @@ class Server:
     # Client command handling callbacks
     def _close_client_connection(self): 
         try:
+            # Stop streaming if active
+            if self.status is ServerStatus.STREAMING:
+                self._stop_streaming()
+                
             # Close accepted sockets
             if self.control_conn:
                 self.control_conn.close()

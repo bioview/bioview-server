@@ -1,7 +1,6 @@
 import queue
 import multiprocessing as mp
 
-from threading import Thread
 from typing import Dict, List
 
 import os
@@ -13,7 +12,6 @@ import uhd
 from bioview_common import log_print, DeviceStatus, Configuration, DeviceType, silence_function
 
 from bioview_server.datatypes import Backend
-
 
 from .process import ProcessWorker
 from .receive import ReceiveWorker
@@ -32,7 +30,7 @@ FILLING_TIME = 0.35
 # This is a good balance between real time display and spikes
 SAVE_BUFFER_SIZE = 20
 
-@silence_function
+# @silence_function
 def initialize_usrp_device(
     serial,
     tx_subdev,
@@ -231,36 +229,44 @@ class USRPBackend(Backend):
                     log_print(self.logger, "error", "Unable to initialize device")
 
                     return False
-                else:
-                    # Save objects
-                    self.usrp_handlers[device_key] = response["usrp"]
 
-                    self.rx_data_queue[device_key] = queue.Queue()
-                    self.rx_command_queue[device_key] = queue.Queue()
+                log_print(self.logger, "debug", "Device initialization succeeded")
 
-                    self.receive_workers[device_key] = ReceiveWorker(
-                        usrp=response["usrp"],
-                        rx_gain=rx_gain,
-                        rx_channels=rx_channels,
-                        rx_streamer=response["rx_streamer"],
-                        rx_queue=self.rx_data_queue[device_key],
-                        cmd_queue=self.rx_command_queue[device_key],
-                    )
+                # Store handler for each object
+                self.usrp_handlers[device_key] = response["usrp"]
 
-                    self.tx_command_queue[device_key] = queue.Queue()
-                    self.transmit_workers[device_key] = TransmitWorker(
-                        usrp=response["usrp"],
-                        tx_gain=tx_gain,
-                        tx_amplitude=device_config.get_param("tx_amplitude"),
-                        tx_channels=tx_channels,
-                        samp_rate=self.samp_rate,
-                        if_freq=device_config.get_param("if_freq"),
-                        tx_streamer=response["tx_streamer"],
-                        cmd_queue=self.tx_command_queue[device_key],
-                    )
+                self.rx_data_queue[device_key] = queue.Queue()
+                self.rx_command_queue[device_key] = queue.Queue()
 
-                    # Save state
-                    self.usrp_states[device_key] = DeviceStatus.CONNECTED
+                self.receive_workers[device_key] = ReceiveWorker(
+                    usrp=response["usrp"],
+                    rx_gain=rx_gain,
+                    rx_channels=rx_channels,
+                    rx_streamer=response["rx_streamer"],
+                    rx_queue=self.rx_data_queue[device_key],
+                    cmd_queue=self.rx_command_queue[device_key],
+                    logger=self.logger
+                )
+
+                log_print(self.logger, "debug", "Receive Worker created")
+                
+                self.tx_command_queue[device_key] = queue.Queue()
+                self.transmit_workers[device_key] = TransmitWorker(
+                    usrp=response["usrp"],
+                    tx_gain=tx_gain,
+                    tx_amplitude=device_config.get_param("tx_amplitude"),
+                    tx_channels=tx_channels,
+                    samp_rate=self.samp_rate,
+                    if_freq=device_config.get_param("if_freq"),
+                    tx_streamer=response["tx_streamer"],
+                    cmd_queue=self.tx_command_queue[device_key],
+                    logger=self.logger
+                )
+
+                log_print(self.logger, "debug", "Transmit Worker created")
+                
+                # Save state
+                self.usrp_states[device_key] = DeviceStatus.CONNECTED
             except Exception as e:
                 log_print(self.logger, "error", f"Unable to initialize device: {e}")
                 return False
@@ -275,7 +281,9 @@ class USRPBackend(Backend):
             display_queue = self.display_queue,
             display_imaginary = self.display_imaginary,
         )
-
+        
+        log_print(self.logger, "debug", "Process Worker created")
+        
         return True 
 
     def _setup_saving(
@@ -293,54 +301,52 @@ class USRPBackend(Backend):
     def _start_streaming(self):
         # Start transmit threads
         for worker in self.transmit_workers.values():
-            if not worker._started.is_set():
+            if not worker.is_alive():
                 worker.start()
-            else: 
-                worker.running = True
+            worker.resume()    
 
         # Start receive threads
         for worker in self.receive_workers.values():
-            if not worker._started.is_set():
+            if not worker.is_alive():
                 worker.start()
-            else: 
-                worker.running = True
+            worker.resume()    
 
         # Start saving
         if self.process_worker:
-            if self.process_worker._started.is_set():
-                self.process_worker.running = True 
-            else:
-                self.process_worker.start() 
+            if not self.process_worker.is_alive():
+                self.process_worker.start()
+            
+            self.process_worker.resume() 
 
         if self.save_worker:
-            if self.save_worker._started.is_set():
-                self.save_worker.running = True 
-            else:
-                self.save_worker.start() 
+            if not self.save_worker.is_alive():
+                self.save_worker.start()
+        
+            self.save_worker.resume() 
 
         # Start display
         if self.display_worker:
-            if self.display_worker._started.is_set():
-                self.display_worker.running = True 
-            else:
-                self.display_worker.start() 
+            if not self.display_worker.is_alive():
+                self.display_worker.start()
+            
+            self.display_worker.resume() 
 
     def _stop_streaming(self):
         # Stops display
         self.running = False 
 
         if self.save_worker:
-            self.save_worker.stop()
+            self.save_worker.pause()
 
-        self.process_worker.stop() 
+        self.process_worker.pause()
 
         # Stop transmit threads
         for worker in self.transmit_workers.values():
-            worker.stop()
+            worker.pause()
 
         # Stop receive threads
         for worker in self.receive_workers.values():
-            worker.stop()
+            worker.pause()
 
     def populate_data_sources(self):
         """
