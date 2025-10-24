@@ -326,10 +326,17 @@ class USRPBackend(Backend):
 
         # Start display
         if self.display_worker:
-            if not self.display_worker.is_alive():
-                self.display_worker.start()
+            if self.display_worker._started.is_set():
+                self.display_worker.running = True 
+            else:
+                self.display_worker.start() 
+
+        # # Start display
+        # if self.display_worker:
+        #     if not self.display_worker.is_alive():
+        #         self.display_worker.start()
             
-            self.display_worker.resume() 
+        #     self.display_worker.resume() 
 
     def _stop_streaming(self):
         # Stops display

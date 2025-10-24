@@ -74,7 +74,7 @@ class ReceiveWorker(PausableWorker):
         timeout = 0.5  # Larger timeout initially
         had_an_overflow = False
         last_overflow = uhd.types.TimeSpec(0)
-
+        
         # Setup the statistic counters
         num_rx_samps = 0
         num_rx_dropped = 0
@@ -84,7 +84,7 @@ class ReceiveWorker(PausableWorker):
         while self.is_running:
             # Check for updated parameters
             try:
-                current_command = self.cmd_queue.get()
+                current_command = self.cmd_queue.get_nowait()
 
                 # Make changes to adjustable params
                 param = current_command["param"]
@@ -106,6 +106,7 @@ class ReceiveWorker(PausableWorker):
 
             except queue.Empty:
                 pass
+
 
             try:
                 # Receive samples
@@ -172,7 +173,7 @@ class ReceiveWorker(PausableWorker):
             except queue.Empty:
                 log_print(self.logger, "debug", "Rx Queue Empty")
                 continue
-
+        
         # Gracefully close once receiving is finished
         stream_cmd = uhd.types.StreamCMD(uhd.types.StreamMode.stop_cont)
         self.rx_streamer.issue_stream_cmd(stream_cmd)

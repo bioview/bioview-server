@@ -125,6 +125,7 @@ class Backend(mp.Process):
         for source in display_sources:
             self.add_display_source(source)
 
+        # TODO: Replace with PausableWorker
         self.display_worker = Thread(
             target = self.display_handler,
             daemon = True
@@ -280,6 +281,7 @@ class Backend(mp.Process):
                         self._setup_display(display_cfg)
                     
                     result = self._start_streaming()
+                    print(result)
                     self.response_queue.put({'status': 'success', 'result': result})
                     self._streaming.set()
                 
@@ -314,6 +316,7 @@ class Backend(mp.Process):
             'command': Command.START_STREAMING,
             'args': cfg_dict
         })
+        print(cfg_dict)
         response = self.response_queue.get(timeout=10)
         return response
     
