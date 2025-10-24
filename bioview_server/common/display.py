@@ -63,7 +63,7 @@ class DisplayWorker(PausableWorker):
         while self.is_running:
             # Get command from cmd queue
             try:
-                current_command = self.cmd_queue.get()
+                current_command = self.cmd_queue.get_nowait()
                 if current_command["param"] == "filter_type":
                     # TODO: Filter Implementation
                     pass
@@ -78,7 +78,7 @@ class DisplayWorker(PausableWorker):
 
             try:
                 # Load samples
-                samples = self.data_queue.get()
+                samples = self.data_queue.get_nowait()
 
                 # Only process selected channels
                 for source in enumerate(self.display_sources):

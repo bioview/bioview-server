@@ -192,7 +192,7 @@ class ProcessWorker(PausableWorker):
                 # Get from all queues
                 for idx, key in enumerate(self.rx_queues):
                     rx_q = self.rx_queues[rx_q]
-                    samples[idx] = rx_q.get()
+                    samples[idx] = rx_q.get_nowait()
                 data_buf = np.transpose(np.vstack(samples))
 
                 buffer_data = np.transpose(np.vstack(data_buf))

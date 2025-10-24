@@ -196,9 +196,13 @@ class Server:
                 time.sleep(1)
 
     def _data_handler(self):
-        while self.running and self.status >= ServerStatus.STREAMING: 
+        while self.running:
+            # Keep alive 
+            if self.status < ServerStatus.STREAMING: 
+                time.sleep(1)
+                continue
             try: 
-                buff = self.data_queue.get()
+                buff = self.data_queue.get_nowait()
                 send_datachunk(self.data_conn, buff)
             except queue.Empty:
                 continue
@@ -212,7 +216,7 @@ class Server:
                 self.control_conn.settimeout(1.0)
                 data = self.control_conn.recv(MAX_BUFFER_SIZE)
 
-                if data.count(b'\x00') == len(data):
+                if data.count(b'\x00') == len(data) and len(data) > 0:
                     # if keep-alive ping 
                     continue
 

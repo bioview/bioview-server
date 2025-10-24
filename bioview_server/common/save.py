@@ -54,7 +54,7 @@ class SaveWorker(PausableWorker):
 
         while self.is_running:
             try:
-                data = self.data_queue.get()
+                data = self.data_queue.get_nowait()
             except queue.Empty:
                 continue
 

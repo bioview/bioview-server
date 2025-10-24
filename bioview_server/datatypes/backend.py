@@ -197,7 +197,7 @@ class Backend(mp.Process):
 
             try:
                 # Get samples 
-                samples = self.display_queue.get()
+                samples = self.display_queue.get_nowait()
                 buff = {} 
 
                 for source in self.display_sources:
@@ -262,7 +262,7 @@ class Backend(mp.Process):
             cmd = data['command']
             cmd_args = data.get('args', {})
 
-            # TODO: Update to put conditionnal checks for responses 
+            # TODO: Update to put conditionnal checks for responses - !IMPORTANT
             match cmd:
                 case Command.CONNECT_DEVICES:
                     result = self._initialize()
