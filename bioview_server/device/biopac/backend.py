@@ -47,7 +47,7 @@ class BIOPACBackend(Backend):
         for idx, _ in enumerate(self.config.channels):
             label = f"Ch{idx + 1}"
             source = DataSource(device=self, channel=idx, label=label)
-            self.data_sources.append(source)
+            self.data_sources.add(source)
 
             self.absolute_channel_nums[idx] = idx
 

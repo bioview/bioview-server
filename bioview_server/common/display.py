@@ -1,10 +1,7 @@
 import queue
-from typing import Callable, Dict
+from typing import List
 
-import numpy as np
-
-from bioview_common import log_print, PausableWorker
-from bioview_server.utils import apply_filter, emit_signal, get_filter
+from bioview_common import log_print, DataSource, PausableWorker
 
 MODIFIABLE_PARAMS = [
     "display_ds",
@@ -15,85 +12,49 @@ MODIFIABLE_PARAMS = [
 
 
 class DisplayWorker(PausableWorker):
+    '''Simple wrapper worker that adds information to display queue which is then sent to frontend'''
     def __init__(
         self,
-        samp_rate: int,
-        display_ds: int, 
-        data_queue: queue.Queue,  # Data comes in
-        data_ready: Callable,  # Data pushed to client
-        display_filter: Dict = None,
-        logger = None 
+        display_sources: List[DataSource] = None, 
+        data_input_queue: queue.Queue = None,  # Data comes in
+        data_output_queue: queue.Queue = None,  # Data pushed to client
+        logger = None
     ):
         super().__init__()
-
-        # Processing
-        self.display_ds = display_ds
-
-        if display_filter:
-            self.display_filter = get_filter(
-                bounds=display_filter["bounds"],
-                samp_rate=samp_rate,
-                btype=display_filter["btype"],
-                ftype=display_filter["ftype"],
-            )
-        else: 
-            self.display_filter = None
-
+        # Keep track of sources 
+        self.display_sources = display_sources if display_sources is not None else []
+        
         # Queues
-        self.data_queue = data_queue
+        self.data_input_queue = data_input_queue
+        self.data_output_queue = data_output_queue
 
         # State
         self.running = False
 
-        # Signals
-        self.data_ready = data_ready
         self.logger = logger 
 
-    def process(self, data):
-        # Downsample
-        # TODO: This may be replaced by scipy.decimate()
-        processed = data[:: self.display_ds]
-
-        # Filter
-        if self.display_filter:
-            processed, _ = apply_filter(processed, self.display_filter)
-        return processed
-
     def work(self):
+        # Nothing to do if we have no queues; return
+        if self.data_input_queue is None or self.data_output_queue is None:
+            return
+        
         while self.is_running:
-            # Get command from cmd queue
             try:
-                current_command = self.cmd_queue.get_nowait()
-                if current_command["param"] == "filter_type":
-                    # TODO: Filter Implementation
-                    pass
-                elif current_command["param"] == "":
-                    # TODO: Other implementation
-                    pass
-            except queue.Empty:
-                pass
+                # Get samples 
+                samples = self.data_input_queue.get_nowait()
+                buff = {} 
 
-            if len(self.display_sources) == 0:
-                continue
-
-            try:
-                # Load samples
-                samples = self.data_queue.get_nowait()
-
-                # Only process selected channels
-                for source in enumerate(self.display_sources):
-                    disp_samples = samples[source.channel, :]
-                    processed = self.process(disp_samples)
-
-                    # Add to display queue
-                    emit_signal(self.data_ready, np.array(processed), source)
-            except queue.Empty:
-                log_print(self.logger, "warning", "Queue Empty")
-                continue
+                for source in self.display_sources:
+                    buff[source] = samples[source.channel]
+                
+                self.data_output_queue.put_nowait(buff)
+            except queue.Empty: 
+                log_print(self.logger, 'debug', 'No data available to send for display')
+            except queue.Full:
+                log_print(self.logger, 'warning', 'Display queue filled up. Unable to add any more data.')
             except Exception as e:
-                log_print(self.logger, "warning", f"Display error: {e}")
-                continue
+                log_print(self.logger, 'error', f'Error occurred: {e}')
 
-        log_print(self.logger, "debug", "Display stopped")
+        log_print(self.logger, "debug", "Display stopped") 
 
     # TODO: Check if we need cleanup

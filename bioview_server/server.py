@@ -26,6 +26,7 @@ import multiprocessing as mp
 from bioview_common import (    
     AuthenticationError,
     ValidationError, 
+    DeviceError, 
     DeviceStatus, 
     get_app_info, 
     MAX_BUFFER_SIZE,
@@ -75,6 +76,7 @@ class Server:
         # Device handling
         self.device_group_states = {} 
         self.device_group_handlers = {}
+        self.data_sources = set() # set(source: DataSource)
 
         # Sockets
         self.data_socket = None
@@ -239,7 +241,10 @@ class Server:
                             send_response(
                                 self.control_conn, 
                                 Response.SUCCESS, 
-                                params={"device_status": self.device_group_states}
+                                params={
+                                    "device_status": self.device_group_states,
+                                    "data_sources": self.data_sources
+                                }
                             )
                         else:
                             send_response(
@@ -266,7 +271,7 @@ class Server:
                 log_print(self.logger, "warning", f"Client connection unexpectedly terminated: {e}")
                 self._close_client_connection()
             except ValidationError as e: 
-                log_print(self.logger, "error", f"Error validating response: {e}")
+                log_print(self.logger, "debug", f"Error validating response: {e}")
 
     def _is_local_client(self, address):
         try:
@@ -472,8 +477,12 @@ class Server:
                 handler.start() # Start subprocess
                 
                 # Initialize
-                handler.initialize()
-                
+                resp = handler.initialize()
+
+                # Check for response 
+                if resp.get('type', None) != Response.SUCCESS:
+                    raise DeviceError(resp.get('message', 'Unknown'))
+
                 # Store 
                 for device_id in group_dict:
                     if device_id == 'metadata':
@@ -483,6 +492,9 @@ class Server:
                 
                 # Ensure we can access group status overall 
                 self.device_group_states[group_id]["metadata"] = DeviceStatus.CONNECTED.value
+
+                # Provide data sources to the frontend for display
+                self.data_sources.update(handler.get_data_sources())
 
                 # Store handler 
                 self.device_group_handlers[group_id] = handler
@@ -497,7 +509,8 @@ class Server:
             sock = self.control_conn, 
             response = response, 
             params = {
-                "device_status": self.device_group_states
+                "device_status": self.device_group_states,
+                "data_sources": [src.to_dict() for src in self.data_sources]
             }
         )
 

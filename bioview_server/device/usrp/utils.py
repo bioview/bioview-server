@@ -75,7 +75,7 @@ def get_channel_map(
     [3] Multi-Frequency
     These two modifications are on top of the multi-band pairing
     """
-    data_sources = {}
+    data_sources = set()
 
     rx_cumsum = np.cumsum(rx_per_dev)
     tx_cumsum = np.cumsum(tx_per_dev)
@@ -105,12 +105,13 @@ def get_channel_map(
             if multi_pairs is None or _check_pairing(
                 r_idx, t_idx, rx_cumsum, tx_cumsum, multi_pairs
             ):
+                label = f"Tx{tx_ctr}Rx{rx_ctr}"
                 source = DataSource(
-                    group_id=group_id, channel=ch_ctr, label=f"Tx{tx_ctr}Rx{rx_ctr}"
+                    group_id=group_id, channel=ch_ctr, label=label
                 )
                 source.tx_idx = t_idx
                 source.rx_idx = r_idx
-                data_sources[f'{group_id}[{ch_ctr}]'] = source
+                data_sources.add(source)
                 ch_ctr += 1
 
             tx_ctr += 1

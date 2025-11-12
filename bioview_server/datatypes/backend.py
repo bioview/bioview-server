@@ -37,12 +37,11 @@ import logging
 import contextlib
 import multiprocessing as mp
 
-from typing import Dict, List 
-from threading import Thread 
+from typing import Dict, List, Set
 
-from bioview_common import Command, DataSource, DeviceStatus, log_print
+from bioview_common import Command, Response, DataSource, DeviceStatus, log_print
 
-from bioview_server.common import SaveWorker
+from bioview_server.common import DisplayWorker, SaveWorker
 
 class Backend(mp.Process):
     def __init__(
@@ -54,7 +53,7 @@ class Backend(mp.Process):
         super().__init__()
         # Parameters
         self.group_id = group_id
-        self.data_sources: Dict[DataSource] = []
+        self.data_sources: Set[DataSource] = set()
         self.display_sources: List[DataSource] = [] 
 
         # Queues        
@@ -125,11 +124,17 @@ class Backend(mp.Process):
         for source in display_sources:
             self.add_display_source(source)
 
-        # TODO: Replace with PausableWorker
-        self.display_worker = Thread(
-            target = self.display_handler,
-            daemon = True
+        # TODO: Debug and once done, remove self.display_handler function implementation 
+        self.display_worker = DisplayWorker(
+            display_sources=self.display_sources,
+            data_input_queue=self.display_queue,
+            data_output_queue=self.data_output_queue,
+            logger = self.logger
         )
+        # self.display_worker = Thread(
+        #     target = self.display_handler,
+        #     daemon = True
+        # )
 
         # Any other specific functionality can be implemented by subclasses
 
@@ -160,7 +165,8 @@ class Backend(mp.Process):
         '''
         Broadcasts available data sources to server handler which can 
         then choose to enable/disable on a per-device basis, as specified
-        by the client handler
+        by the client handler. Since the handler only needs to know labels, 
+        we can deal accordingly.
         '''
         return self.data_sources
         
@@ -266,9 +272,10 @@ class Backend(mp.Process):
             match cmd:
                 case Command.CONNECT_DEVICES:
                     result = self._initialize()
+                    self.response_queue.put({'type': Response.SUCCESS, 'result': result})
+                    
                     if not result:
                         raise RuntimeError("Unable to initialize device")
-                    self.response_queue.put({'status': 'success', 'result': result})
                 
                 case Command.START_STREAMING:
                     save_cfg = cmd_args.get('save_config', {})
@@ -282,25 +289,25 @@ class Backend(mp.Process):
                     
                     result = self._start_streaming()
                     print(result)
-                    self.response_queue.put({'status': 'success', 'result': result})
+                    self.response_queue.put({'type': Response.SUCCESS, 'result': result})
                     self._streaming.set()
                 
                 case Command.STOP_STREAMING:
                     self._streaming.clear()
                     result = self._stop_streaming()
-                    self.response_queue.put({'status': 'success', 'result': result})
+                    self.response_queue.put({'type': Response.SUCCESS, 'result': result})
                 
                 case Command.DISCONNECT_DEVICES:
                     result = self._disconnect()
-                    self.response_queue.put({'status': 'success', 'result': result})
+                    self.response_queue.put({'type': Response.SUCCESS, 'result': result})
                 
                 case Command.UPDATE_RUNNING_PARAMETER:
                     self._queue_param_update(cmd_args)
-                    self.response_queue.put({'status': 'success'})
+                    self.response_queue.put({'type': Response.SUCCESS, 'result': None})
                     
         except Exception as e:
             log_print(self.logger, 'error', f"Command {cmd} failed: {e}")
-            self.response_queue.put({'status': 'error', 'message': str(e)})
+            self.response_queue.put({'type': Response.ERROR, 'message': str(e)})
     
     # Public API for non-blocking calls
     def initialize(self, **kwargs):
