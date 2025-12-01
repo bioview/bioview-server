@@ -48,6 +48,8 @@ from bioview_server.utils import (
 
 from bioview_server.device import AVAILABLE_BACKENDS, get_device_group_handler
 
+SLEEP_DURATION = 0.001 # Confirm CPU load with varying this value
+
 class Server: 
     def __init__(
         self,
@@ -104,27 +106,35 @@ class Server:
         else:
             self.logger = logger 
 
-    def start(self): 
-        log_print(self.logger, 'info' 'Starting server')
-        
-        # Open sockets 
-        self._create_sockets()
-
+    def _start(self): 
         # Create listener threads 
         self.running = True 
+        self.status = ServerStatus.CLIENT_DISCONNECTED
+
+        # Open sockets 
+        self._create_sockets()          
+
+        # Start server threads
+        self.control_thread = Thread(
+            target=self._control_handler, 
+            daemon=True
+        )
+
+        self.control_thread.start()
+
+    def start(self): 
+        log_print(self.logger, 'info' 'Starting server')
+
+        self._start() # Initial start 
 
         try:
-            # Start server threads
-            control_thread = Thread(
-                target=self._control_handler, 
-                daemon=True
-            )
+            while self.status > ServerStatus.SHUTDOWN_SERVER:
+                if self.status == ServerStatus.RESET_SERVER: 
+                    self._close_client_connection()
+                    self._start()
+                
+                time.sleep(SLEEP_DURATION)
 
-            control_thread.start()
-
-            # Keep main thread alive
-            while self.running:
-                time.sleep(0.1)
         except Exception:
             log_print(self.logger, 'error', 'Unable to start server')
         finally:
@@ -153,7 +163,27 @@ class Server:
 
     def _control_handler(self): 
         while self.running:  
-            if self.status is ServerStatus.CLIENT_DISCONNECTED:
+            # If authenticated, parse commands
+            if self.status >= ServerStatus.CLIENT_CONNECTED:
+                # Ensure we do not spawn endless threads
+                if not self.cmd_thread: 
+                    self.cmd_thread = Thread(
+                        target=self._command_handler, 
+                        daemon=True 
+                    )
+                    self.cmd_thread.start()
+
+                if not self.data_thread: 
+                    self.data_thread = Thread(
+                        target=self._data_handler, 
+                        daemon=True
+                    )
+                    self.data_thread.start()
+
+                # Check if sockets are still alive and update status accordingly
+                time.sleep(SLEEP_DURATION)
+
+            elif self.status >= ServerStatus.CLIENT_DISCONNECTED:
                 # Ensure that no other commands can be accepted 
                 if self.cmd_thread: 
                     self.cmd_thread.join() 
@@ -176,32 +206,17 @@ class Server:
                     # Connect data socket 
                     conn, addr = self.data_socket.accept()
                     self.data_conn = conn
-
-            # If authenticated, parse commands
-            if self.status is ServerStatus.CLIENT_CONNECTED:
-                # Ensure we do not spawn endless threads
-                if not self.cmd_thread: 
-                    self.cmd_thread = Thread(
-                        target=self._command_handler, 
-                        daemon=True 
-                    )
-                    self.cmd_thread.start()
-
-                if not self.data_thread: 
-                    self.data_thread = Thread(
-                        target=self._data_handler, 
-                        daemon=True
-                    )
-                    self.data_thread.start()
-
-                # Check if sockets are still alive and update status accordingly
-                time.sleep(1)
+            
+            else:
+                # Keep alive 
+                time.sleep(SLEEP_DURATION)
+                continue
 
     def _data_handler(self):
         while self.running:
             # Keep alive 
             if self.status < ServerStatus.STREAMING: 
-                time.sleep(1)
+                time.sleep(SLEEP_DURATION)
                 continue
             try: 
                 buff = self.data_queue.get_nowait()
@@ -212,15 +227,20 @@ class Server:
                 log_print(self.logger, 'error', f'Error sending data: {e}')
 
     def _command_handler(self):
-        while self.running and self.status >= ServerStatus.CLIENT_CONNECTED: 
+        while self.running:
+            if self.status < ServerStatus.CLIENT_CONNECTED: 
+                continue
+
             try:
                 # Receive data continuously 
                 self.control_conn.settimeout(1.0)
                 data = self.control_conn.recv(MAX_BUFFER_SIZE)
 
                 if data.count(b'\x00') == len(data) and len(data) > 0:
-                    # if keep-alive ping 
+                    # if keep-alive, do nothing
                     continue
+                elif len(data) == 0:
+                    raise ConnectionResetError
 
                 # Dispatch appropriate function 
                 cmd_type, payload = parse_and_validate_command(data)
@@ -229,7 +249,7 @@ class Server:
                 match cmd_type:
                     # Client commands
                     case Command.DISCONNECT_SERVER.name: 
-                        self._close_client_connection()
+                        self.status = ServerStatus.RESET_SERVER
 
                     # Device commands 
                     case Command.DISCOVER_DEVICES.name: 
@@ -269,7 +289,7 @@ class Server:
             except (ConnectionResetError, ConnectionAbortedError) as e:  
                 # This will occur when client disconnects. Reset state 
                 log_print(self.logger, "warning", f"Client connection unexpectedly terminated: {e}")
-                self._close_client_connection()
+                self.status = ServerStatus.RESET_SERVER
             except ValidationError as e: 
                 log_print(self.logger, "debug", f"Error validating response: {e}")
 
@@ -391,25 +411,30 @@ class Server:
     # Client command handling callbacks
     def _close_client_connection(self): 
         try:
+            self.running = False  # Let all threads stop
+            
             # Stop streaming if active
             if self.status is ServerStatus.STREAMING:
                 self._stop_streaming()
                 
             # Close accepted sockets
-            if self.control_conn:
-                self.control_conn.close()
-            self.control_conn = None 
+            for sock in [self.control_conn, self.data_conn]:
+                if sock:
+                    try: sock.close()
+                    except OSError: pass
+            self.control_conn = None
+            self.data_conn = None
 
-            if self.data_conn:
-                self.data_conn.close()
-            self.data_conn = None 
-
+            for sock in [self.control_socket, self.data_socket]:
+                if sock:
+                    try: sock.close()
+                    except OSError: pass
+            self.control_socket = None
+            self.data_socket = None
+            
             log_print(self.logger, 'debug', "Client connection closed successfully")
         except Exception as e:
             log_print(self.logger, 'error', f"Server disconnection error: {e}")
-
-        finally:
-            self.status = ServerStatus.CLIENT_DISCONNECTED
 
     # Device command handling callbacks 
     def _discover_devices(self, payload): 
@@ -518,7 +543,6 @@ class Server:
             log_print(self.logger, "warning", f"Device initialization failed for groups: {uninit_groups}")
         else:
             log_print(self.logger, "info", "All devices successfully initialized")
-
         
     def _disconnect_devices(self):
         if len(self.device_group_handlers) == 0:
