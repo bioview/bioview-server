@@ -258,20 +258,25 @@ class Server:
 
                         # Send response here since we don't want to send this response during init 
                         if self.device_group_states != {}: 
+                            log_print(self.logger, 'debug', 'Successfully found devices')
                             send_response(
                                 self.control_conn, 
                                 Response.SUCCESS, 
                                 params={
                                     "device_status": self.device_group_states,
-                                    "data_sources": self.data_sources
-                                }
+                                    "data_sources": [src.to_dict() for src in self.data_sources]
+                                },
+                                logger = self.logger
                             )
                         else:
+                            log_print(self.logger, 'debug', 'Failed to find devices')
                             send_response(
                                 self.control_conn, 
                                 Response.ERROR, 
                                 params={"message": "Specified devices not found: \
-                                    Are you sure they are plugged in and drivers are installed?"})
+                                    Are you sure they are plugged in and drivers are installed?"},
+                                logger = self.logger
+                            )
                     case Command.INITIALIZE_DEVICES.name: 
                         self._initialize_devices(payload)
                     case Command.DISCONNECT_DEVICES.name: 
@@ -479,7 +484,8 @@ class Server:
         
         if self.device_group_states == {}: 
             send_response(self.control_conn, Response.ERROR, 
-                params={"message": "Invalid configuration provided"}) 
+                params={"message": "Invalid configuration provided"},
+                logger = self.logger) 
             return 
 
         log_print(self.logger, "info", "Initializing devices")
@@ -536,7 +542,8 @@ class Server:
             params = {
                 "device_status": self.device_group_states,
                 "data_sources": [src.to_dict() for src in self.data_sources]
-            }
+            },
+            logger = self.logger
         )
 
         if len(uninit_groups) > 0:
@@ -548,7 +555,7 @@ class Server:
         if len(self.device_group_handlers) == 0:
             msg = "Server has no initialized devices"
             log_print(self.logger, 'warning', msg)
-            send_response(self.control_conn, Response.SUCCESS, params={"message": msg})
+            send_response(self.control_conn, Response.SUCCESS, params={"message": msg}, logger = self.logger)
         
         try: 
             for handler in self.device_group_handlers.values():
@@ -556,18 +563,18 @@ class Server:
 
             msg = "Devices disconnected successfully"
             log_print(self.logger, 'info', msg)
-            send_response(self.control_conn, Response.SUCCESS, params={"message": msg})
+            send_response(self.control_conn, Response.SUCCESS, params={"message": msg}, logger = self.logger)
         except Exception as e:
             msg = f"Failed to disconnect devices: {e}"
             log_print(self.logger, 'error', msg)
-            send_response(self.control_conn, Response.ERROR, params={"message": msg})
+            send_response(self.control_conn, Response.ERROR, params={"message": msg}, logger = self.logger)
     
     # Handle streaming 
     def _start_streaming(self, payload): 
         if len(self.device_group_handlers) == 0: 
             msg = "Server has no initialized devices"
             log_print(self.logger, 'error', msg)
-            send_response(self.control_conn, Response.ERROR, params={"message": msg})
+            send_response(self.control_conn, Response.ERROR, params={"message": msg}, logger = self.logger)
 
         # Ask all backends to start
         try:
@@ -581,17 +588,17 @@ class Server:
 
             msg = "Data streaming started successfully"
             log_print(self.logger, 'info', msg)
-            send_response(self.control_conn, Response.SUCCESS, params={"message": msg})
+            send_response(self.control_conn, Response.SUCCESS, params={"message": msg}, logger = self.logger)
         except Exception as e:
             msg = f"Failed to start streaming: {e}"
             log_print(self.logger, 'error', msg)
-            send_response(self.control_conn, Response.ERROR, params={"message": msg})
+            send_response(self.control_conn, Response.ERROR, params={"message": msg}, logger = self.logger)
 
     def _stop_streaming(self):
         if len(self.device_group_handlers) == 0:
             msg = "Server has no initialized devices"
             log_print(self.logger, 'warning', msg)
-            send_response(self.control_conn, Response.SUCCESS, params={"message": msg})
+            send_response(self.control_conn, Response.SUCCESS, params={"message": msg}, logger = self.logger)
 
         try:
             log_print(self.logger, 'info', "Attempting to stop data streaming")
