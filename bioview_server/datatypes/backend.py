@@ -131,12 +131,6 @@ class Backend(mp.Process):
             data_output_queue=self.data_output_queue,
             logger = self.logger
         )
-        # self.display_worker = Thread(
-        #     target = self.display_handler,
-        #     daemon = True
-        # )
-
-        # Any other specific functionality can be implemented by subclasses
 
     def stop_display(self):
         if self.display_worker:
