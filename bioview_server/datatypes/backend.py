@@ -281,6 +281,8 @@ class Backend(mp.Process):
                     if display_cfg: 
                         self._setup_display(display_cfg)
                     
+                    # TODO: Add initial calibration sequence here. For example, this can include
+                    # gain balancing or Guoyi's phase calibration method
                     result = self._start_streaming()
                     print(result)
                     self.response_queue.put({'type': Response.SUCCESS, 'result': result})

@@ -36,7 +36,16 @@ class TransmitWorker(PausableWorker):
         self.tx_channels = tx_channels
         self.samp_rate = samp_rate
         self.if_freq = if_freq
-
+        
+        # TODO: Currently we generate a fixed number of samples for the Tx 
+        # waveform and loop around since it reduces computations and we will 
+        # keep wrapping around due to the periodicity of the signal anyway. 
+        # However, this massively restricts our implementation to a FDM superhet
+        # scheme and does not allow for anything fancier to happen. Thus, 
+        # let us modify this function to provide Tx waveforms which can not
+        # only provide a buffer for FDM but also CDM and other methods 
+        # Furthermore, the generated Tx waveforms should also include a calibration
+        # function if it is so desired
         self._generate_tx_waveforms()
 
         self.usrp = usrp
