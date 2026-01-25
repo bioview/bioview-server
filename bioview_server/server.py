@@ -175,7 +175,7 @@ class Server:
                     challenge_response = control_conn.recv(MAX_BUFFER_SIZE)
                     client_cmd, client_payload = parse_and_validate_command(challenge_response) 
 
-                    if client_cmd is not Command.AUTHENTICATE_CLIENT.name: 
+                    if client_cmd != Command.AUTHENTICATE_CLIENT.name: 
                         # This is an invalid connection attemp. We should ideally log it: TODO
                         control_conn.close() 
                         continue 
@@ -270,10 +270,13 @@ class Server:
             daemon = True 
         )
         self.data_thread = Thread(
-            thread = self._data_handler, 
+            target = self._data_handler, 
             daemon = True 
         )
 
+        # Mark session started
+        self.client_session_active = True 
+        
         self.cmd_thread.start() 
         self.data_thread.start()
 
@@ -288,6 +291,8 @@ class Server:
         self.data_thread.join() 
     
     def close_client_connections(self): 
+        log_print(self.logger, 'debug', 'Closing client conection')
+
         if self.client_control_conn: 
             with contextlib.suppress(Exception):
                 self.client_control_conn.close() 
@@ -305,7 +310,7 @@ class Server:
     def _data_handler(self):
         while self.client_session_active:
             try:
-                buff = self.data_queue.get(0.5)  # add a little delay to lower CPU usage
+                buff = self.data_queue.get(1)  # add a little delay to lower CPU usage
 
                 try: 
                     send_datachunk(self.client_data_conn, buff)
@@ -326,12 +331,12 @@ class Server:
                 self.client_control_conn.settimeout(1.0)
                 try: 
                     data = self.client_control_conn.recv(MAX_BUFFER_SIZE)
+                except socket.timeout: 
+                    continue  # ensure timeouts do not kill this thread 
                 except (OSError, ConnectionResetError) as e: 
                     log_print(self.logger, "error", f"Connection reset by host: {e}")
                     break
-                except socket.timeout: 
-                    continue  # ensure timeouts do not kill this thread 
-
+                
                 if not data: break  # Control connection is closed
 
                 # Parse received command and appropriately call background function 
@@ -381,7 +386,7 @@ class Server:
                         self._stop_streaming()
 
             except ValidationError as e:
-                log_print(self.logger, "debug", f"Invalid command sent: {e}")
+                log_print(self.logger, "debug", f"Invalid command {cmd_type} sent: {e}")
                 continue  # Invalid command should not close connection
 
     def _is_local_client(self, address):
@@ -438,7 +443,7 @@ class Server:
         self._discover_devices(payload)
         
         if self.device_group_states == {}: 
-            send_response(self.control_conn, Response.ERROR, 
+            send_response(self.client_control_conn, Response.ERROR, 
                 params={"message": "Invalid configuration provided"},
                 logger = self.logger) 
             return 
@@ -459,7 +464,7 @@ class Server:
             group_dict = group_cfg_dict[group_id]
             try:
                 # Get handler
-                handler = get_device_group_handler(group_dict, self.response_queue, self.data_queue)
+                handler = get_device_group_handler(group_dict, self.response_queue, self.data_queue, self.logger)
                 handler.start() # Start subprocess
                 
                 # Initialize
@@ -492,7 +497,7 @@ class Server:
 
         # Send response (both discovered states as well as initialized devices)
         send_response(
-            sock = self.control_conn, 
+            sock = self.client_control_conn, 
             response = response, 
             params = {
                 "device_status": self.device_group_states,
@@ -510,7 +515,7 @@ class Server:
         if len(self.device_group_handlers) == 0:
             msg = "Server has no initialized devices"
             log_print(self.logger, 'warning', msg)
-            send_response(self.control_conn, Response.SUCCESS, params={"message": msg}, logger = self.logger)
+            send_response(self.client_control_conn, Response.SUCCESS, params={"message": msg}, logger = self.logger)
         
         try: 
             for handler in self.device_group_handlers.values():
@@ -518,18 +523,18 @@ class Server:
 
             msg = "Devices disconnected successfully"
             log_print(self.logger, 'info', msg)
-            send_response(self.control_conn, Response.SUCCESS, params={"message": msg}, logger = self.logger)
+            send_response(self.client_control_conn, Response.SUCCESS, params={"message": msg}, logger = self.logger)
         except Exception as e:
             msg = f"Failed to disconnect devices: {e}"
             log_print(self.logger, 'error', msg)
-            send_response(self.control_conn, Response.ERROR, params={"message": msg}, logger = self.logger)
+            send_response(self.client_control_conn, Response.ERROR, params={"message": msg}, logger = self.logger)
     
     # Handle streaming 
     def _start_streaming(self, payload): 
         if len(self.device_group_handlers) == 0: 
             msg = "Server has no initialized devices"
             log_print(self.logger, 'error', msg)
-            send_response(self.control_conn, Response.ERROR, params={"message": msg}, logger = self.logger)
+            send_response(self.client_control_conn, Response.ERROR, params={"message": msg}, logger = self.logger)
 
         # Ask all backends to start
         try:
@@ -541,17 +546,17 @@ class Server:
 
             msg = "Data streaming started successfully"
             log_print(self.logger, 'info', msg)
-            send_response(self.control_conn, Response.SUCCESS, params={"message": msg}, logger = self.logger)
+            send_response(self.client_control_conn, Response.SUCCESS, params={"message": msg}, logger = self.logger)
         except Exception as e:
             msg = f"Failed to start streaming: {e}"
             log_print(self.logger, 'error', msg)
-            send_response(self.control_conn, Response.ERROR, params={"message": msg}, logger = self.logger)
+            send_response(self.client_control_conn, Response.ERROR, params={"message": msg}, logger = self.logger)
 
     def _stop_streaming(self):
         if len(self.device_group_handlers) == 0:
             msg = "Server has no initialized devices"
             log_print(self.logger, 'warning', msg)
-            send_response(self.control_conn, Response.SUCCESS, params={"message": msg}, logger = self.logger)
+            send_response(self.client_control_conn, Response.SUCCESS, params={"message": msg}, logger = self.logger)
 
         try:
             log_print(self.logger, 'info', "Attempting to stop data streaming")
@@ -561,11 +566,11 @@ class Server:
 
             msg = "Data streaming stopped successfully"
             log_print(self.logger, 'info', msg)
-            send_response(self.control_conn, Response.SUCCESS, params={"message": msg})
+            send_response(self.client_control_conn, Response.SUCCESS, params={"message": msg})
         except Exception as e:
             msg = f"Failed to stop streaming: {e}"
             log_print(self.logger, 'error', msg)
-            send_response(self.control_conn, Response.ERROR, params={"message": msg})
+            send_response(self.client_control_conn, Response.ERROR, params={"message": msg})
 
     def stop(self):
         log_print(self.logger, 'debug', "Attempting to shutdown server")
