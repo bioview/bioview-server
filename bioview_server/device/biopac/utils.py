@@ -10,7 +10,7 @@ from pathlib import Path
 
 import wmi
 
-from bioview_server.utils import get_cache_file
+from bioview_common import get_cache_file
 
 from .constants import BIOPAC_CONNECTION_CODES, BIOPAC_VENDOR_ID
 

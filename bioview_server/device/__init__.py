@@ -3,7 +3,7 @@ import sys
 import multiprocessing as mp 
 
 from bioview_common import log_print, DeviceType, Configuration, SUPPORTED_DEVICES
-from bioview_server.utils import suppress_stdout
+from bioview_common import silence_function as suppress_stdout
 
 
 __all__ = []
@@ -38,72 +38,75 @@ try:
 except Exception as e:
     print(f"BIOPAC backend not available: {e}")
 
-def get_device_group_handler(
-        group_dict, 
+try:
+    # Virtual device: always available, no hardware or platform requirements.
+    from . import dummy
+
+    __all__.append("dummy")
+    AVAILABLE_BACKENDS[DeviceType.DUMMY.value] = dummy
+except Exception as e:
+    print(f"DUMMY backend not available: {e}")
+
+
+def get_device_handler(
+        device_id, 
+        device_cfg, 
         response_queue: mp.Queue, 
         data_output_queue: mp.Queue,
         logger = None
     ): 
-    '''
-    group_dict = {
-        'metadata': { 
-            Common information such as type of devices, 
-            overall group connectivity state, and so on.
-        },
-        'device_id_1': { # Device params },
-        ...
-        'device_id_N': { # Device params }
-    }
-    Each group has one associated handler
-    '''
-
-    metadata = group_dict.get("metadata", {})
-    group_id = metadata.get("group_id", "")
-    device_type = metadata.get("device_type", None)
+    device_type = device_cfg.get_param("device_type")
     
     if device_type not in SUPPORTED_DEVICES:
-        log_print(logger, 'error', f'Unsupported device type: {device_type}. Supported device types are: {SUPPORTED_DEVICES}')
-        return 
+        log_print(logger, "error", f"Unsupported device type: {device_type}")
+        return None
     elif device_type not in AVAILABLE_BACKENDS:
-        log_print(logger, 'warning', f'Unable to initialize group {group_id} as backend not available on machine. ') 
-        return 
-    elif not device_type:
-        log_print(logger, 'error', f'Group {group_id} has no device type specified')
-        return 
+        log_print(logger, "warning", f"Backend not available for {device_type}") 
+        return None
     
-    # If everything works, initialize 
     match device_type: 
         case DeviceType.USRP.value: 
-
             handler = AVAILABLE_BACKENDS.get(DeviceType.USRP.value).USRPBackend(
-                group_id = group_id, 
-                samp_rate = metadata.get('samp_rate'),  
-                devices = {k: v for k, v in group_dict.items() if k != "metadata"},
+                group_id = device_id, 
+                samp_rate = device_cfg.get_param("samp_rate"),  
+                devices = {device_id: device_cfg.to_dict()},
                 response_queue = response_queue,
                 data_output_queue = data_output_queue,
-                display_ds = metadata.get('display_ds', 10),
-                display_imaginary = metadata.get('display_imaginary', False),
-                save_ds = metadata.get('save_ds', 1),
-                save_iq = metadata.get('save_iq', False),
-                save_imaginary = metadata.get('save_imaginary', True),
+                display_ds = device_cfg.get_param("disp_ds", 10),
+                display_imaginary = device_cfg.get_param("display_imaginary", False),
+                save_ds = device_cfg.get_param("save_ds", 1),
+                save_iq = device_cfg.get_param("save_iq", False),
+                save_imaginary = device_cfg.get_param("save_imaginary", True),
                 discovered_devices = None
             )
         
         case DeviceType.BIOPAC.value: 
-            # We only support one BIOPAC device per group for now. Hence, 
-            # we assume that there is only one dict provided
-            device_dict = next(iter(group_dict.values())) 
-            device_cfg = Configuration.from_dict(device_dict, DeviceType.BIOPAC.value)
-            
             handler = AVAILABLE_BACKENDS.get(DeviceType.BIOPAC.value).BIOPACBackend(
-                group_id = group_id, 
+                group_id = device_id, 
                 response_queue = response_queue, 
-                samp_rate = device_cfg.get_param('samp_rate'),  
-                mpdev_path = device_cfg.get_param('mpdev_path'), 
-                device_code = device_cfg.get_param('device_code'),
+                samp_rate = device_cfg.get_param("samp_rate"),  
+                mpdev_path = device_cfg.get_param("mpdev_path"), 
+                device_code = getattr(device_cfg, "device_code", 103),
                 data_output_queue = data_output_queue
             )
+
+        case DeviceType.DUMMY.value:
+            handler = AVAILABLE_BACKENDS.get(DeviceType.DUMMY.value).DummyBackend(
+                group_id = device_id,
+                samp_rate = device_cfg.get_param("samp_rate", 500),
+                num_channels = device_cfg.get_param("num_channels", 4),
+                response_queue = response_queue,
+                data_output_queue = data_output_queue,
+                signal_freq = device_cfg.get_param("signal_freq", 1.0),
+                amplitude = device_cfg.get_param("amplitude", 1.0),
+                noise_std = device_cfg.get_param("noise_std", 0.0),
+                chunk_duration = device_cfg.get_param("chunk_duration", 0.05),
+            )
+
+        case _:
+            handler = None
         
     return handler  
+  
 
-__all__ = ["AVAILABLE_BACKENDS", "get_device_group_handler"]
+__all__ = ["AVAILABLE_BACKENDS", "get_device_handler"]

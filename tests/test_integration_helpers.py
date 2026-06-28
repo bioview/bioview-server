@@ -6,7 +6,7 @@ import pytest
 from bioview_common import ValidationError
 
 from bioview_server.device import AVAILABLE_BACKENDS
-from bioview_server.utils import (
+from bioview_common import (
     apply_filter,
     emit_signal,
     get_cache_file,

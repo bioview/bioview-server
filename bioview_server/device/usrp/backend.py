@@ -326,14 +326,14 @@ class USRPBackend(Backend):
 
         # Start display
         if self.display_worker:
-            if self.display_worker._started.is_set():
-                self.display_worker.running = True 
-            else:
-                self.display_worker.start() 
+            if not self.display_worker.is_alive():
+                self.display_worker.start()
+            self.display_worker.resume()
 
     def _stop_streaming(self):
         # Stops display
-        self.running = False 
+        if self.display_worker:
+            self.display_worker.pause()
 
         if self.save_worker:
             self.save_worker.pause()
@@ -390,6 +390,12 @@ class USRPBackend(Backend):
             for idx, abs_idx in enumerate(dev_cfg.absolute_channel_nums):
                 channel_ifs[abs_idx] = dev_cfg.if_freq[idx]
         self.channel_ifs = channel_ifs
+
+    
+    def _queue_param_update(self, params):
+        for device_key, q in self.rx_command_queue.items():
+            for param, value in params.items():
+                q.put({"param": param, "value": value})
 
     def _disconnect(self):
         # Stop streaming

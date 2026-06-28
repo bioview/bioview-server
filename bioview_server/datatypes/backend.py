@@ -39,7 +39,7 @@ import multiprocessing as mp
 
 from typing import Dict, List, Set
 
-from bioview_common import Command, Response, DataSource, DeviceStatus, log_print
+from bioview_common import IPCCommand, Response, DataSource, DeviceStatus, log_print
 
 from bioview_server.common import DisplayWorker, SaveWorker
 
@@ -120,13 +120,10 @@ class Backend(mp.Process):
             while not self.data_output_queue.empty():
                 self.data_output_queue.get_nowait()
 
-        display_sources = display_config.get('display_sources', [])
-        for source in display_sources:
-            self.add_display_source(source)
-
-        # TODO: Debug and once done, remove self.display_handler function implementation 
+        # The client receives the full stream (so it can save everything) and then
+        # decides which sources to plot. Therefore we forward all data sources.
         self.display_worker = DisplayWorker(
-            display_sources=self.display_sources,
+            display_sources=list(self.data_sources),
             data_input_queue=self.display_queue,
             data_output_queue=self.data_output_queue,
             logger = self.logger
@@ -186,31 +183,6 @@ class Backend(mp.Process):
         with contextlib.suppress(Exception):
             self.display_sources.remove(source_id) 
 
-    def display_handler(self):
-        '''
-        The only role of display worker in the server is to keep polling
-        for data in the display_queue and add it to the sending queue
-        '''
-        while self._streaming.is_set():
-            if len(self.data_sources) == 0: 
-                continue 
-
-            try:
-                # Get samples 
-                samples = self.display_queue.get_nowait()
-                buff = {} 
-
-                for source in self.display_sources:
-                    buff[source] = samples[source.channel]
-                
-                self.data_output_queue.put_nowait(buff)
-            except queue.Empty: 
-                log_print(self.logger, 'debug', 'No data available to send for display')
-            except queue.Full:
-                log_print(self.logger, 'warning', 'Display queue filled up. Unable to add any more data.')
-            except Exception as e:
-                log_print(self.logger, 'error', f'Error occurred: {e}')
-
     def _start_streaming(self):
         raise NotImplementedError
 
@@ -264,42 +236,49 @@ class Backend(mp.Process):
 
             # TODO: Update to put conditionnal checks for responses - !IMPORTANT
             match cmd:
-                case Command.CONNECT_DEVICES:
+                case IPCCommand.CONNECT_DEVICES:
                     result = self._initialize()
                     self.response_queue.put({'type': Response.SUCCESS, 'result': result})
                     
                     if not result:
                         raise RuntimeError("Unable to initialize device")
                 
-                case Command.START_STREAMING:
-                    save_cfg = cmd_args.get('save_config', {})
-                    display_cfg = cmd_args.get('display_config', {})
+                case IPCCommand.START_STREAMING:
+                    cmd_args = cmd_args or {}
+                    save_cfg = cmd_args.get('save_config', {}) or {}
+                    display_cfg = cmd_args.get('display_config', {}) or {}
 
-                    if save_cfg:
+                    # Saving is performed on the client (fast disk); only set up the
+                    # server-side save worker if explicitly enabled.
+                    if save_cfg.get('enable_save'):
                         self._setup_saving(save_cfg)
-                    
-                    if display_cfg: 
-                        self._setup_display(display_cfg)
-                    
+
+                    # Display is the live stream to the client and must always run.
+                    self._setup_display(display_cfg)
+
                     # TODO: Add initial calibration sequence here. For example, this can include
                     # gain balancing or Guoyi's phase calibration method
                     result = self._start_streaming()
-                    print(result)
                     self.response_queue.put({'type': Response.SUCCESS, 'result': result})
                     self._streaming.set()
                 
-                case Command.STOP_STREAMING:
+                case IPCCommand.STOP_STREAMING:
                     self._streaming.clear()
                     result = self._stop_streaming()
                     self.response_queue.put({'type': Response.SUCCESS, 'result': result})
                 
-                case Command.DISCONNECT_DEVICES:
+                case IPCCommand.DISCONNECT_DEVICES:
                     result = self._disconnect()
                     self.response_queue.put({'type': Response.SUCCESS, 'result': result})
                 
-                case Command.UPDATE_RUNNING_PARAMETER:
+                case IPCCommand.UPDATE_RUNNING_PARAMETER:
                     self._queue_param_update(cmd_args)
                     self.response_queue.put({'type': Response.SUCCESS, 'result': None})
+
+                case IPCCommand.SHUTDOWN:
+                    # Stop the subprocess run loop cleanly
+                    self._streaming.clear()
+                    self._running.clear()
                     
         except Exception as e:
             log_print(self.logger, 'error', f"Command {cmd} failed: {e}")
@@ -308,7 +287,7 @@ class Backend(mp.Process):
     # Public API for non-blocking calls
     def initialize(self, **kwargs):
         self.command_queue.put({
-            'command': Command.CONNECT_DEVICES,
+            'command': IPCCommand.CONNECT_DEVICES,
             'args': kwargs
         })
         response = self.response_queue.get(timeout=150)
@@ -316,33 +295,32 @@ class Backend(mp.Process):
 
     def start_streaming(self, cfg_dict: Dict = None):
         self.command_queue.put({
-            'command': Command.START_STREAMING,
+            'command': IPCCommand.START_STREAMING,
             'args': cfg_dict
         })
-        print(cfg_dict)
         response = self.response_queue.get(timeout=10)
         return response
     
     def stop_streaming(self):
-        self.command_queue.put({'command': Command.STOP_STREAMING})
+        self.command_queue.put({'command': IPCCommand.STOP_STREAMING})
         response = self.response_queue.get(timeout=10)
         return response
     
     def queue_param_update(self, **params):
         self.command_queue.put({
-            'command': Command.UPDATE_RUNNING_PARAMETER,
+            'command': IPCCommand.UPDATE_RUNNING_PARAMETER,
             'args': params
         })
         # Don't wait for response for real-time updates
         # TODO: Fix
     
     def disconnect(self):
-        self.command_queue.put({'command': Command.DISCONNECT_DEVICES})
+        self.command_queue.put({'command': IPCCommand.DISCONNECT_DEVICES})
         response = self.response_queue.get(timeout=5)
         return response
     
     def shutdown(self):
-        self.command_queue.put({'command': Command.SHUTDOWN})
+        self.command_queue.put({'command': IPCCommand.SHUTDOWN})
         self.join(timeout=5)
         if self.is_alive():
             self.terminate()

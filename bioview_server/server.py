@@ -24,30 +24,34 @@ from threading import Thread
 
 import multiprocessing as mp 
 
-from bioview_common import (    
-    AuthenticationError,
-    ValidationError, 
-    DeviceError, 
-    DeviceStatus, 
-    get_app_info, 
-    MAX_BUFFER_SIZE,
-    CONTROL_PORT, DATA_PORT,
-    ServerStatus, 
-    Response, Command,
+from bioview_common import (
     APP_VERSION,
+    AuthenticationError,
+    CONTROL_PORT,
+    Command,
+    DATA_PORT,
+    DeviceError,
+    DeviceStatus,
+    MAX_BUFFER_SIZE,
+    Response,
+    ServerStatus,
+    ValidationError,
+    generate_challenge,
+    get_app_info,
+    is_dict_of_dicts,
     log_print,
-    is_dict_of_dicts
-)
-
-from bioview_server.utils import (
-    send_response, 
+    parse_and_validate_command,
+    parse_and_validate_response,
+    recv_message,
+    send_command,
     send_datachunk,
-    generate_challenge, 
-    validate_token, 
-    parse_and_validate_command
+    send_response,
+    validate_token
 )
 
-from bioview_server.device import AVAILABLE_BACKENDS, get_device_group_handler
+
+
+from bioview_server.device import AVAILABLE_BACKENDS, get_device_handler
 
 SLEEP_DURATION = 0.001 # Confirm CPU load with varying this value
 
@@ -81,6 +85,7 @@ class Server:
         # Device handling
         self.device_group_states = {}
         self.device_group_handlers = {}
+        self.config = None
         self.data_sources = set()  # set(source: DataSource)
 
         # Sockets
@@ -110,7 +115,7 @@ class Server:
             self.logger = logger
 
     def start(self): 
-        log_print(self.logger, 'info' 'Starting server')
+        log_print(self.logger, 'info', 'Starting server')
         
         # Setup sockets 
         self._create_sockets()
@@ -140,7 +145,7 @@ class Server:
                     continue
 
                 # Now that we have a connection, we will validate the payload
-                auth_data = control_conn.recv(MAX_BUFFER_SIZE)
+                auth_data = recv_message(control_conn, self.logger)
                 if not auth_data: 
                     control_conn.close()
                     continue 
@@ -172,7 +177,7 @@ class Server:
                         logger = self.logger 
                     ),
                     
-                    challenge_response = control_conn.recv(MAX_BUFFER_SIZE)
+                    challenge_response = recv_message(control_conn, self.logger)
                     client_cmd, client_payload = parse_and_validate_command(challenge_response) 
 
                     if client_cmd != Command.AUTHENTICATE_CLIENT.name: 
@@ -218,7 +223,7 @@ class Server:
                     data_conn, _ = self.data_socket.accept()
                     log_print(self.logger, "debug", "Data connection accepted.")
                 except socket.timeout: 
-                    log_print(self.logger, "error" "Client failed to connect data socket in time.")
+                    log_print(self.logger, "error", "Client failed to connect data socket in time.")
                     control_conn.close() 
                     continue
 
@@ -244,7 +249,9 @@ class Server:
             self.control_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.control_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.control_socket.bind(("0.0.0.0", self.control_port))
-            self.control_socket.listen(1)
+            # A LAN discovery scan opens many short-lived probe connections at
+            # once; a generous backlog keeps them from being refused/reset.
+            self.control_socket.listen(socket.SOMAXCONN)
             self.control_socket.settimeout(1) # Make sure that accept is non-blocking
             log_print(self.logger, 'debug', 'Control socket created')
         except Exception as e: 
@@ -255,7 +262,7 @@ class Server:
             self.data_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.data_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.data_socket.bind(("0.0.0.0", self.data_port))
-            self.data_socket.listen(1)
+            self.data_socket.listen(8)
             self.data_socket.settimeout(5) 
             log_print(self.logger, 'debug', 'Data socket connected')
         except Exception as e: 
@@ -310,10 +317,23 @@ class Server:
     def _data_handler(self):
         while self.client_session_active:
             try:
-                buff = self.data_queue.get(1)  # add a little delay to lower CPU usage
+                # Use a real (short) timeout so the loop periodically re-checks
+                # client_session_active and the thread can exit cleanly when the
+                # session ends or while streaming is paused (no data queued).
+                buff = self.data_queue.get(timeout=1.0)
 
                 try: 
-                    send_datachunk(self.client_data_conn, buff)
+                    # Backends push {'data': ndarray, 'sources': [source dicts]}.
+                    # The source list is forwarded as chunk metadata so the client
+                    # can route each row to the correct plot/save column.
+                    if isinstance(buff, dict) and "data" in buff:
+                        send_datachunk(
+                            self.client_data_conn,
+                            buff["data"],
+                            meta={"sources": buff.get("sources")},
+                        )
+                    else:
+                        send_datachunk(self.client_data_conn, buff)
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     log_print(self.logger, 'error', 'Client disconnected during data transmission.')
                     self.client_session_active = False  # Signal other threads to stop
@@ -330,7 +350,7 @@ class Server:
                 # Receive commands (but we block while waiting) 
                 self.client_control_conn.settimeout(1.0)
                 try: 
-                    data = self.client_control_conn.recv(MAX_BUFFER_SIZE)
+                    data = recv_message(self.client_control_conn, self.logger)
                 except socket.timeout: 
                     continue  # ensure timeouts do not kill this thread 
                 except (OSError, ConnectionResetError) as e: 
@@ -384,6 +404,8 @@ class Server:
                         self._start_streaming(payload)
                     case Command.STOP_STREAMING.name:
                         self._stop_streaming()
+                    case Command.UPDATE_RUNNING_PARAMETER.name:
+                        self._update_running_parameter(payload)
 
             except ValidationError as e:
                 log_print(self.logger, "debug", f"Invalid command {cmd_type} sent: {e}")
@@ -402,6 +424,7 @@ class Server:
             return False
 
     # Device command handling callbacks 
+
     def _discover_devices(self, payload): 
         log_print(self.logger, "info", "Discovering connected devices")
         
@@ -411,36 +434,36 @@ class Server:
             try:
                 self.discovered_devices.extend(backend.discover_devices())
             except Exception as e: 
-                msg = f'Device discovery failed for devices of type {backend_type} with error: {e}'
-                log_print(self.logger, 'warning', msg)
+                msg = f"Device discovery failed for devices of type {backend_type} with error: {e}"
+                log_print(self.logger, "warning", msg)
         
-        log_print(self.logger, 'debug', f'Found {self.discovered_devices}')
+        log_print(self.logger, "debug", f"Found {self.discovered_devices}")
         
-        # Extract provided device configuration
-        device_groups = payload.get('device_groups', {})
-        if device_groups is {} or not is_dict_of_dicts(device_groups):
-            return None
+        if not self.config:
+            from bioview_common import Configuration
+            self.config = Configuration.from_dict(payload.get("device_groups", payload))
 
-        # Check if all devices in the device groups are present 
+        # Check if all devices in the config are present 
         self.device_group_states = {} # Refresh
 
-        for group_id, group_dict in device_groups.items(): 
-            self.device_group_states[group_id] = {}
-            for device_id in group_dict.keys():
-                # Avoid populating with metadata
-                if device_id == 'metadata':
-                    continue
-
-                if device_id in self.discovered_devices:
-                    self.device_group_states[group_id][device_id] = DeviceStatus.AVAILABLE.value
-                else: 
-                    self.device_group_states[group_id][device_id] = DeviceStatus.UNAVAILABLE.value
+        for device_id in self.config.devices.keys():
+            if device_id in self.discovered_devices:
+                self.device_group_states[device_id] = DeviceStatus.AVAILABLE.value
+            else: 
+                self.device_group_states[device_id] = DeviceStatus.UNAVAILABLE.value
 
         log_print(self.logger, "info", "Device discovery completed successfully")
+
     
+
     def _initialize_devices(self, payload):
+        # Store configuration
+        from bioview_common import Configuration
+        self.config = Configuration.from_dict(payload.get("device_groups", payload))
+        
         # For flexibility, we provide device configurations to both initialize and discover.
         self._discover_devices(payload)
+
         
         if self.device_group_states == {}: 
             send_response(self.client_control_conn, Response.ERROR, 
@@ -453,47 +476,41 @@ class Server:
         response = Response.SUCCESS
 
         # Now that we have a valid device configuration, try initializing 
-        self.device_group_handlers = {} # Refresh
+        self.device_group_handlers = {}
         uninit_groups = []
 
-        group_cfg_dict = payload.get("device_groups")
-
-        for group_id in self.device_group_states: 
-            self.device_group_handlers[group_id] = None 
+        for device_id, device_cfg in self.config.devices.items():
+            self.device_group_handlers[device_id] = None 
             
-            group_dict = group_cfg_dict[group_id]
             try:
                 # Get handler
-                handler = get_device_group_handler(group_dict, self.response_queue, self.data_queue, self.logger)
+                handler = get_device_handler(device_id, device_cfg, self.response_queue, self.data_queue, self.logger)
+                if not handler:
+                    raise DeviceError(f"Unable to create handler for {device_id}")
+                
                 handler.start() # Start subprocess
                 
                 # Initialize
                 resp = handler.initialize()
 
                 # Check for response 
-                if resp.get('type', None) != Response.SUCCESS:
-                    raise DeviceError(resp.get('message', 'Unknown'))
+                if resp.get("type") != Response.SUCCESS:
+                    raise DeviceError(resp.get("message", "Unknown"))
 
                 # Store 
-                for device_id in group_dict:
-                    if device_id == 'metadata':
-                        continue
-
-                    self.device_group_states[group_id][device_id] = DeviceStatus.CONNECTED.value
+                self.device_group_states[device_id] = DeviceStatus.CONNECTED.value
                 
-                # Ensure we can access group status overall 
-                self.device_group_states[group_id]["metadata"] = DeviceStatus.CONNECTED.value
-
                 # Provide data sources to the frontend for display
                 self.data_sources.update(handler.get_data_sources())
 
                 # Store handler 
-                self.device_group_handlers[group_id] = handler
+                self.device_group_handlers[device_id] = handler
             except Exception as e:
-                msg = f'Unable to initialize group: {group_id}. Error: {e}'
+                msg = f"Unable to initialize device: {device_id}. Error: {e}"
                 response = Response.WARNING
-                log_print(self.logger, 'error', msg)
-                uninit_groups.append(group_id)
+                log_print(self.logger, "error", msg)
+                uninit_groups.append(device_id)
+
 
         # Send response (both discovered states as well as initialized devices)
         send_response(
@@ -535,6 +552,18 @@ class Server:
             msg = "Server has no initialized devices"
             log_print(self.logger, 'error', msg)
             send_response(self.client_control_conn, Response.ERROR, params={"message": msg}, logger = self.logger)
+            return
+
+        # Build a structured streaming config from the experiment configuration.
+        # Saving happens on the client (fast disk), so server-side saving is off;
+        # the display path is the live stream to the client and is always enabled.
+        experiment_cfg = payload.get("Experiment", payload.get("experiment", {})) or {}
+        stream_cfg = {
+            "save_config": {"enable_save": False},
+            "display_config": {
+                "display_sources": experiment_cfg.get("display_sources", []),
+            },
+        }
 
         # Ask all backends to start
         try:
@@ -542,7 +571,7 @@ class Server:
 
             # Start your existing receive/transmit workers
             for handler in self.device_group_handlers.values():
-                handler.start_streaming(payload)
+                handler.start_streaming(stream_cfg)
 
             msg = "Data streaming started successfully"
             log_print(self.logger, 'info', msg)
@@ -557,6 +586,7 @@ class Server:
             msg = "Server has no initialized devices"
             log_print(self.logger, 'warning', msg)
             send_response(self.client_control_conn, Response.SUCCESS, params={"message": msg}, logger = self.logger)
+            return
 
         try:
             log_print(self.logger, 'info', "Attempting to stop data streaming")
@@ -571,6 +601,34 @@ class Server:
             msg = f"Failed to stop streaming: {e}"
             log_print(self.logger, 'error', msg)
             send_response(self.client_control_conn, Response.ERROR, params={"message": msg})
+
+    def _update_running_parameter(self, payload):
+        device_id = payload.get("id")
+        config = payload.get("config")
+
+        if not device_id or not config:
+            send_response(self.client_control_conn, Response.ERROR, params={"message": "Invalid payload"}, logger=self.logger)
+            return
+
+        log_print(self.logger, "info", f"Updating parameter for device {device_id}")
+
+        # Update internal config
+        if self.config:
+            for param, value in config.items():
+                self.config.update_device_param(device_id, param, value)
+
+        # Find the handler managing this device. device_id is typically the group_id.
+        handler = self.device_group_handlers.get(device_id)
+
+        if handler is None:
+            send_response(self.client_control_conn, Response.ERROR, params={"message": "Device handler not found"}, logger=self.logger)
+            return
+
+        try:
+            handler.queue_param_update(**config)
+            send_response(self.client_control_conn, Response.SUCCESS, params={"message": "Parameter updated"}, logger=self.logger)
+        except Exception as e:
+            send_response(self.client_control_conn, Response.ERROR, params={"message": str(e)}, logger=self.logger)
 
     def stop(self):
         log_print(self.logger, 'debug', "Attempting to shutdown server")

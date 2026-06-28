@@ -11,7 +11,7 @@ import numpy as np
 import uhd
 from bioview_common import DataSource, log_print
 
-from bioview_server.utils import get_cache_file
+from bioview_common import get_cache_file
 
 
 CLOCK_TIMEOUT = 1000  # 1000ms timeout for external clock locking

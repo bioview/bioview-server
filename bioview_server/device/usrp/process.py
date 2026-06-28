@@ -4,7 +4,7 @@ from typing import List
 import numpy as np
 
 from bioview_common import log_print, PausableWorker
-from bioview_server.utils import apply_filter, get_filter
+from bioview_common import apply_filter, get_filter
 
 
 class ProcessWorker(PausableWorker):
@@ -53,7 +53,7 @@ class ProcessWorker(PausableWorker):
         ]
 
         # Keep track of phase and filter states for all data sources
-        for source in self.data_sources.values():
+        for source in self.data_sources:
             source.accumulated_phase = 0.0
             source.filter_state = None
 
@@ -142,7 +142,7 @@ class ProcessWorker(PausableWorker):
         else:
             save_list = np.empty((num_sources, len_samples))
 
-        for source in self.data_sources.values():
+        for source in self.data_sources:
             data = buffer[source.rx_idx, :]
             first_comp, second_comp = self._process_chunk(
                 data=data,
@@ -191,7 +191,7 @@ class ProcessWorker(PausableWorker):
             try:
                 # Get from all queues
                 for idx, key in enumerate(self.rx_queues):
-                    rx_q = self.rx_queues[rx_q]
+                    rx_q = self.rx_queues[key]
                     samples[idx] = rx_q.get_nowait()
                 data_buf = np.transpose(np.vstack(samples))
 
