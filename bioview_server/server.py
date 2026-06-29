@@ -15,6 +15,7 @@ for expanding functionality to handle the case for multiple clients.
 import time 
 import queue 
 import argparse
+import signal
 import socket 
 import logging 
 import ipaddress
@@ -254,8 +255,12 @@ class Server:
             self.control_socket.listen(socket.SOMAXCONN)
             self.control_socket.settimeout(1) # Make sure that accept is non-blocking
             log_print(self.logger, 'debug', 'Control socket created')
-        except Exception as e: 
+        except OSError as e:
+            # A port already in use almost always means another BioView server is
+            # already running; surface it so the caller can exit cleanly rather
+            # than spin on an unbound socket.
             log_print(self.logger, 'error', f'Unable to create control socket: {e}')
+            raise
 
         # Create data socket
         try: 
@@ -265,8 +270,9 @@ class Server:
             self.data_socket.listen(8)
             self.data_socket.settimeout(5) 
             log_print(self.logger, 'debug', 'Data socket connected')
-        except Exception as e: 
-            log_print(self.logger, 'error', f'Unable to create data socket: {e}') 
+        except OSError as e:
+            log_print(self.logger, 'error', f'Unable to create data socket: {e}')
+            raise
 
     def handle_client_session(self, control_conn, data_conn): 
         self.client_control_conn = control_conn 
@@ -650,7 +656,7 @@ class Server:
 
         log_print(self.logger, 'debug', "Server shut down successfully")
 
-if __name__ == '__main__': 
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Launch BioView Backend Server")
     parser.add_argument(
         "--local",
@@ -659,12 +665,14 @@ if __name__ == '__main__':
     )
     parser.add_argument(
         "--control-port",
+        type=int,
         help=f"Port number to use for control connections. Default: {CONTROL_PORT}",
         required=False,
         default=CONTROL_PORT
     )
     parser.add_argument(
         "--data-port",
+        type=int,
         help=f"Port number to use for data connections. Default: {DATA_PORT}",
         required=False,
         default=DATA_PORT
@@ -677,7 +685,7 @@ if __name__ == '__main__':
     )
     log_print(logger, 'info', f"BioView Device Server, Version: {APP_VERSION}")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     server = Server(
         local_only = args.local,
@@ -686,14 +694,37 @@ if __name__ == '__main__':
         logger = logger
     )
 
+    # Stop cleanly when the launcher (or the OS) asks us to terminate, so sockets
+    # are released promptly when the GUI that spawned us closes.
+    def _handle_termination(signum, frame):
+        log_print(logger, 'info', f"Received signal {signum}. Shutting down server...")
+        server.running = False
+
+    with contextlib.suppress(Exception):
+        signal.signal(signal.SIGTERM, _handle_termination)
+
+    exit_code = 0
     try:
         server.start()
     except KeyboardInterrupt:
         log_print(logger, 'warning', "Keyboard interrupt received. Shutting down server...")
+    except OSError as e:
+        # Most likely the control/data port is already bound by another server.
+        log_print(logger, 'error', f"Unable to bind server sockets ({e}). Exiting...")
+        exit_code = 1
     except Exception:
         log_print(logger, 'error', "Server error. Shutting down server...")
+        exit_code = 1
     finally:
         try:
             server.stop()
         except Exception:
             log_print(logger, 'error', "Unable to shut down server. Exiting...")
+
+    return exit_code
+
+
+if __name__ == '__main__':
+    import sys
+
+    sys.exit(main())

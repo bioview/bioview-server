@@ -14,6 +14,9 @@ dependencies = [
     "scipy (>=1.16.1,<2.0.0)"
 ]
 
+[project.scripts]
+bioview-server = "bioview_server.server:main"
+
 [project.optional-dependencies]
 uhd = [
     "uhd ; platform_system == 'Windows'"
