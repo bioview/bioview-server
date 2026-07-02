@@ -1,6 +1,6 @@
 [project]
 name = "bioview-server"
-version = "0.9.3.9debug"
+version = "0.9.3.9"
 description = "Cross-platform backend providing core functionality for headless and networked clients"
 authors = [
     {name = "Aakash Kapoor",email = "113218196+meowkash@users.noreply.github.com"}
