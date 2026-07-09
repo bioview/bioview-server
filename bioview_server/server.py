@@ -571,6 +571,24 @@ class Server:
                 self.device_group_states[device_id] = DeviceStatus.AVAILABLE.value
                 continue
 
+            if device_type == DeviceType.BIOPAC.value:
+                hardware = device_cfg.get_param("hardware") or {}
+                hw_names = set(hardware.keys()) if isinstance(hardware, dict) else set()
+                biopac_discovered = {
+                    name
+                    for name, info in self.discovered_devices_cache.items()
+                    if isinstance(info, dict)
+                }
+                if hw_names and hw_names.issubset(biopac_discovered):
+                    self.device_group_states[device_id] = DeviceStatus.AVAILABLE.value
+                elif hw_names & biopac_discovered:
+                    self.device_group_states[device_id] = DeviceStatus.AVAILABLE.value
+                elif biopac_discovered and not hw_names:
+                    self.device_group_states[device_id] = DeviceStatus.AVAILABLE.value
+                else:
+                    self.device_group_states[device_id] = DeviceStatus.UNAVAILABLE.value
+                continue
+
             if device_id in discovered_names:
                 self.device_group_states[device_id] = DeviceStatus.AVAILABLE.value
                 continue
@@ -762,6 +780,11 @@ class Server:
                 "chunk_duration",
                 "hardware",
                 "channel_map",
+                "channels",
+                "model",
+                "mpdev_path",
+                "connection_type",
+                "port",
             }
         )
 

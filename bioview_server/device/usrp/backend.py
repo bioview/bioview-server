@@ -284,9 +284,7 @@ class USRPBackend(Backend):
                 self.rx_command_queue[device_name] = queue.Queue()
 
                 rx_offset = self.global_rx_offsets[device_name]
-                local_rx_gain = rx_gain[
-                    rx_offset : rx_offset + len(rx_channels)
-                ]
+                local_rx_gain = list(rx_gain)
                 self.receive_workers[device_name] = ReceiveWorker(
                     usrp=response["usrp"],
                     rx_gain=local_rx_gain,

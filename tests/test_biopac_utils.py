@@ -34,8 +34,8 @@ def test_discover_devices_filters_by_vid_and_name(monkeypatch):
     monkeypatch.setattr(utils, "wmi", types.SimpleNamespace(WMI=lambda: DummyWMI()))
 
     found = utils.discover_devices()
-    # Should find d1 and d3 because of BIOPAC vid or name
-    ids = [d["device_id"] for d in found]
+    assert isinstance(found, dict)
+    ids = [d["device_id"] for d in found.values()]
     assert any("VID_097E" in i for i in ids)
     assert any("BIOPAC" in d["manufacturer"].upper() or "BIOPAC" in d["name"].upper() for d in found)
 
@@ -65,8 +65,7 @@ def test_discover_devices_initializes_pythoncom_when_available(monkeypatch):
     monkeypatch.setattr(utils.importlib, "import_module", lambda name: DummyPyCom if name == "pythoncom" else __import__(name))
 
     found = utils.discover_devices()
-    # Should run and uninitialize pythoncom without error
-    assert isinstance(found, list)
+    assert isinstance(found, dict)
 
 
 def test_discover_devices_handles_missing_pythoncom(monkeypatch):

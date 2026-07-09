@@ -16,6 +16,25 @@ from .constants import BIOPAC_CONNECTION_CODES, BIOPAC_VENDOR_ID
 
 
 def discover_devices():
+    """Discover BIOPAC USB devices; returns {hardware_key: device_info}."""
+    discovered_devices = {}
+    discovered_list = _discover_devices_list()
+    for index, device_info in enumerate(discovered_list):
+        key = _discovery_key(device_info, index)
+        discovered_devices[key] = device_info
+    return discovered_devices
+
+
+def _discovery_key(device_info: dict, index: int) -> str:
+    name = (device_info.get("name") or "").strip()
+    if name:
+        key = "".join(c if c.isalnum() or c in "_-" else "_" for c in name)
+        key = key.strip("_") or f"BIOPAC_{index}"
+        return key
+    return f"BIOPAC_{index}"
+
+
+def _discover_devices_list():
     # Discover BIOPAC devices connected over USB.
     discovered_devices = []
     coinit = False
@@ -87,16 +106,58 @@ def discover_devices():
         return discovered_devices
 
 
+def build_hardware_dict_from_group(group_config: dict, group_id: str) -> dict:
+    hardware = group_config.get("hardware")
+    if hardware:
+        return dict(hardware)
+
+    entry = {
+        k: v
+        for k, v in group_config.items()
+        if k
+        in {
+            "channels",
+            "model",
+            "connection_type",
+            "port",
+            "samp_rate",
+            "labels",
+            "device_code",
+        }
+    }
+    device_name = group_config.get("device_name") or group_id
+    return {device_name: entry}
+
+
+def resolve_biopac_hardware_entry(
+    hardware: dict, discovered_devices: dict | None = None
+) -> dict:
+    """Pick the first hardware entry (BIOPAC groups are typically single-unit)."""
+    if not hardware:
+        return {}
+    if len(hardware) == 1:
+        return dict(next(iter(hardware.values())))
+    if discovered_devices:
+        for key, entry in hardware.items():
+            if key in discovered_devices:
+                return dict(entry)
+    return dict(next(iter(hardware.values())))
+
+
+def update_device_firmware():
+    """BIOPAC firmware updates are managed outside BioView."""
+    pass
+
+
 def load_mpdev_dll(custom_loc: str = None):
     dll = None
     try:
         dll = ctypes.CDLL("mpdev.dll")
         print("mpdev.dll found!")
-        return
+        return dll
     except FileNotFoundError:
         print("mpdev.dll is not located in $PATH")
 
-    # Check custom loc
     if custom_loc is not None:
         print(f"Searching for mpdev.dll in {custom_loc}")
         dll_locs = Path(custom_loc).glob("**/mpdev.dll")
@@ -105,31 +166,34 @@ def load_mpdev_dll(custom_loc: str = None):
             print("mpdev.dll found!")
             return dll
 
-    # Check root diretory - Check cache before searching
     dll_path = get_mpdev_path()
     if dll_path is not None:
         print("mpdev.dll found!")
         return ctypes.CDLL(dll_path)
-    else:
-        print("Searching for mpdev.dll in OS folders")
-        sys_dir = Path(os.path.abspath(os.sep))
-        dll_locs = sys_dir.glob("Program Files*/BIOPAC*/**/x64/mpdev.dll")
 
-        for loc in dll_locs:
-            update_mpdev_path(loc)
-            dll = ctypes.CDLL(loc)
-            print("mpdev.dll found!")
-            return dll
+    print("Searching for mpdev.dll in OS folders")
+    sys_dir = Path(os.path.abspath(os.sep))
+    dll_locs = sys_dir.glob("Program Files*/BIOPAC*/**/x64/mpdev.dll")
+
+    for loc in dll_locs:
+        update_mpdev_path(loc)
+        dll = ctypes.CDLL(loc)
+        print("mpdev.dll found!")
+        return dll
 
     return None
 
 
 # Wrappers for BIOPAC operations
 def connect_biopac_device(
-    mpdev_handler, device_code: int = 103, connection_code: int = 10
+    mpdev_handler,
+    device_code: int = 103,
+    connection_code: int = 10,
+    port: str = "auto",
 ):
+    port_bytes = port.encode("utf-8") if isinstance(port, str) else port
     result_code = mpdev_handler.connectMPDev(
-        c_int(device_code), c_int(connection_code), b"auto"
+        c_int(device_code), c_int(connection_code), port_bytes
     )
     if BIOPAC_CONNECTION_CODES.get(result_code, None) != "MPSUCCESS":
         raise Exception(f"BIOPAC Connection Failed with Error Code: {result_code}")
@@ -167,6 +231,18 @@ def stop_acquisition(mpdev_handler):
         )
 
 
+def disconnect_biopac_device(mpdev_handler):
+    if hasattr(mpdev_handler, "disconnectMPDev"):
+        result_code = mpdev_handler.disconnectMPDev()
+        if BIOPAC_CONNECTION_CODES.get(result_code, None) not in (
+            "MPSUCCESS",
+            None,
+        ):
+            raise Exception(
+                f"BIOPAC Disconnect Failed with Error Code: {result_code}"
+            )
+
+
 def wrap_result_code(result, stage=""):
     result_code = BIOPAC_CONNECTION_CODES.get(result, "INVALID_CODE")
     if result_code == "MPSUCCESS":
@@ -192,16 +268,7 @@ def update_mpdev_path(dll_path):
     cache_file = get_cache_file("mpdev_path")
 
     try:
-        with open(cache_file) as fobj:
-            dll_path = json.load(fobj)
-    except Exception:
-        print("mpdev path is not cached currently. Storing in cache.")
-
-    # Update
-    try:
         with open(cache_file, "w") as fobj:
             json.dump(str(dll_path), fobj)
     except Exception as e:
         print(f"Error updating cache: {e}")
-    finally:
-        print("Successfully stored in cache")

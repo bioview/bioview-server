@@ -91,12 +91,11 @@ def get_device_handler(
         
         case DeviceType.BIOPAC.value: 
             handler = AVAILABLE_BACKENDS.get(DeviceType.BIOPAC.value).BIOPACBackend(
-                group_id = device_id, 
-                response_queue = response_queue, 
-                samp_rate = device_cfg.get_param("samp_rate"),  
-                mpdev_path = device_cfg.get_param("mpdev_path"), 
-                device_code = getattr(device_cfg, "device_code", 103),
-                data_output_queue = data_output_queue
+                group_id=device_id,
+                response_queue=response_queue,
+                data_output_queue=data_output_queue,
+                group_config=device_cfg.to_dict(),
+                discovered_devices=discovered_devices,
             )
 
         case DeviceType.DUMMY.value:

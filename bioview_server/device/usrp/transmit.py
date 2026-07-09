@@ -85,10 +85,18 @@ class TransmitWorker(PausableWorker):
 
     def _apply_command(self, param: str, val):
         if param == "tx_gain":
-            if val != self.tx_gain:
+            gains = val if isinstance(val, list) else [val]
+            local_gains = gains[
+                self.global_tx_offset : self.global_tx_offset + len(self.tx_channels)
+            ]
+            if len(local_gains) < len(self.tx_channels):
+                local_gains = list(local_gains) + [local_gains[-1] if local_gains else 0] * (
+                    len(self.tx_channels) - len(local_gains)
+                )
+            if local_gains != self.tx_gain:
                 for idx, chan in enumerate(self.tx_channels):
-                    self.usrp.set_tx_gain(val[idx], chan)
-            self.tx_gain = val
+                    self.usrp.set_tx_gain(local_gains[idx], chan)
+            self.tx_gain = local_gains
         elif param in TX_PARAMS or param.startswith("calibration."):
             self.scheme.update_param(param, val)
             if param in ("if_freq", "calibration", "calibration.enabled", "signal_scheme"):
