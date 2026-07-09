@@ -56,6 +56,21 @@ from bioview_server.device import AVAILABLE_BACKENDS, get_device_handler
 
 SLEEP_DURATION = 0.001 # Confirm CPU load with varying this value
 
+
+def _handler_init_succeeded(resp: dict) -> bool:
+    """True only when a backend subprocess reports a successful connect."""
+    if not resp or not isinstance(resp, dict):
+        return False
+    resp_type = resp.get("type")
+    if resp_type in (Response.ERROR, Response.ERROR.name):
+        return False
+    if resp_type not in (Response.SUCCESS, Response.SUCCESS.name):
+        return False
+    if resp.get("result") is False:
+        return False
+    return True
+
+
 class Server:
     def __init__(
         self,
@@ -571,6 +586,13 @@ class Server:
 
         log_print(self.logger, "info", "Device discovery completed successfully")
 
+    def _active_device_handlers(self):
+        return {
+            device_id: handler
+            for device_id, handler in self.device_group_handlers.items()
+            if handler is not None
+        }
+
     def _initialize_devices_work(self, payload):
         self.config = self._config_from_payload(payload)
         self._discover_devices(payload)
@@ -587,6 +609,7 @@ class Server:
         for device_id, device_cfg in self.config.devices.items():
             self.device_group_handlers[device_id] = None
             self.device_group_states[device_id] = DeviceStatus.CONNECTING.value
+            handler = None
 
             try:
                 handler = get_device_handler(
@@ -603,9 +626,9 @@ class Server:
                 handler.start()
 
                 resp = handler.initialize()
-                resp_type = resp.get("type")
-                if resp_type != Response.SUCCESS and resp_type != Response.SUCCESS.name:
-                    raise DeviceError(resp.get("message", "Unknown"))
+                if not _handler_init_succeeded(resp):
+                    message = (resp or {}).get("message", "Unknown initialization error")
+                    raise DeviceError(message)
 
                 self.device_group_states[device_id] = DeviceStatus.CONNECTED.value
                 self.data_sources.update(handler.get_data_sources())
@@ -614,7 +637,11 @@ class Server:
                 msg = f"Unable to initialize device: {device_id}. Error: {e}"
                 log_print(self.logger, "error", msg)
                 self.device_group_states[device_id] = DeviceStatus.UNAVAILABLE.value
+                self.device_group_handlers[device_id] = None
                 uninit_groups.append(device_id)
+                if handler is not None:
+                    with contextlib.suppress(Exception):
+                        handler.shutdown()
 
         if len(uninit_groups) > 0:
             log_print(
@@ -626,13 +653,15 @@ class Server:
             log_print(self.logger, "info", "All devices successfully initialized")
         
     def _disconnect_devices(self):
-        if len(self.device_group_handlers) == 0:
+        active_handlers = self._active_device_handlers()
+        if not active_handlers:
             msg = "Server has no initialized devices"
             log_print(self.logger, 'warning', msg)
             send_response(self.client_control_conn, Response.SUCCESS, params={"message": msg}, logger = self.logger)
+            return
         
         try: 
-            for handler in self.device_group_handlers.values():
+            for handler in active_handlers.values():
                 handler.disconnect()
 
             msg = "Devices disconnected successfully"
@@ -645,7 +674,8 @@ class Server:
     
     # Handle streaming 
     def _start_streaming(self, payload): 
-        if len(self.device_group_handlers) == 0: 
+        active_handlers = self._active_device_handlers()
+        if not active_handlers:
             msg = "Server has no initialized devices"
             log_print(self.logger, 'error', msg)
             send_response(self.client_control_conn, Response.ERROR, params={"message": msg}, logger = self.logger)
@@ -669,7 +699,7 @@ class Server:
             log_print(self.logger, 'info', "Attempting to start data streaming")
 
             # Start your existing receive/transmit workers
-            for handler in self.device_group_handlers.values():
+            for handler in active_handlers.values():
                 handler.start_streaming(stream_cfg)
 
             msg = "Data streaming started successfully"
@@ -681,7 +711,8 @@ class Server:
             send_response(self.client_control_conn, Response.ERROR, params={"message": msg}, logger = self.logger)
 
     def _stop_streaming(self):
-        if len(self.device_group_handlers) == 0:
+        active_handlers = self._active_device_handlers()
+        if not active_handlers:
             msg = "Server has no initialized devices"
             log_print(self.logger, 'warning', msg)
             send_response(self.client_control_conn, Response.SUCCESS, params={"message": msg}, logger = self.logger)
@@ -690,7 +721,7 @@ class Server:
         try:
             log_print(self.logger, 'info', "Attempting to stop data streaming")
 
-            for handler in self.device_group_handlers.values():
+            for handler in active_handlers.values():
                 handler.stop_streaming()
 
             msg = "Data streaming stopped successfully"
@@ -735,6 +766,8 @@ class Server:
         )
 
         for device_id, handler in self.device_group_handlers.items():
+            if handler is None:
+                continue
             device_payload = payload.get(device_id)
             if not isinstance(device_payload, dict):
                 continue

@@ -237,9 +237,11 @@ class Backend(mp.Process):
             match cmd:
                 case IPCCommand.CONNECT_DEVICES:
                     result = self._initialize()
-                    self.response_queue.put({"type": Response.SUCCESS, "result": result})
                     if not result:
                         raise RuntimeError("Unable to initialize device")
+                    self.response_queue.put(
+                        {"type": Response.SUCCESS, "result": result}
+                    )
 
                 case IPCCommand.START_STREAMING:
                     cmd_args = cmd_args or {}
