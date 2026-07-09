@@ -4,23 +4,33 @@ Ref: uhd examples
 import json
 import time
 import contextlib
-from typing import List
+from typing import Dict, List
 from datetime import datetime, timedelta
 
 import numpy as np
 import uhd
-from bioview_common import DataSource, log_print
+from bioview_common import DISCOVERY_CACHE_TTL, DataSource, log_print
 
 from bioview_common import get_cache_file
 
 
 CLOCK_TIMEOUT = 1000  # 1000ms timeout for external clock locking
 
+_discovery_cache: Dict[str, dict] = {}
+_discovery_cache_ts = 0.0
+
+
+def invalidate_discovery_cache():
+    """Clear cached UHD discovery results (e.g. after a device is unplugged)."""
+    global _discovery_cache_ts
+    _discovery_cache.clear()
+    _discovery_cache_ts = 0.0
+
 
 def update_device_firmware():
     pass
 
-def discover_devices(logger = None):
+def discover_devices(logger=None, use_cache: bool = True):
     """
     Devices discovered using uhd.find contain the following keys -
     - 'type': eg. b200
@@ -30,18 +40,35 @@ def discover_devices(logger = None):
 
     These props are wrapped into an appropriate payload
     """
+    global _discovery_cache_ts
+
+    if use_cache and _discovery_cache and (
+        time.monotonic() - _discovery_cache_ts
+    ) < DISCOVERY_CACHE_TTL:
+        log_print(logger, "debug", "Using cached USRP discovery results")
+        return dict(_discovery_cache)
+
     discovered_devices = {}
 
     try:
+        log_print(logger, "info", "Searching for USRP devices (uhd.find)...")
         device_list = uhd.find("")
 
         for device in device_list:
             device_dict = dict(device)
-            device_id = device_dict.get('name', 'invalid_usrp_device')
+            device_id = device_dict.get("name", "invalid_usrp_device")
             discovered_devices[device_id] = device_dict
 
-            # Update in cache
             update_usrp_address(device_dict["name"], device_dict["serial"])
+
+        _discovery_cache.clear()
+        _discovery_cache.update(discovered_devices)
+        _discovery_cache_ts = time.monotonic()
+        log_print(
+            logger,
+            "info",
+            f"USRP discovery complete: {sorted(discovered_devices.keys())}",
+        )
     except Exception as e:
         log_print(logger, "error", f"Error occured in UHD device discovery: {e}")
 

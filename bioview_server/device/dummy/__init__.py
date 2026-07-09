@@ -2,10 +2,15 @@ from .backend import DummyBackend, SineWaveWorker
 
 
 def discover_devices():
-    """Virtual devices have nothing to physically probe. Discovery returns an
-    empty list; the dummy backend always initializes successfully regardless of
-    the reported availability, which is enough to exercise the full pipeline."""
-    return []
+    """Report the virtual dummy backend as present on the server."""
+    return [
+        {
+            "name": "DummyVirtual",
+            "type": "dummy",
+            "device_type": "dummy",
+            "serial": "virtual",
+        }
+    ]
 
 
 def update_device_firmware(*args, **kwargs):

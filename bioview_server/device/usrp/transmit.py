@@ -1,171 +1,196 @@
-import math
 import queue
-from typing import List
+from typing import Dict, List
 
 import numpy as np
 import uhd
 
 from bioview_common import log_print, PausableWorker
+from bioview_common.signal_schemes import SignalScheme
 
 INIT_DELAY = 0.05  # 50mS initial delay before transmit
+
+TX_PARAMS = {
+    "tx_gain",
+    "tx_amplitude",
+    "tx_phase",
+    "if_freq",
+    "calibration",
+    "calibration.enabled",
+    "signal_scheme",
+    "fmcw",
+    "pulsed_doppler",
+}
+
 
 class TransmitWorker(PausableWorker):
     def __init__(
         self,
         usrp,
         tx_gain: List[float],
-        tx_amplitude: List[float],
         tx_channels: List[int],
         samp_rate: int,
-        if_freq: float,
         tx_streamer,
+        scheme: SignalScheme,
         cmd_queue: queue.Queue,
+        global_tx_offset: int = 0,
         running: bool = False,
-        logger = None 
+        logger=None,
     ):
         super().__init__()
 
-        # Signals
         self.logger = logger
-
-        # Modifiable params
         self.tx_gain = tx_gain
-        self.tx_amplitude = tx_amplitude
-
-        # Fixed params
         self.tx_channels = tx_channels
         self.samp_rate = samp_rate
-        self.if_freq = if_freq
-        
-        # TODO: Currently we generate a fixed number of samples for the Tx 
-        # waveform and loop around since it reduces computations and we will 
-        # keep wrapping around due to the periodicity of the signal anyway. 
-        # However, this massively restricts our implementation to a FDM superhet
-        # scheme and does not allow for anything fancier to happen. Thus, 
-        # let us modify this function to provide Tx waveforms which can not
-        # only provide a buffer for FDM but also CDM and other methods 
-        # Furthermore, the generated Tx waveforms should also include a calibration
-        # function if it is so desired
-        self._generate_tx_waveforms()
-
         self.usrp = usrp
         self.tx_streamer = tx_streamer
+        self.scheme = scheme
+        self.cmd_queue = cmd_queue
+        self.global_tx_offset = global_tx_offset
         self.running = running
 
-        self.cmd_queue = cmd_queue
+        self.tx_metadata = None
+        self._sample_idx = 0
+        self._use_cyclic = scheme.cycle_length() is not None
+        self.tx_waveform = None
         self.tx_buffer_size = self.tx_streamer.get_max_num_samps()
 
-    def _get_buf_size(self, freq):
-        return self.samp_rate * freq / (math.gcd(int(self.samp_rate), int(freq)) ** 2)
-
-    def _get_lcm(self, a, b):
-        return int(a * b / math.gcd(int(a), int(b)))
-
-    def _generate_tx_waveforms(self):
-        """
-        Generate sine waves for each Tx channel, using as minimum a buffer size
-        as possible. The buffer is made larger in length to be able to read
-        circularly without causing overflow issues.
-        """
-
-        if len(self.if_freq) == 1:
-            self.tx_waveform_size = self._get_buf_size(self.if_freq[0])
+        if self._use_cyclic:
+            self._build_cyclic_buffer()
         else:
-            # Return the least common multiple
-            self.tx_waveform_size = self._get_lcm(
-                self._get_buf_size(self.if_freq[0]), self._get_buf_size(self.if_freq[1])
+            self.tx_waveform = np.zeros(
+                (len(tx_channels), self.tx_buffer_size), dtype=np.complex64
             )
 
-        len_buf = 20 * self.tx_waveform_size
+    def _build_cyclic_buffer(self):
+        period = self.scheme.cycle_length()
+        len_buf = max(period * 20, self.tx_buffer_size)
+        self.tx_waveform = self.scheme.generate(len_buf, 0)
 
-        self.tx_waveform = np.zeros((len(self.tx_channels), len_buf), dtype=np.complex64)
+    def _generate_chunk(self, n: int) -> np.ndarray:
+        if self._use_cyclic and self.tx_waveform is not None:
+            start = self._sample_idx % self.tx_waveform.shape[1]
+            end = start + n
+            if end <= self.tx_waveform.shape[1]:
+                chunk = self.tx_waveform[:, start:end]
+            else:
+                part1 = self.tx_waveform[:, start:]
+                part2 = self.tx_waveform[:, : end - self.tx_waveform.shape[1]]
+                chunk = np.hstack([part1, part2])
+            self._sample_idx += n
+            return chunk
+        chunk = self.scheme.generate(n, self._sample_idx)
+        self._sample_idx += n
+        return chunk
 
-        # Generate IQ Modulated IF signals
-        for idx, _ in enumerate(self.tx_channels):
-            self.tx_waveform[idx] = uhd.dsp.signals.get_continuous_tone(
-                self.samp_rate,
-                self.if_freq[idx],
-                self.tx_amplitude[idx],
-                desired_size=len_buf,
-                max_size=(2 * self.samp_rate),
-                waveform="sine",
-            )
+    def _apply_command(self, param: str, val):
+        if param == "tx_gain":
+            if val != self.tx_gain:
+                for idx, chan in enumerate(self.tx_channels):
+                    self.usrp.set_tx_gain(val[idx], chan)
+            self.tx_gain = val
+        elif param in TX_PARAMS or param.startswith("calibration."):
+            self.scheme.update_param(param, val)
+            if param in ("if_freq", "calibration", "calibration.enabled", "signal_scheme"):
+                self._use_cyclic = self.scheme.cycle_length() is not None
+                if self._use_cyclic:
+                    self._build_cyclic_buffer()
+        elif param == "tx_amplitude":
+            amps = val if isinstance(val, list) else [val]
+            local_amps = amps[
+                self.global_tx_offset : self.global_tx_offset + len(self.tx_channels)
+            ]
+            self.scheme.update_param("tx_amplitude", local_amps)
+        elif param == "if_freq":
+            freqs = val if isinstance(val, list) else [val]
+            local_freqs = freqs[
+                self.global_tx_offset : self.global_tx_offset + len(self.tx_channels)
+            ]
+            self.scheme.update_param("if_freq", local_freqs)
+        elif param == "tx_phase":
+            phases = val if isinstance(val, list) else [val]
+            local_phases = phases[self.global_tx_offset : self.global_tx_offset + len(self.tx_channels)]
+            self.scheme.update_param("tx_phase", local_phases)
+        elif param == "set_calibration_enabled":
+            self.scheme.set_calibration_enabled(bool(val))
+            self._use_cyclic = self.scheme.cycle_length() is not None
+            if self._use_cyclic:
+                self._build_cyclic_buffer()
+
+    def set_global_tx_param(self, global_tx_idx: int, param: str, value):
+        local_idx = global_tx_idx - self.global_tx_offset
+        if local_idx < 0 or local_idx >= len(self.tx_channels):
+            return
+        if param == "phase":
+            phases = [0.0] * self.scheme.get_num_tx_channels()
+            for i in range(len(phases)):
+                phases[i] = getattr(self.scheme, "tx_phase_deg", [0.0] * len(phases))[i]
+            phases[local_idx] = value
+            self.scheme.update_param("tx_phase", phases)
+        elif param == "amplitude":
+            amps = [self.scheme.get_tx_amplitude(i) for i in range(self.scheme.get_num_tx_channels())]
+            amps[local_idx] = value
+            self.scheme.update_param("tx_amplitude", amps)
 
     def work(self):
         log_print(self.logger, "debug", "Transmission Started")
-        tx_metadata = uhd.types.TXMetadata()
-        tx_metadata.start_of_burst = True
-        tx_metadata.end_of_burst = False
-        tx_metadata.has_time_spec = True
-        tx_metadata.time_spec = uhd.types.TimeSpec(
+        self.tx_metadata = uhd.types.TXMetadata()
+        self.tx_metadata.start_of_burst = True
+        self.tx_metadata.end_of_burst = False
+        self.tx_metadata.has_time_spec = True
+        self.tx_metadata.time_spec = uhd.types.TimeSpec(
             self.usrp.get_time_now().get_real_secs() + INIT_DELAY
         )
 
         while self.is_running:
-            # Check for updated parameters
             try:
                 current_command = self.cmd_queue.get_nowait()
-
-                # Command here will just tell adjustable params and will make changes
-                param = current_command["param"]
-                val = current_command["value"]
-
-                if param == "tx_gain":
-                    if val != self.tx_gain:
-                        for chan in self.tx_channels:
-                            self.usrp.set_tx_gain(val[chan], chan)
-
-                    log_print(
-                        self.logger, "debug",
-                        f"Tx gain updated to {val}. Current {self.tx_gain}",
-                    )
-                    self.tx_gain = val
-                elif param == "tx_amplitude":
-                    curr_tx_amplitude = self.tx_amplitude
-                    if val != curr_tx_amplitude:
-                        for idx in range(len(self.tx_channels)):
-                            self.tx_waveform[idx] = (
-                                self.tx_waveform[idx] * val / curr_tx_amplitude[idx]
-                            )
-
-                    log_print(
-                        self.logger, "debug",
-                        f"Tx amplitude updated to {val}. Current {self.tx_amplitude}",
-                    )
-                    self.tx_amplitude = val
-                # NOTE: Any other modifiable parameters may be added here
+                self._apply_command(
+                    current_command["param"], current_command["value"]
+                )
             except queue.Empty:
                 pass
 
             try:
-                # Send samples
-                buffer_iter = self.tx_waveform
-                num_samps = self.tx_streamer.send(buffer_iter, tx_metadata)
+                if self._use_cyclic:
+                    buffer_iter = self._generate_chunk(self.tx_buffer_size)
+                else:
+                    if self.tx_waveform is None or self.tx_waveform.shape[1] != self.tx_buffer_size:
+                        self.tx_waveform = self._generate_chunk(self.tx_buffer_size)
+                    else:
+                        self.tx_waveform = self._generate_chunk(self.tx_buffer_size)
+                    buffer_iter = self.tx_waveform
+
+                num_samps = self.tx_streamer.send(buffer_iter, self.tx_metadata)
             except RuntimeError as ex:
                 log_print(self.logger, "error", f"Runtime error in transmit: {ex}")
                 continue
 
-            # Continue transmission
-            tx_metadata.start_of_burst = False
-            tx_metadata.has_time_spec = False
+            self.tx_metadata.start_of_burst = False
+            self.tx_metadata.has_time_spec = False
 
             if num_samps < self.tx_buffer_size:
                 log_print(
                     self.logger, "warning", f"Tx Sent only {num_samps} samples"
                 )
 
-        # End transmission
-        tx_metadata.end_of_burst = True
-        self.tx_streamer.send(np.zeros_like(self.tx_waveform), tx_metadata)
+        self.tx_metadata.end_of_burst = True
+        n_ch = len(self.tx_channels)
+        self.tx_streamer.send(
+            np.zeros((n_ch, self.tx_buffer_size), dtype=np.complex64),
+            self.tx_metadata,
+        )
         log_print(self.logger, "debug", "Transmission Stopped")
 
     def cleanup(self):
-        """Cleanup when thread terminates or pauses - end the burst properly"""
         if self.tx_metadata is not None:
             try:
-                # End transmission burst
                 self.tx_metadata.end_of_burst = True
-                self.tx_streamer.send(np.zeros_like(self.tx_waveform), self.tx_metadata)
+                n_ch = len(self.tx_channels)
+                self.tx_streamer.send(
+                    np.zeros((n_ch, self.tx_buffer_size), dtype=np.complex64),
+                    self.tx_metadata,
+                )
                 log_print(self.logger, "debug", "Transmission burst ended cleanly")
             except Exception as ex:
                 log_print(self.logger, "error", f"Error ending transmission burst: {ex}")

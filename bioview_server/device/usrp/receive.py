@@ -20,6 +20,7 @@ class ReceiveWorker(PausableWorker):
         rx_streamer,
         rx_queue: queue.Queue,
         cmd_queue: queue.Queue,
+        global_rx_offset: int = 0,
         running: bool = False,
         logger = None
     ):
@@ -31,6 +32,7 @@ class ReceiveWorker(PausableWorker):
         # Modifiable params
         self.rx_gain = rx_gain
         self.rx_channels = rx_channels
+        self.global_rx_offset = global_rx_offset
 
         # Device params
         self.usrp = usrp
@@ -91,15 +93,19 @@ class ReceiveWorker(PausableWorker):
                 val = current_command["value"]
 
                 if param == "rx_gain":
-                    if val != self.rx_gain:
-                        for chan in self.rx_channels:
-                            self.usrp.set_rx_gain(val[chan], chan)
+                    gains = val if isinstance(val, list) else [val]
+                    local_gains = gains[
+                        self.global_rx_offset : self.global_rx_offset + len(self.rx_channels)
+                    ]
+                    if local_gains != self.rx_gain:
+                        for idx, chan in enumerate(self.rx_channels):
+                            self.usrp.set_rx_gain(local_gains[idx], chan)
 
                     log_print(
                         self.logger, "debug",
-                        f"Rx gain updated to {val}. Current {self.rx_gain}",
+                        f"Rx gain updated to {local_gains}. Current {self.rx_gain}",
                     )
-                    self.rx_gain = val
+                    self.rx_gain = local_gains
                 # NOTE: Any other modifiable parameters may be added here
                 else:
                     pass
@@ -167,7 +173,7 @@ class ReceiveWorker(PausableWorker):
             # Copy samples to avoid buffer overwrite and put in queue
             # recv_buffer.dtype = np.complex64 (since default cpu_format = 'fc32')
             try:
-                self.rx_queue.put(recv_buffer)
+                self.rx_queue.put(recv_buffer.copy())
             except queue.Full:
                 log_print(self.logger, "warning", "Rx Queue full, dropping buffer")
             except queue.Empty:

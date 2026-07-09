@@ -2,7 +2,7 @@
 import sys
 import multiprocessing as mp 
 
-from bioview_common import log_print, DeviceType, Configuration, SUPPORTED_DEVICES
+from bioview_common import log_print, DeviceType, SUPPORTED_DEVICES
 from bioview_common import silence_function as suppress_stdout
 
 
@@ -53,8 +53,9 @@ def get_device_handler(
         device_cfg, 
         response_queue: mp.Queue, 
         data_output_queue: mp.Queue,
-        logger = None
-    ): 
+        logger = None,
+        discovered_devices: dict = None,
+    ):
     device_type = device_cfg.get_param("device_type")
     
     if device_type not in SUPPORTED_DEVICES:
@@ -65,19 +66,27 @@ def get_device_handler(
         return None
     
     match device_type: 
-        case DeviceType.USRP.value: 
+        case DeviceType.USRP.value:
+            group_cfg = device_cfg.to_dict()
+            hardware = group_cfg.get("hardware")
+            if hardware:
+                devices = {name: dict(hw) for name, hw in hardware.items()}
+            else:
+                devices = {device_id: group_cfg}
+
             handler = AVAILABLE_BACKENDS.get(DeviceType.USRP.value).USRPBackend(
-                group_id = device_id, 
-                samp_rate = device_cfg.get_param("samp_rate"),  
-                devices = {device_id: device_cfg.to_dict()},
-                response_queue = response_queue,
-                data_output_queue = data_output_queue,
-                display_ds = device_cfg.get_param("disp_ds", 10),
-                display_imaginary = device_cfg.get_param("display_imaginary", False),
-                save_ds = device_cfg.get_param("save_ds", 1),
-                save_iq = device_cfg.get_param("save_iq", False),
-                save_imaginary = device_cfg.get_param("save_imaginary", True),
-                discovered_devices = None
+                group_id=device_id,
+                samp_rate=device_cfg.get_param("samp_rate"),
+                devices=devices,
+                group_config=group_cfg,
+                response_queue=response_queue,
+                data_output_queue=data_output_queue,
+                display_ds=device_cfg.get_param("disp_ds", 10),
+                display_imaginary=device_cfg.get_param("display_imaginary", False),
+                save_ds=device_cfg.get_param("save_ds", 1),
+                save_iq=device_cfg.get_param("save_iq", False),
+                save_imaginary=device_cfg.get_param("save_imaginary", True),
+                discovered_devices=discovered_devices,
             )
         
         case DeviceType.BIOPAC.value: 
@@ -92,15 +101,10 @@ def get_device_handler(
 
         case DeviceType.DUMMY.value:
             handler = AVAILABLE_BACKENDS.get(DeviceType.DUMMY.value).DummyBackend(
-                group_id = device_id,
-                samp_rate = device_cfg.get_param("samp_rate", 500),
-                num_channels = device_cfg.get_param("num_channels", 4),
-                response_queue = response_queue,
-                data_output_queue = data_output_queue,
-                signal_freq = device_cfg.get_param("signal_freq", 1.0),
-                amplitude = device_cfg.get_param("amplitude", 1.0),
-                noise_std = device_cfg.get_param("noise_std", 0.0),
-                chunk_duration = device_cfg.get_param("chunk_duration", 0.05),
+                group_id=device_id,
+                response_queue=response_queue,
+                data_output_queue=data_output_queue,
+                group_config=device_cfg.to_dict(),
             )
 
         case _:

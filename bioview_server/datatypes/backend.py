@@ -95,7 +95,7 @@ class Backend(mp.Process):
             self.save_worker = SaveWorker(
                 save_path=self.save_path,
                 data_queue=self.save_queue,
-                num_channels=len(self.data_sources),
+                num_channels=len(self.get_data_sources()),
                 logger = self.logger
             )
 
@@ -231,58 +231,57 @@ class Backend(mp.Process):
 
     def _handle_command(self, data):
         try:
-            cmd = data['command']
-            cmd_args = data.get('args', {})
+            cmd = data["command"]
+            cmd_args = data.get("args", {})
 
-            # TODO: Update to put conditionnal checks for responses - !IMPORTANT
             match cmd:
                 case IPCCommand.CONNECT_DEVICES:
                     result = self._initialize()
-                    self.response_queue.put({'type': Response.SUCCESS, 'result': result})
-                    
+                    self.response_queue.put({"type": Response.SUCCESS, "result": result})
                     if not result:
                         raise RuntimeError("Unable to initialize device")
-                
+
                 case IPCCommand.START_STREAMING:
                     cmd_args = cmd_args or {}
-                    save_cfg = cmd_args.get('save_config', {}) or {}
-                    display_cfg = cmd_args.get('display_config', {}) or {}
-
-                    # Saving is performed on the client (fast disk); only set up the
-                    # server-side save worker if explicitly enabled.
-                    if save_cfg.get('enable_save'):
+                    save_cfg = cmd_args.get("save_config", {}) or {}
+                    display_cfg = cmd_args.get("display_config", {}) or {}
+                    if save_cfg.get("enable_save"):
                         self._setup_saving(save_cfg)
-
-                    # Display is the live stream to the client and must always run.
                     self._setup_display(display_cfg)
-
-                    # TODO: Add initial calibration sequence here. For example, this can include
-                    # gain balancing or Guoyi's phase calibration method
                     result = self._start_streaming()
-                    self.response_queue.put({'type': Response.SUCCESS, 'result': result})
+                    self.response_queue.put({"type": Response.SUCCESS, "result": result})
                     self._streaming.set()
-                
+
                 case IPCCommand.STOP_STREAMING:
                     self._streaming.clear()
                     result = self._stop_streaming()
-                    self.response_queue.put({'type': Response.SUCCESS, 'result': result})
-                
+                    self.response_queue.put({"type": Response.SUCCESS, "result": result})
+
                 case IPCCommand.DISCONNECT_DEVICES:
                     result = self._disconnect()
-                    self.response_queue.put({'type': Response.SUCCESS, 'result': result})
-                
+                    self.response_queue.put({"type": Response.SUCCESS, "result": result})
+
                 case IPCCommand.UPDATE_RUNNING_PARAMETER:
                     self._queue_param_update(cmd_args)
-                    self.response_queue.put({'type': Response.SUCCESS, 'result': None})
+                    self.response_queue.put({"type": Response.SUCCESS, "result": None})
+
+                case IPCCommand.RUN_DPIC_BALANCE:
+                    result = self._run_dpic_balance()
+                    self.response_queue.put(
+                        {"type": Response.SUCCESS, "result": result is not None}
+                    )
 
                 case IPCCommand.SHUTDOWN:
-                    # Stop the subprocess run loop cleanly
                     self._streaming.clear()
                     self._running.clear()
-                    
+
         except Exception as e:
-            log_print(self.logger, 'error', f"Command {cmd} failed: {e}")
-            self.response_queue.put({'type': Response.ERROR, 'message': str(e)})
+            log_print(self.logger, "error", f"Command {cmd} failed: {e}")
+            self.response_queue.put({"type": Response.ERROR, "message": str(e)})
+
+    def _run_dpic_balance(self):
+        """Override in USRP backend for DPIC balancing."""
+        return None
     
     # Public API for non-blocking calls
     def initialize(self, **kwargs):
@@ -311,8 +310,14 @@ class Backend(mp.Process):
             'command': IPCCommand.UPDATE_RUNNING_PARAMETER,
             'args': params
         })
-        # Don't wait for response for real-time updates
-        # TODO: Fix
+
+    def run_dpic_balance(self):
+        self.command_queue.put({
+            'command': IPCCommand.RUN_DPIC_BALANCE,
+            'args': {},
+        })
+        response = self.response_queue.get(timeout=600)
+        return response
     
     def disconnect(self):
         self.command_queue.put({'command': IPCCommand.DISCONNECT_DEVICES})

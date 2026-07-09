@@ -21,7 +21,7 @@ import logging
 import ipaddress
 import contextlib 
 
-from threading import Thread
+from threading import Lock, Thread
 
 import multiprocessing as mp 
 
@@ -88,6 +88,10 @@ class Server:
         self.device_group_handlers = {}
         self.config = None
         self.data_sources = set()  # set(source: DataSource)
+        self.discovered_devices_cache = {}
+        self._device_op_lock = Lock()
+        self._device_op_in_progress = False
+        self._device_op_thread = None
 
         # Sockets
         self.data_socket = None
@@ -375,32 +379,11 @@ class Server:
 
                     # Device commands 
                     case Command.DISCOVER_DEVICES.name: 
-                        # Pass device configuration here 
-                        self._discover_devices(payload)
-
-                        # Send response here since we don't want to send this response during init
-                        if self.device_group_states != {}: 
-                            log_print(self.logger, 'debug', 'Successfully found devices')
-                            send_response(
-                                self.client_control_conn, 
-                                Response.SUCCESS, 
-                                params={
-                                    "device_status": self.device_group_states,
-                                    "data_sources": [src.to_dict() for src in self.data_sources]
-                                },
-                                logger = self.logger
-                            )
-                        else:
-                            log_print(self.logger, 'debug', 'Failed to find devices')
-                            send_response(
-                                self.client_control_conn, 
-                                Response.ERROR, 
-                                params={"message": "Specified devices not found: \
-                                    Are you sure they are plugged in and drivers are installed?"},
-                                logger = self.logger
-                            )
+                        self._start_discover_devices_async(payload)
                     case Command.INITIALIZE_DEVICES.name: 
-                        self._initialize_devices(payload)
+                        self._start_initialize_devices_async(payload)
+                    case Command.GET_DEVICE_STATUS.name:
+                        self._handle_get_device_status()
                     case Command.DISCONNECT_DEVICES.name: 
                         self._disconnect_devices()
                         
@@ -412,6 +395,8 @@ class Server:
                         self._stop_streaming()
                     case Command.UPDATE_RUNNING_PARAMETER.name:
                         self._update_running_parameter(payload)
+                    case Command.RUN_DPIC_BALANCE.name:
+                        self._run_dpic_balance(payload)
 
             except ValidationError as e:
                 log_print(self.logger, "debug", f"Invalid command {cmd_type} sent: {e}")
@@ -429,108 +414,214 @@ class Server:
             log_print(self.logger, 'error', f"{address} is not a valid IP address")
             return False
 
-    # Device command handling callbacks 
+    # Device command handling callbacks
+
+    def _config_from_payload(self, payload):
+        from bioview_common import Configuration
+
+        return Configuration.from_dict(payload.get("device_groups", payload))
+
+    def _connecting_states_for_config(self, config):
+        return {
+            device_id: DeviceStatus.CONNECTING.value
+            for device_id in config.devices
+        }
+
+    def _handle_get_device_status(self):
+        send_response(
+            sock=self.client_control_conn,
+            response=Response.SUCCESS,
+            params={
+                "pending": self._device_op_in_progress,
+                "device_status": self.device_group_states,
+                "data_sources": [
+                    src.to_dict() for src in self.data_sources
+                ],
+            },
+            logger=self.logger,
+        )
+
+    def _reject_if_device_op_running(self):
+        with self._device_op_lock:
+            if self._device_op_in_progress:
+                send_response(
+                    self.client_control_conn,
+                    Response.ERROR,
+                    params={"message": "Device operation already in progress"},
+                    logger=self.logger,
+                )
+                return True
+        return False
+
+    def _ack_device_operation_start(self, payload):
+        config = self._config_from_payload(payload)
+        self.config = config
+        self.device_group_states = self._connecting_states_for_config(config)
+        send_response(
+            sock=self.client_control_conn,
+            response=Response.DEVICE_CONNECTING,
+            params={
+                "pending": True,
+                "device_status": dict(self.device_group_states),
+            },
+            logger=self.logger,
+        )
+
+    def _start_discover_devices_async(self, payload):
+        if self._reject_if_device_op_running():
+            return
+
+        self._ack_device_operation_start(payload)
+
+        with self._device_op_lock:
+            self._device_op_in_progress = True
+
+        def _worker():
+            try:
+                self._discover_devices(payload)
+            except Exception as e:
+                log_print(
+                    self.logger,
+                    "error",
+                    f"Background device discovery failed: {e}",
+                )
+            finally:
+                with self._device_op_lock:
+                    self._device_op_in_progress = False
+
+        self._device_op_thread = Thread(target=_worker, daemon=True)
+        self._device_op_thread.start()
+
+    def _start_initialize_devices_async(self, payload):
+        if self._reject_if_device_op_running():
+            return
+
+        self._ack_device_operation_start(payload)
+
+        with self._device_op_lock:
+            self._device_op_in_progress = True
+
+        def _worker():
+            try:
+                self._initialize_devices_work(payload)
+            except Exception as e:
+                log_print(
+                    self.logger,
+                    "error",
+                    f"Background device initialization failed: {e}",
+                )
+            finally:
+                with self._device_op_lock:
+                    self._device_op_in_progress = False
+
+        self._device_op_thread = Thread(target=_worker, daemon=True)
+        self._device_op_thread.start()
 
     def _discover_devices(self, payload): 
         log_print(self.logger, "info", "Discovering connected devices")
         
-        # Refresh list of discovered devices
-        self.discovered_devices = []
+        discovered_names = set()
         for backend_type, backend in AVAILABLE_BACKENDS.items(): 
             try:
-                self.discovered_devices.extend(backend.discover_devices())
+                found = backend.discover_devices()
+                if isinstance(found, dict):
+                    discovered_names.update(found.keys())
+                    self.discovered_devices_cache.update(found)
+                elif isinstance(found, list):
+                    for entry in found:
+                        if isinstance(entry, dict):
+                            name = entry.get("name", "")
+                            discovered_names.add(name)
+                            if name:
+                                self.discovered_devices_cache[name] = entry
+                        else:
+                            discovered_names.add(str(entry))
             except Exception as e: 
                 msg = f"Device discovery failed for devices of type {backend_type} with error: {e}"
                 log_print(self.logger, "warning", msg)
         
-        log_print(self.logger, "debug", f"Found {self.discovered_devices}")
+        discovered_names.discard("")
+        log_print(self.logger, "debug", f"Found {sorted(discovered_names)}")
         
         if not self.config:
-            from bioview_common import Configuration
-            self.config = Configuration.from_dict(payload.get("device_groups", payload))
+            self.config = self._config_from_payload(payload)
 
-        # Check if all devices in the config are present 
-        self.device_group_states = {} # Refresh
+        from bioview_common.datatypes.devices import DeviceType
 
-        for device_id in self.config.devices.keys():
-            if device_id in self.discovered_devices:
+        self.device_group_states = {}
+
+        for device_id, device_cfg in self.config.devices.items():
+            device_type = device_cfg.get_param("device_type")
+            if device_type == DeviceType.DUMMY.value:
                 self.device_group_states[device_id] = DeviceStatus.AVAILABLE.value
-            else: 
+                continue
+
+            if device_id in discovered_names:
+                self.device_group_states[device_id] = DeviceStatus.AVAILABLE.value
+                continue
+
+            hardware = device_cfg.get_param("hardware") or {}
+            hw_names = set(hardware.keys()) if isinstance(hardware, dict) else set()
+            if hw_names and hw_names.issubset(discovered_names):
+                self.device_group_states[device_id] = DeviceStatus.AVAILABLE.value
+            elif hw_names & discovered_names:
+                self.device_group_states[device_id] = DeviceStatus.AVAILABLE.value
+            else:
                 self.device_group_states[device_id] = DeviceStatus.UNAVAILABLE.value
 
         log_print(self.logger, "info", "Device discovery completed successfully")
 
-    
-
-    def _initialize_devices(self, payload):
-        # Store configuration
-        from bioview_common import Configuration
-        self.config = Configuration.from_dict(payload.get("device_groups", payload))
-        
-        # For flexibility, we provide device configurations to both initialize and discover.
+    def _initialize_devices_work(self, payload):
+        self.config = self._config_from_payload(payload)
         self._discover_devices(payload)
 
-        
-        if self.device_group_states == {}: 
-            send_response(self.client_control_conn, Response.ERROR, 
-                params={"message": "Invalid configuration provided"},
-                logger = self.logger) 
-            return 
+        if self.device_group_states == {}:
+            log_print(self.logger, "error", "Invalid configuration provided")
+            return
 
         log_print(self.logger, "info", "Initializing devices")
 
-        response = Response.SUCCESS
-
-        # Now that we have a valid device configuration, try initializing 
         self.device_group_handlers = {}
         uninit_groups = []
 
         for device_id, device_cfg in self.config.devices.items():
-            self.device_group_handlers[device_id] = None 
-            
+            self.device_group_handlers[device_id] = None
+            self.device_group_states[device_id] = DeviceStatus.CONNECTING.value
+
             try:
-                # Get handler
-                handler = get_device_handler(device_id, device_cfg, self.response_queue, self.data_queue, self.logger)
+                handler = get_device_handler(
+                    device_id,
+                    device_cfg,
+                    self.response_queue,
+                    self.data_queue,
+                    self.logger,
+                    discovered_devices=self.discovered_devices_cache,
+                )
                 if not handler:
                     raise DeviceError(f"Unable to create handler for {device_id}")
-                
-                handler.start() # Start subprocess
-                
-                # Initialize
-                resp = handler.initialize()
 
-                # Check for response 
-                if resp.get("type") != Response.SUCCESS:
+                handler.start()
+
+                resp = handler.initialize()
+                resp_type = resp.get("type")
+                if resp_type != Response.SUCCESS and resp_type != Response.SUCCESS.name:
                     raise DeviceError(resp.get("message", "Unknown"))
 
-                # Store 
                 self.device_group_states[device_id] = DeviceStatus.CONNECTED.value
-                
-                # Provide data sources to the frontend for display
                 self.data_sources.update(handler.get_data_sources())
-
-                # Store handler 
                 self.device_group_handlers[device_id] = handler
             except Exception as e:
                 msg = f"Unable to initialize device: {device_id}. Error: {e}"
-                response = Response.WARNING
                 log_print(self.logger, "error", msg)
+                self.device_group_states[device_id] = DeviceStatus.UNAVAILABLE.value
                 uninit_groups.append(device_id)
 
-
-        # Send response (both discovered states as well as initialized devices)
-        send_response(
-            sock = self.client_control_conn, 
-            response = response, 
-            params = {
-                "device_status": self.device_group_states,
-                "data_sources": [src.to_dict() for src in self.data_sources]
-            },
-            logger = self.logger
-        )
-
         if len(uninit_groups) > 0:
-            log_print(self.logger, "warning", f"Device initialization failed for groups: {uninit_groups}")
+            log_print(
+                self.logger,
+                "warning",
+                f"Device initialization failed for groups: {uninit_groups}",
+            )
         else:
             log_print(self.logger, "info", "All devices successfully initialized")
         
@@ -571,6 +662,8 @@ class Server:
             },
         }
 
+        self._sync_device_params_from_payload(payload)
+
         # Ask all backends to start
         try:
             log_print(self.logger, 'info', "Attempting to start data streaming")
@@ -608,6 +701,58 @@ class Server:
             log_print(self.logger, 'error', msg)
             send_response(self.client_control_conn, Response.ERROR, params={"message": msg})
 
+    def _sync_device_params_from_payload(self, payload):
+        """Apply latest client device configuration to live backends before streaming."""
+        if not payload:
+            return
+
+        from bioview_common.datatypes.configuration.hardware_params import (
+            GLOBAL_RX_PARAMS,
+            GLOBAL_TX_PARAMS,
+        )
+
+        skip = {
+            "type",
+            "device_type",
+            "cfg_type",
+            "device_name",
+            "absolute_channel_nums",
+        }
+        sync_keys = (
+            GLOBAL_TX_PARAMS
+            | GLOBAL_RX_PARAMS
+            | {
+                "calibration",
+                "samp_rate",
+                "signal_scheme",
+                "signal_freq",
+                "amplitude",
+                "noise_std",
+                "chunk_duration",
+                "hardware",
+                "channel_map",
+            }
+        )
+
+        for device_id, handler in self.device_group_handlers.items():
+            device_payload = payload.get(device_id)
+            if not isinstance(device_payload, dict):
+                continue
+
+            if self.config:
+                for param, value in device_payload.items():
+                    if param in skip:
+                        continue
+                    self.config.update_device_param(device_id, param, value)
+
+            sync_params = {
+                k: v
+                for k, v in device_payload.items()
+                if k in sync_keys or str(k).startswith("calibration.")
+            }
+            if sync_params:
+                handler.queue_param_update(**sync_params)
+
     def _update_running_parameter(self, payload):
         device_id = payload.get("id")
         config = payload.get("config")
@@ -635,6 +780,45 @@ class Server:
             send_response(self.client_control_conn, Response.SUCCESS, params={"message": "Parameter updated"}, logger=self.logger)
         except Exception as e:
             send_response(self.client_control_conn, Response.ERROR, params={"message": str(e)}, logger=self.logger)
+
+    def _run_dpic_balance(self, payload):
+        device_id = payload.get("id") if payload else None
+        if not device_id and self.device_group_handlers:
+            device_id = next(iter(self.device_group_handlers))
+
+        handler = self.device_group_handlers.get(device_id)
+        if handler is None:
+            send_response(
+                self.client_control_conn,
+                Response.ERROR,
+                params={"message": "Device handler not found"},
+                logger=self.logger,
+            )
+            return
+
+        try:
+            response = handler.run_dpic_balance()
+            if response.get("type") in (Response.SUCCESS, Response.SUCCESS.name, Response.SUCCESS.value):
+                send_response(
+                    self.client_control_conn,
+                    Response.SUCCESS,
+                    params={"message": "DPIC balance complete"},
+                    logger=self.logger,
+                )
+            else:
+                send_response(
+                    self.client_control_conn,
+                    Response.ERROR,
+                    params={"message": response.get("message", "DPIC failed")},
+                    logger=self.logger,
+                )
+        except Exception as e:
+            send_response(
+                self.client_control_conn,
+                Response.ERROR,
+                params={"message": str(e)},
+                logger=self.logger,
+            )
 
     def stop(self):
         log_print(self.logger, 'debug', "Attempting to shutdown server")

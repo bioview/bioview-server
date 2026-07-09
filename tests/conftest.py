@@ -17,6 +17,9 @@ import pytest
 
 from bioview_common import (
     Command,
+    DEVICE_OP_POLL_INTERVAL,
+    DISCOVER_TIMEOUT,
+    INIT_TIMEOUT_DEFAULT,
     Response,
     get_challenge_response,
     parse_and_validate_response,
@@ -68,6 +71,31 @@ class RawTestClient:
     def command(self, command: Command, params=None):
         raw = send_command(self.control_sock, command, params)
         return parse_and_validate_response(raw)
+
+    def wait_for_device_op(
+        self,
+        initial_resp_type,
+        initial_payload,
+        timeout: float = None,
+    ):
+        """Wait for an async discover/init operation to finish via polling."""
+        if initial_resp_type != Response.DEVICE_CONNECTING.name:
+            return initial_resp_type, initial_payload
+
+        deadline = time.monotonic() + (timeout or INIT_TIMEOUT_DEFAULT)
+        while time.monotonic() < deadline:
+            resp_type, payload = self.command(Command.GET_DEVICE_STATUS)
+            assert resp_type == Response.SUCCESS.name, payload
+            if not payload.get("pending", False) and payload.get("device_status"):
+                return Response.SUCCESS.name, payload
+            time.sleep(DEVICE_OP_POLL_INTERVAL)
+
+        pytest.fail("device operation did not complete in time")
+
+    def device_command(self, command: Command, params=None, timeout: float = None):
+        """Send discover/init and block until the async operation completes."""
+        resp_type, payload = self.command(command, params)
+        return self.wait_for_device_op(resp_type, payload, timeout=timeout)
 
     def recv_data_chunk(self, timeout: float = 5.0):
         """Receive one streamed numpy chunk from the data socket and return

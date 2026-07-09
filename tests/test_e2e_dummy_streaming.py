@@ -36,16 +36,17 @@ def test_connection_and_auth(client):
 
 
 def test_discover_dummy_device(client):
-    resp_type, payload = client.command(
+    resp_type, payload = client.device_command(
         Command.DISCOVER_DEVICES, {"device_groups": DUMMY_DEVICE_GROUPS}
     )
     assert resp_type == Response.SUCCESS.name, payload
     assert "device_status" in payload
     assert "DummyDevice" in payload["device_status"]
+    assert payload["device_status"]["DummyDevice"] == "Available"
 
 
 def test_initialize_dummy_device(client):
-    resp_type, payload = client.command(
+    resp_type, payload = client.device_command(
         Command.INITIALIZE_DEVICES, {"device_groups": DUMMY_DEVICE_GROUPS}
     )
     # Dummy initialization always succeeds.
@@ -57,7 +58,7 @@ def test_initialize_dummy_device(client):
 
 
 def test_stream_dummy_device_end_to_end(client):
-    resp_type, _ = client.command(
+    resp_type, _ = client.device_command(
         Command.INITIALIZE_DEVICES, {"device_groups": DUMMY_DEVICE_GROUPS}
     )
     assert resp_type == Response.SUCCESS.name
