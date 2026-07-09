@@ -710,7 +710,9 @@ class Server:
             },
         }
 
-        self._sync_device_params_from_payload(payload)
+        # Do not overwrite backend runtime state on every Start.
+        # UI parameter edits are already propagated live via UPDATE_RUNNING_PARAMETER,
+        # so resuming streaming should continue from the last runtime values.
 
         # Ask all backends to start
         try:
