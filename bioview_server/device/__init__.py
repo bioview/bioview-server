@@ -3,7 +3,7 @@ import sys
 import multiprocessing as mp 
 
 from bioview_common import log_print, DeviceType, SUPPORTED_DEVICES
-from bioview_common import silence_function as suppress_stdout
+from bioview_common.utils.logs import suppress_stdout
 
 
 __all__ = []

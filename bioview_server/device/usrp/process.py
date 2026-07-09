@@ -233,7 +233,13 @@ class ProcessWorker(PausableWorker):
                     local_tx, self.global_sample_idx, buffer.shape[1]
                 )
                 cal_data = self._decimate_cal_ref(raw_env)
-                save_list[source.channel, : len(cal_data)] = cal_data
+                if self.save_imaginary:
+                    # Calibration reference is a real-valued envelope.
+                    # Store it in channel 0 and keep the imaginary component at 0.
+                    save_list[source.channel, : len(cal_data), 0] = cal_data
+                    save_list[source.channel, : len(cal_data), 1] = 0.0
+                else:
+                    save_list[source.channel, : len(cal_data)] = cal_data
 
         self.global_sample_idx += buffer.shape[1]
         return save_list, display_list
