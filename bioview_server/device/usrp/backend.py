@@ -62,6 +62,11 @@ def initialize_usrp_device(
     wire_format,
     logger=None,
 ):
+    if not hasattr(uhd, "usrp"):
+        raise RuntimeError(
+            "UHD Python bindings are incomplete (uhd.usrp missing). "
+            "Reinstall UHD from Ettus for your Python version."
+        )
     usrp = uhd.usrp.MultiUSRP(f"serial={serial},num_recv_frames=1024")
 
     usrp.set_rx_subdev_spec(uhd.usrp.SubdevSpec(rx_subdev))
@@ -84,15 +89,32 @@ def initialize_usrp_device(
         )
         return None
 
+    def _tune_request(freq_hz):
+        """UHD 4.10+ Python API expects a tune_request object."""
+        try:
+            if hasattr(uhd, "types") and hasattr(uhd.types, "TuneRequest"):
+                return uhd.types.TuneRequest(float(freq_hz))
+        except Exception:
+            pass
+        try:
+            lib_types = getattr(getattr(uhd, "libpyuhd", None), "types", None)
+            if lib_types and hasattr(lib_types, "tune_request"):
+                return lib_types.tune_request(float(freq_hz))
+        except Exception:
+            pass
+        return float(freq_hz)
+
+    tune = _tune_request(carrier_freq)
+
     for idx, chan in enumerate(rx_channels):
         usrp.set_rx_rate(samp_rate, chan)
-        usrp.set_rx_freq(carrier_freq, chan)
+        usrp.set_rx_freq(tune, chan)
         usrp.set_rx_gain(rx_gain[idx], chan)
         usrp.set_rx_antenna("RX2", chan)
 
     for idx, chan in enumerate(tx_channels):
         usrp.set_tx_rate(samp_rate, chan)
-        usrp.set_tx_freq(carrier_freq, chan)
+        usrp.set_tx_freq(tune, chan)
         usrp.set_tx_gain(tx_gain[idx], chan)
         usrp.set_tx_antenna("TX1", chan)
 

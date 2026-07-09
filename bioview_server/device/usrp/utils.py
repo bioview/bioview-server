@@ -14,6 +14,14 @@ from bioview_common import DISCOVERY_CACHE_TTL, DataSource, log_print
 from bioview_common import get_cache_file
 
 
+if not hasattr(uhd, "usrp"):
+    raise ImportError(
+        "Invalid UHD Python bindings: module 'uhd' has no attribute 'usrp'. "
+        "Install the USRP Hardware Driver (UHD) Python API from Ettus Research "
+        "for your Python version, and ensure no local file named uhd.py is on PYTHONPATH."
+    )
+
+
 CLOCK_TIMEOUT = 1000  # 1000ms timeout for external clock locking
 
 _discovery_cache: Dict[str, dict] = {}
