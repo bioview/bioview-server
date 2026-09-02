@@ -3,8 +3,8 @@ from typing import List
 
 import numpy as np
 import uhd
+from bioview_common import QUEUE_PUT_TIMEOUT_S, PausableWorker, log_print, put_or_drop
 
-from bioview_common import log_print, PausableWorker
 
 INIT_DELAY = 0.05  # 50mS initial delay before transmit
 # This is a good balance between real time display and spikes
@@ -22,7 +22,7 @@ class ReceiveWorker(PausableWorker):
         cmd_queue: queue.Queue,
         global_rx_offset: int = 0,
         running: bool = False,
-        logger = None
+        logger=None,
     ):
         super().__init__()
 
@@ -41,6 +41,11 @@ class ReceiveWorker(PausableWorker):
         self.cmd_queue = cmd_queue  # Commands (such as gain change)
 
         self.running = running
+
+        # Counters surfaced for diagnostics; drops are logged at a low rate so
+        # logging never becomes the bottleneck it is reporting on.
+        self.buffers_dropped = 0
+        self._last_drop_logged = 0
 
     def work(self):
         log_print(self.logger, "debug", "Receiving Started")
@@ -76,7 +81,7 @@ class ReceiveWorker(PausableWorker):
         timeout = 0.5  # Larger timeout initially
         had_an_overflow = False
         last_overflow = uhd.types.TimeSpec(0)
-        
+
         # Setup the statistic counters
         num_rx_samps = 0
         num_rx_dropped = 0
@@ -95,14 +100,16 @@ class ReceiveWorker(PausableWorker):
                 if param == "rx_gain":
                     gains = val if isinstance(val, list) else [val]
                     local_gains = gains[
-                        self.global_rx_offset : self.global_rx_offset + len(self.rx_channels)
+                        self.global_rx_offset : self.global_rx_offset
+                        + len(self.rx_channels)
                     ]
                     if local_gains != self.rx_gain:
                         for idx, chan in enumerate(self.rx_channels):
                             self.usrp.set_rx_gain(local_gains[idx], chan)
 
                     log_print(
-                        self.logger, "debug",
+                        self.logger,
+                        "debug",
                         f"Rx gain updated to {local_gains}. Current {self.rx_gain}",
                     )
                     self.rx_gain = local_gains
@@ -112,7 +119,6 @@ class ReceiveWorker(PausableWorker):
 
             except queue.Empty:
                 pass
-
 
             try:
                 # Receive samples
@@ -142,12 +148,14 @@ class ReceiveWorker(PausableWorker):
                     rx_metadata.time_spec.get_frac_secs(),
                 )
                 log_print(
-                    self.logger, "warning",
+                    self.logger,
+                    "warning",
                     f"Receiver Overflow: {rx_metadata.strerror()}",
                 )
             elif rx_metadata.error_code == uhd.types.RXMetadataErrorCode.late:
                 log_print(
-                    self.logger, "warning",
+                    self.logger,
+                    "warning",
                     f"Receiver Late: {rx_metadata.strerror()}, restarting...",
                 )
                 # Radio core will be in the idle state.
@@ -159,27 +167,35 @@ class ReceiveWorker(PausableWorker):
                 self.rx_streamer.issue_stream_cmd(stream_cmd)
             elif rx_metadata.error_code == uhd.types.RXMetadataErrorCode.timeout:
                 log_print(
-                    self.logger, "warning",
+                    self.logger,
+                    "warning",
                     f"Receiver Timeout: {rx_metadata.strerror()}",
                 )
             else:
                 log_print(
-                    self.logger, "warning",
+                    self.logger,
+                    "warning",
                     f"Receiver Error: {rx_metadata.strerror()}",
                 )
 
             total_samps_received += num_rx_samps
 
-            # Copy samples to avoid buffer overwrite and put in queue
-            # recv_buffer.dtype = np.complex64 (since default cpu_format = 'fc32')
-            try:
-                self.rx_queue.put(recv_buffer.copy())
-            except queue.Full:
-                log_print(self.logger, "warning", "Rx Queue full, dropping buffer")
-            except queue.Empty:
-                log_print(self.logger, "debug", "Rx Queue Empty")
-                continue
-        
+            # Copy so the next recv() cannot overwrite queued samples.
+            # Blocking here would stall recv() and turn a processing backlog
+            # into a UHD overflow, so wait briefly and then drop.
+            if not put_or_drop(
+                self.rx_queue, recv_buffer.copy(), timeout=QUEUE_PUT_TIMEOUT_S
+            ):
+                self.buffers_dropped += 1
+                if self.buffers_dropped - self._last_drop_logged >= 20:
+                    self._last_drop_logged = self.buffers_dropped
+                    log_print(
+                        self.logger,
+                        "warning",
+                        f"Rx queue full; {self.buffers_dropped} buffers dropped "
+                        "(demodulation is not keeping up)",
+                    )
+
         # Gracefully close once receiving is finished
         stream_cmd = uhd.types.StreamCMD(uhd.types.StreamMode.stop_cont)
         self.rx_streamer.issue_stream_cmd(stream_cmd)

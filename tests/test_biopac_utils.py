@@ -2,6 +2,7 @@ import types
 
 import pytest
 
+
 # The BIOPAC backend is Windows-only and imports the `wmi` package at module
 # load; skip the whole module cleanly on platforms where it is unavailable.
 utils = pytest.importorskip(
@@ -37,7 +38,10 @@ def test_discover_devices_filters_by_vid_and_name(monkeypatch):
     assert isinstance(found, dict)
     ids = [d["device_id"] for d in found.values()]
     assert any("VID_097E" in i for i in ids)
-    assert any("BIOPAC" in d["manufacturer"].upper() or "BIOPAC" in d["name"].upper() for d in found)
+    assert any(
+        "BIOPAC" in d["manufacturer"].upper() or "BIOPAC" in d["name"].upper()
+        for d in found.values()
+    )
 
 
 def test_discover_devices_initializes_pythoncom_when_available(monkeypatch):
@@ -60,12 +64,11 @@ def test_discover_devices_initializes_pythoncom_when_available(monkeypatch):
         def CoUninitialize():
             DummyPyCom.initialized = False
 
-    monkeypatch.setattr(utils, "importlib", __import__("importlib"))
-    # Ensure importlib.import_module returns our dummy pythoncom
-    monkeypatch.setattr(utils.importlib, "import_module", lambda name: DummyPyCom if name == "pythoncom" else __import__(name))
+    monkeypatch.setattr(utils, "_com_module", lambda: DummyPyCom)
 
     found = utils.discover_devices()
     assert isinstance(found, dict)
+    assert not DummyPyCom.initialized, "COM should be uninitialized again afterwards"
 
 
 def test_discover_devices_handles_missing_pythoncom(monkeypatch):
@@ -76,9 +79,8 @@ def test_discover_devices_handles_missing_pythoncom(monkeypatch):
             return [d1]
 
     monkeypatch.setattr(utils, "wmi", types.SimpleNamespace(WMI=lambda: DummyWMI()))
-    # Make import_module raise to simulate pythoncom absence
-    monkeypatch.setattr(utils, "importlib", __import__("importlib"))
-    monkeypatch.setattr(utils.importlib, "import_module", lambda name: (_ for _ in ()).throw(ImportError("no pythoncom")))
+    # pywin32 absent: discovery must still run rather than fail outright
+    monkeypatch.setattr(utils, "_com_module", lambda: None)
 
     found = utils.discover_devices()
     assert len(found) == 1

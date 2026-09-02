@@ -1,18 +1,188 @@
 import contextlib
 import ctypes
 import json
-import os 
 import logging
-import importlib
-from pathlib import Path
+import os
+import threading
 from ctypes import byref, c_double, c_int
 from pathlib import Path
 
 import wmi
-
 from bioview_common import get_cache_file
 
-from .constants import BIOPAC_CONNECTION_CODES, BIOPAC_VENDOR_ID
+from .constants import (
+    BIOPAC_CONNECTION_CODES,
+    BIOPAC_VENDOR_ID,
+    describe_biopac_code,
+)
+
+
+#: Identifier for hypervisor-enforced code integrity in Win32_DeviceGuard's
+#: SecurityServices lists.
+_HVCI_SERVICE_ID = 2
+
+#: How long to wait for the DeviceGuard query. This runs while reporting a
+#: failure, and a diagnostic that blocks the operation it is explaining is worse
+#: than no diagnostic: the WMI call has been seen to hang indefinitely inside a
+#: backend subprocess, which stalled device initialization outright.
+_HVCI_QUERY_TIMEOUT = 3.0
+
+#: Cached result. Memory Integrity cannot change without a reboot, so one
+#: successful answer holds for the life of the process.
+_hvci_state = None
+
+
+def _query_memory_integrity():
+    """Ask Windows which security services are configured and running."""
+    import wmi as _wmi
+
+    pythoncom = _com_module()
+    coinit = False
+    if pythoncom is not None:
+        with contextlib.suppress(Exception):
+            pythoncom.CoInitializeEx(0x2)
+            coinit = True
+    try:
+        for entry in _wmi.WMI(
+            namespace=r"root\Microsoft\Windows\DeviceGuard"
+        ).Win32_DeviceGuard():
+            running = set(entry.SecurityServicesRunning or [])
+            configured = set(entry.SecurityServicesConfigured or [])
+            return _HVCI_SERVICE_ID in running, _HVCI_SERVICE_ID in configured
+    finally:
+        if coinit:
+            with contextlib.suppress(Exception):
+                pythoncom.CoUninitialize()
+
+    return False, False
+
+
+def memory_integrity_state():
+    """Whether Windows Memory Integrity is running, and whether it is configured.
+
+    Returns ``(running, configured)``. The two differ across a pending reboot,
+    and that difference is the point of checking: turning Memory Integrity off
+    leaves it *configured off but still running* until the machine restarts, so
+    a user who has just flipped the switch still sees the driver refused. The
+    policy registry key reports only the configured value and would suggest the
+    problem was solved while it very much is not.
+
+    The query is bounded and cached: it is only ever used to explain a failure,
+    so it must not become one.
+    """
+    global _hvci_state
+    if _hvci_state is not None:
+        return _hvci_state
+
+    if os.name != "nt":
+        _hvci_state = (False, False)
+        return _hvci_state
+
+    result = {}
+
+    def _run():
+        with contextlib.suppress(Exception):
+            result["state"] = _query_memory_integrity()
+
+    worker = threading.Thread(target=_run, daemon=True)
+    worker.start()
+    worker.join(timeout=_HVCI_QUERY_TIMEOUT)
+
+    if "state" in result:
+        _hvci_state = result["state"]
+        return _hvci_state
+
+    # The query hung or failed. Fall back to the configured value from the
+    # registry, which is instant, and do not claim to know the running state.
+    configured = _memory_integrity_configured_in_registry()
+    _hvci_state = (configured, configured)
+    return _hvci_state
+
+
+def _memory_integrity_configured_in_registry() -> bool:
+    """The configured Memory Integrity setting, read straight from the policy key."""
+    try:
+        import winreg
+    except Exception:
+        return False
+
+    key_path = (
+        r"SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios"
+        r"\HypervisorEnforcedCodeIntegrity"
+    )
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path) as key:
+            enabled, _ = winreg.QueryValueEx(key, "Enabled")
+        return bool(enabled)
+    except Exception:
+        return False
+
+
+def driver_failure_hint() -> str:
+    """What this machine's configuration adds to a driver that would not start.
+
+    Only the observation belongs here -- what it means and what to do about it
+    live in the shared issue catalogue, so the Monitor and the Configurator word
+    it identically and a change needs editing in one place. The text is what the
+    catalogue matches on.
+    """
+    running, configured = memory_integrity_state()
+    if not running:
+        return ""
+
+    if configured:
+        return " Memory Integrity is enabled on this machine."
+
+    # Switched off but still live until the next boot: a genuinely different
+    # situation, because the remedy is a restart rather than a settings change.
+    return (
+        " Memory Integrity is switched off but still running until this "
+        "machine is restarted."
+    )
+
+
+def _usb_serial_from_device_id(device_id):
+    r"""The unit's own serial number from a Windows instance path, if it has one.
+
+    A path looks like ``USB\VID_097E&PID_0036\<instance>``. That last segment
+    is the serial the device reports -- but only when it reports one at all;
+    otherwise Windows synthesises an id from the port path, which always
+    contains '&'. An MP36 supplies no USB serial, so this is None for it rather
+    than a meaningless port path shown to the user as a serial number.
+    """
+    if not device_id:
+        return None
+    tail = str(device_id).rsplit("\\", 1)[-1].strip()
+    if not tail or "&" in tail:
+        return None
+    return tail
+
+
+def _model_from_name(*candidates):
+    """The BIOPAC model (MP36, MP150, ...) named in any of these strings."""
+    from bioview_common.datatypes.configuration.biopac import MODEL_CODE_MAPPING
+
+    for text in candidates:
+        upper = (text or "").upper()
+        for model in sorted(MODEL_CODE_MAPPING, key=len, reverse=True):
+            if model in upper:
+                return model
+    return None
+
+
+def _com_module():
+    """The pythoncom module, or None when pywin32 is unavailable.
+
+    Imported plainly rather than through importlib: PyInstaller cannot follow a
+    dynamic import, so the frozen build would ship without pythoncom, COM would
+    go uninitialised on worker threads, and every WMI query -- and therefore all
+    BIOPAC discovery -- would fail there.
+    """
+    try:
+        import pythoncom
+    except Exception:
+        return None
+    return pythoncom
 
 
 def discover_devices():
@@ -43,16 +213,17 @@ def _discover_devices_list():
         # Try to initialise COM for this thread so WMI works when called
         # from worker threads. If pythoncom isn't available, continue and
         # let wmi raise a helpful error.
-        try:
-            pythoncom = importlib.import_module("pythoncom")
-            # Prefer CoInitializeEx for safety; fallback to CoInitialize
-            if hasattr(pythoncom, "CoInitializeEx"):
-                pythoncom.CoInitializeEx(0x2)  # COINIT_MULTITHREADED
-            else:
-                pythoncom.CoInitialize()
-            coinit = True
-        except Exception:
-            pythoncom = None
+        pythoncom = _com_module()
+        if pythoncom is not None:
+            try:
+                # Prefer CoInitializeEx for safety; fallback to CoInitialize
+                if hasattr(pythoncom, "CoInitializeEx"):
+                    pythoncom.CoInitializeEx(0x2)  # COINIT_MULTITHREADED
+                else:
+                    pythoncom.CoInitialize()
+                coinit = True
+            except Exception:
+                pythoncom = None
 
         c = wmi.WMI()
         # Query USB devices from WMI
@@ -66,9 +237,10 @@ def _discover_devices_list():
                         pid_start = device.DeviceID.find("PID_") + 4
                         pid = device.DeviceID[pid_start : pid_start + 4]
 
+                name = device.Name or "Unknown"
                 device_info = {
                     "device_id": device.DeviceID,
-                    "name": device.Name or "Unknown",
+                    "name": name,
                     "description": device.Description or "Unknown",
                     "manufacturer": device.Manufacturer or "Unknown",
                     "service": device.Service or "None",
@@ -76,6 +248,10 @@ def _discover_devices_list():
                     "present": device.Present,
                     "vid": vid,
                     "pid": pid,
+                    # Identifying details for the Configurator's device list,
+                    # which previously had nothing to show but "S/N Unknown".
+                    "serial": _usb_serial_from_device_id(device.DeviceID),
+                    "model": _model_from_name(name, device.Description),
                 }
 
                 # Normalise VID for numeric comparison
@@ -87,15 +263,20 @@ def _discover_devices_list():
                         vid_int = None
 
                 # Validate and add to list
-                if vid_int == BIOPAC_VENDOR_ID or \
-                'biopac' in (device_info['manufacturer'] or '').lower() or \
-                'biopac' in (device_info['name'] or '').lower():  
+                if (
+                    vid_int == BIOPAC_VENDOR_ID
+                    or "biopac" in (device_info["manufacturer"] or "").lower()
+                    or "biopac" in (device_info["name"] or "").lower()
+                ):
                     discovered_devices.append(device_info)
     except Exception as e:
         logging.getLogger(__name__).error("Unable to discover BIOPAC devices: %s", e)
 
     finally:
-        # Uninitialize pythoncom if we initialized it here
+        # Uninitialize pythoncom if we initialized it here. A return statement
+        # does not belong in this block: it would discard whatever exception was
+        # in flight, so a genuine WMI or COM failure would look like "no BIOPAC
+        # devices attached" with nothing logged anywhere.
         if coinit and pythoncom is not None:
             try:
                 if hasattr(pythoncom, "CoUninitialize"):
@@ -103,7 +284,7 @@ def _discover_devices_list():
             except Exception:
                 pass
 
-        return discovered_devices
+    return discovered_devices
 
 
 def build_hardware_dict_from_group(group_config: dict, group_id: str) -> dict:
@@ -142,11 +323,6 @@ def resolve_biopac_hardware_entry(
             if key in discovered_devices:
                 return dict(entry)
     return dict(next(iter(hardware.values())))
-
-
-def update_device_firmware():
-    """BIOPAC firmware updates are managed outside BioView."""
-    pass
 
 
 def load_mpdev_dll(custom_loc: str = None):
@@ -196,7 +372,11 @@ def connect_biopac_device(
         c_int(device_code), c_int(connection_code), port_bytes
     )
     if BIOPAC_CONNECTION_CODES.get(result_code, None) != "MPSUCCESS":
-        raise Exception(f"BIOPAC Connection Failed with Error Code: {result_code}")
+        # Raised as-is. Machine-level context (is Memory Integrity blocking the
+        # driver?) is added by the server when it records the failure: this code
+        # runs inside the backend subprocess, where that query has been seen to
+        # hang, and a stalled initialization is worse than a thinner message.
+        raise Exception(f"BIOPAC connection failed: {describe_biopac_code(result_code)}")
 
 
 def configure_biopac_device(mpdev_handler, channels, sample_rate):
@@ -204,15 +384,55 @@ def configure_biopac_device(mpdev_handler, channels, sample_rate):
     result_code = mpdev_handler.setAcqChannels(byref(channels))
     if BIOPAC_CONNECTION_CODES.get(result_code, None) != "MPSUCCESS":
         raise Exception(
-            f"BIOPAC Channel Configuration Failed with Error Code: {result_code}"
+            f"BIOPAC channel configuration failed: {describe_biopac_code(result_code)}"
         )
 
     # Set sample rate
     result_code = mpdev_handler.setSampleRate(c_double(1000.0 / sample_rate))
     if BIOPAC_CONNECTION_CODES.get(result_code, None) != "MPSUCCESS":
         raise Exception(
-            f"BIOPAC Sample Rate Configuration Failed with Error Code: {result_code}"
+            "BIOPAC sample rate configuration failed: "
+            f"{describe_biopac_code(result_code)}"
         )
+
+
+def start_acq_daemon(mpdev_handler) -> bool:
+    """Start mpdev's acquisition daemon, which backs ``receiveMPData``.
+
+    The daemon is a thread inside the DLL that continuously downloads and caches
+    samples from the MP unit; ``receiveMPData`` then hands them back in order, at
+    the hardware's pace. Without it the only way to read data is
+    ``getMostRecentSample``, one driver round-trip per sample, which cannot keep
+    up with a kHz sample rate from Python.
+
+    mpdev requires this to be called *before* ``startAcquisition``, and the two
+    transfer styles must not be mixed within one acquisition.
+
+    Returns True when the daemon is running, False when this DLL has no
+    ``startMPAcqDaemon`` at all. Raises if the call is made and fails, so the
+    caller can fall back to polling rather than reading from a dead daemon.
+    """
+    start = getattr(mpdev_handler, "startMPAcqDaemon", None)
+    if start is None:
+        return False
+
+    result_code = start()
+    if BIOPAC_CONNECTION_CODES.get(result_code, None) != "MPSUCCESS":
+        raise Exception(
+            f"BIOPAC acquisition daemon failed to start: "
+            f"{describe_biopac_code(result_code)}"
+        )
+    return True
+
+
+def daemon_last_error(mpdev_handler):
+    """mpdev's daemon-specific error code, or None if the DLL cannot report one."""
+    last_error = getattr(mpdev_handler, "getMPDaemonLastError", None)
+    if last_error is None:
+        return None
+    with contextlib.suppress(Exception):
+        return last_error()
+    return None
 
 
 def start_acquisition(mpdev_handler):
@@ -238,9 +458,7 @@ def disconnect_biopac_device(mpdev_handler):
             "MPSUCCESS",
             None,
         ):
-            raise Exception(
-                f"BIOPAC Disconnect Failed with Error Code: {result_code}"
-            )
+            raise Exception(f"BIOPAC Disconnect Failed with Error Code: {result_code}")
 
 
 def wrap_result_code(result, stage=""):

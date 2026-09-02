@@ -13,9 +13,19 @@ def discover_devices():
     ]
 
 
-def update_device_firmware(*args, **kwargs):
-    # No-op for the virtual device; present for API parity with real backends.
-    return True
+#: No Configurator-editable properties on this backend yet. The Configurator
+#: reads this to decide whether the Edit button is available for a device.
+EDITABLE_PROPERTIES = {}
 
 
-__all__ = ["DummyBackend", "SineWaveWorker", "discover_devices", "update_device_firmware"]
+def set_device_config(device_info: dict, new_config: dict, logger=None):
+    return False, "This device type has no editable properties."
+
+
+__all__ = [
+    "DummyBackend",
+    "SineWaveWorker",
+    "discover_devices",
+    "EDITABLE_PROPERTIES",
+    "set_device_config",
+]

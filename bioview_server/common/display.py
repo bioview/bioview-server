@@ -1,29 +1,38 @@
 import queue
 from typing import List
 
-from bioview_common import log_print, DataSource, PausableWorker
-
-MODIFIABLE_PARAMS = [
-    "display_ds",
-    "display_filter_type",
-    "display_filter_f_low",
-    "display_filter_f_high",
-]
+from bioview_common import DataSource, PausableWorker, log_print, put_drop_oldest
 
 
 class DisplayWorker(PausableWorker):
-    '''Wrapper worker that forwards processed data to the output queue for the
+    """Wrapper worker that forwards processed data to the output queue for the
     client. It emits a contiguous (num_sources, num_samples) numpy array together
     with the ordered list of data sources describing each row, so the client can
-    save the full stream and route individual rows to plots reliably.'''
+    save the full stream and route individual rows to plots reliably."""
+
     def __init__(
         self,
-        display_sources: List[DataSource] = None, 
+        display_sources: List[DataSource] = None,
         data_input_queue: queue.Queue = None,  # Data comes in
         data_output_queue: queue.Queue = None,  # Data pushed to client
-        logger = None
+        logger=None,
     ):
         super().__init__()
+        self.set_display_sources(display_sources)
+
+        # Queues
+        self.data_input_queue = data_input_queue
+        self.data_output_queue = data_output_queue
+
+        self.logger = logger
+
+    def set_display_sources(self, display_sources):
+        """Replace the row -> source map used to label emitted chunks.
+
+        Enabling or disabling a device channel changes both how many rows the
+        backend emits and what each row means, so this has to be updatable while
+        the worker is alive rather than fixed at construction.
+        """
         # Ordered list of sources; row i of each emitted array corresponds to
         # display_sources[i]. Ordered by channel so it matches ProcessWorker output.
         self.display_sources = sorted(
@@ -33,12 +42,6 @@ class DisplayWorker(PausableWorker):
 
         # Precompute serializable source descriptors (sent as chunk metadata)
         self._source_dicts = [s.to_dict() for s in self.display_sources]
-
-        # Queues
-        self.data_input_queue = data_input_queue
-        self.data_output_queue = data_output_queue
-
-        self.logger = logger 
 
     def work(self):
         # Nothing to do if we have no queues; return
@@ -53,8 +56,10 @@ class DisplayWorker(PausableWorker):
 
         try:
             payload = {"data": samples, "sources": self._source_dicts}
-            self.data_output_queue.put_nowait(payload)
-        except queue.Full:
-            log_print(self.logger, 'warning', 'Display queue filled up. Unable to add any more data.')
+            # Live display: only the newest chunk has value, so evict the oldest
+            # rather than stalling here and letting latency grow unbounded.
+            if not put_drop_oldest(self.data_output_queue, payload):
+                self.dropped_chunks += 1
+                self._log_drop()
         except Exception as e:
-            log_print(self.logger, 'error', f'Error occurred: {e}')
+            log_print(self.logger, "error", f"Error occurred: {e}")

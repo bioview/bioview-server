@@ -1,24 +1,31 @@
 """
 Ref: uhd examples
 """
-import json
 import time
-import contextlib
-from typing import Dict, List
 from datetime import datetime, timedelta
+from typing import Dict, List
 
 import numpy as np
 import uhd
-from bioview_common import DISCOVERY_CACHE_TTL, DataSource, log_print
+from bioview_common import DISCOVERY_CACHE_TTL, DataSource, DeviceType, log_print
 
-from bioview_common import get_cache_file
+# Name/serial bookkeeping lives in naming.py so it stays importable (and
+# testable) without the UHD driver.
+from .naming import (  # noqa: F401  - re-exported for existing callers
+    apply_alias,
+    get_device_aliases,
+    get_usrp_address,
+    set_device_alias,
+    update_usrp_address,
+)
 
 
 if not hasattr(uhd, "usrp"):
     raise ImportError(
         "Invalid UHD Python bindings: module 'uhd' has no attribute 'usrp'. "
         "Install the USRP Hardware Driver (UHD) Python API from Ettus Research "
-        "for your Python version, and ensure no local file named uhd.py is on PYTHONPATH."
+        "for your Python version, and ensure no local file named uhd.py is on "
+        "PYTHONPATH."
     )
 
 
@@ -35,9 +42,6 @@ def invalidate_discovery_cache():
     _discovery_cache_ts = 0.0
 
 
-def update_device_firmware():
-    pass
-
 def discover_devices(logger=None, use_cache: bool = True):
     """
     Devices discovered using uhd.find contain the following keys -
@@ -50,9 +54,11 @@ def discover_devices(logger=None, use_cache: bool = True):
     """
     global _discovery_cache_ts
 
-    if use_cache and _discovery_cache and (
-        time.monotonic() - _discovery_cache_ts
-    ) < DISCOVERY_CACHE_TTL:
+    if (
+        use_cache
+        and _discovery_cache
+        and (time.monotonic() - _discovery_cache_ts) < DISCOVERY_CACHE_TTL
+    ):
         log_print(logger, "debug", "Using cached USRP discovery results")
         return dict(_discovery_cache)
 
@@ -63,11 +69,13 @@ def discover_devices(logger=None, use_cache: bool = True):
         device_list = uhd.find("")
 
         for device in device_list:
-            device_dict = dict(device)
-            device_id = device_dict.get("name", "invalid_usrp_device")
+            device_dict = apply_alias(dict(device))
+            device_dict.setdefault("device_type", DeviceType.USRP.value)
+            device_id = device_dict["name"]
             discovered_devices[device_id] = device_dict
 
-            update_usrp_address(device_dict["name"], device_dict["serial"])
+            if device_dict.get("serial"):
+                update_usrp_address(device_id, device_dict["serial"])
 
         _discovery_cache.clear()
         _discovery_cache.update(discovered_devices)
@@ -141,9 +149,7 @@ def get_channel_map(
                 r_idx, t_idx, rx_cumsum, tx_cumsum, multi_pairs
             ):
                 label = f"Tx{tx_ctr}Rx{rx_ctr}"
-                source = DataSource(
-                    group_id=group_id, channel=ch_ctr, label=label
-                )
+                source = DataSource(group_id=group_id, channel=ch_ctr, label=label)
                 source.tx_idx = t_idx
                 source.rx_idx = r_idx
                 data_sources.add(source)
@@ -156,11 +162,16 @@ def get_channel_map(
     return data_sources
 
 
-def setup_pps(usrp, pps, num_mboards, logger = None):
+def setup_pps(usrp, pps, num_mboards, logger=None):
     """Setup the PPS source."""
     if pps == "mimo":
         if num_mboards != 2:
-            log_print(logger, "error", f'ref = "mimo" implies 2 motherboards; your system has {num_mboards} boards')
+            log_print(
+                logger,
+                "error",
+                f'ref = "mimo" implies 2 motherboards; your system has '
+                f"{num_mboards} boards",
+            )
             return False
         # make mboard 1 a slave over the MIMO Cable
         usrp.set_time_source("mimo", 1)
@@ -169,11 +180,16 @@ def setup_pps(usrp, pps, num_mboards, logger = None):
     return True
 
 
-def setup_ref(usrp, ref, num_mboards, logger = None):
+def setup_ref(usrp, ref, num_mboards, logger=None):
     """Setup the reference clock."""
     if ref == "mimo":
         if num_mboards != 2:
-            log_print(logger, "error", f'ref = "mimo" implies 2 motherboards; your system has {num_mboards} boards')
+            log_print(
+                logger,
+                "error",
+                f'ref = "mimo" implies 2 motherboards; your system has '
+                f"{num_mboards} boards",
+            )
             return False
         usrp.set_clock_source("mimo", 1)
     else:
@@ -191,12 +207,16 @@ def setup_ref(usrp, ref, num_mboards, logger = None):
                 time.sleep(1e-3)
                 is_locked = usrp.get_mboard_sensor("ref_locked", i)
             if not is_locked:
-                log_print(logger, "error", f"Unable to confirm clock signal locked on board {i}")
+                log_print(
+                    logger,
+                    "error",
+                    f"Unable to confirm clock signal locked on board {i}",
+                )
                 return False
     return True
 
 
-def check_channels(usrp, rx_channels, tx_channels, logger = None):
+def check_channels(usrp, rx_channels, tx_channels, logger=None):
     # Check that each Rx channel specified is less than the total number
     # of rx channels that the device can support
     dev_rx_channels = usrp.get_rx_num_channels()
@@ -212,35 +232,3 @@ def check_channels(usrp, rx_channels, tx_channels, logger = None):
         return [], []
 
     return rx_channels, tx_channels
-
-
-def get_usrp_address(device_name: str, logger = None):
-    cache_file = get_cache_file("usrp_serial_numbers")
-    map_dict = {}
-
-    try:
-        with open(cache_file) as fobj:
-            map_dict = json.load(fobj)
-    except Exception:
-        log_print(logger, "error", "Cache is empty")
-        return None
-
-    return map_dict[device_name]
-
-
-def update_usrp_address(device_name: str, device_serial: str, logger = None):
-    cache_file = get_cache_file("usrp_serial_numbers")
-    map_dict = {}
-
-    with contextlib.suppress(Exception):
-        with open(cache_file) as fobj:
-            map_dict = json.load(fobj)
-
-    map_dict[device_name] = device_serial
-
-    # Update
-    try:
-        with open(cache_file, "w") as fobj:
-            json.dump(map_dict, fobj)
-    except Exception as e:
-        log_print(logger, "error", f"Error updating cache: {e}")

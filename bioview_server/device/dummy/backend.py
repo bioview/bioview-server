@@ -9,21 +9,29 @@ without hardware.
 
 from __future__ import annotations
 
+import multiprocessing as mp
 import queue
 import time
-import multiprocessing as mp
-
-from typing import Dict, List, Optional
 
 import numpy as np
-
-from bioview_common import DataSource, DeviceStatus, PausableWorker, log_print
-from bioview_common.datatypes.configuration.usrp_channel_map import resolve_channel_map
+from bioview_common import (
+    DataSource,
+    DeviceStatus,
+    PausableWorker,
+    log_print,
+    put_drop_oldest,
+)
 from bioview_common.datatypes.configuration.hardware_params import (
     GLOBAL_TX_PARAMS,
     apply_global_tx_param_to_schemes,
+    build_global_mapping,
 )
-from bioview_common.signal_schemes import DpicBalancer, scheme_from_config
+from bioview_common.datatypes.configuration.usrp_channel_map import resolve_channel_map
+from bioview_common.signal_schemes import (
+    DpicBalancer,
+    DpicChannel,
+    scheme_from_config,
+)
 
 from bioview_server.datatypes import Backend
 
@@ -80,10 +88,12 @@ class SineWaveWorker(PausableWorker):
 
         self._sample_idx += self.chunk_size
 
-        try:
-            self.display_queue.put_nowait(np.ascontiguousarray(chunk, dtype=float))
-        except queue.Full:
-            log_print(self.logger, "warning", "[DUMMY] Display queue full; dropping chunk")
+        if not put_drop_oldest(
+            self.display_queue, np.ascontiguousarray(chunk, dtype=np.float32)
+        ):
+            log_print(
+                self.logger, "warning", "[DUMMY] Display queue full; dropping chunk"
+            )
 
         self._next_emit += self.chunk_duration
         sleep_for = self._next_emit - time.monotonic()
@@ -99,7 +109,7 @@ class DummyBackend(Backend):
         group_id: str,
         response_queue: mp.Queue,
         data_output_queue: mp.Queue = None,
-        group_config: Optional[dict] = None,
+        group_config: dict | None = None,
         samp_rate: int = 500,
         num_channels: int = 4,
         signal_freq: float = 1.0,
@@ -132,6 +142,7 @@ class DummyBackend(Backend):
         self.mimo_sources = set()
         self.cal_ref_sources = []
         self.dpic_pairs = []
+        self._cal_enabled = False
         self.registry = None
         self.schemes_by_device = {}
         self.global_tx_to_device = {}
@@ -143,9 +154,7 @@ class DummyBackend(Backend):
         self.channel_model = None
         self._cal_enabled_at_start = False
         self.display_ds = int(self.group_config.get("disp_ds", 10))
-        self.display_imaginary = bool(
-            self.group_config.get("display_imaginary", False)
-        )
+        self.display_imaginary = bool(self.group_config.get("display_imaginary", False))
         self.save_ds = int(self.group_config.get("save_ds", 100))
         self.save_iq = bool(self.group_config.get("save_iq", False))
         self.save_imaginary = bool(self.group_config.get("save_imaginary", True))
@@ -174,14 +183,11 @@ class DummyBackend(Backend):
         )
         self.data_sources = set(self.mimo_sources)
 
-        self.global_tx_to_device = {}
-        tx_offset = 0
-        for device_name, hw in self.hardware.items():
-            n_tx = len(hw.get("tx_channels", [0]))
-            self.global_tx_offsets[device_name] = tx_offset
-            for local in range(n_tx):
-                self.global_tx_to_device[tx_offset + local] = (device_name, local)
-            tx_offset += n_tx
+        (
+            self.global_tx_to_device,
+            self.global_tx_offsets,
+            _tx_gains,
+        ) = build_global_mapping(self.hardware, "tx")
 
         self.channel_ifs = list(self.registry.tx_if_freq)
         self.if_filter_bw = list(self.registry.tx_filter_bw)
@@ -272,7 +278,7 @@ class DummyBackend(Backend):
         self.status = DeviceStatus.CONNECTED
         return True
 
-    def _setup_saving(self, save_config: Dict):
+    def _setup_saving(self, save_config: dict):
         super()._setup_saving(save_config)
         if self.process_worker:
             self.process_worker.save_imaginary = self.save_imaginary
@@ -353,9 +359,8 @@ class DummyBackend(Backend):
         if not self.rf_worker.is_alive():
             self.rf_worker.start()
 
-        if self.process_worker:
-            if not self.process_worker.is_alive():
-                self.process_worker.start()
+        if self.process_worker and not self.process_worker.is_alive():
+            self.process_worker.start()
 
         self.rf_worker.resume()
         if self.process_worker:
@@ -363,16 +368,9 @@ class DummyBackend(Backend):
 
         time.sleep(0.35)
 
-        dpic_cfg = self.group_config.get("dpic_balance", {})
-        if dpic_cfg.get("auto_on_start") and self.dpic_pairs:
-            self._run_dpic_balance()
-
-        if self._cal_enabled_at_start:
-            for scheme in self.schemes_by_device.values():
-                scheme.set_calibration_enabled(True)
-        else:
-            for scheme in self.schemes_by_device.values():
-                scheme.set_calibration_enabled(False)
+        for scheme in self.schemes_by_device.values():
+            scheme.set_calibration_enabled(self._cal_enabled_at_start)
+        self._cal_enabled = self._cal_enabled_at_start
 
         if self.save_worker:
             if not self.save_worker.is_alive():
@@ -402,40 +400,71 @@ class DummyBackend(Backend):
         self.status = DeviceStatus.CONNECTED
         return True
 
+    def _post_start_streaming(self):
+        dpic_cfg = self.group_config.get("dpic_balance", {})
+        if dpic_cfg.get("auto_on_start") and self.dpic_pairs:
+            self._run_dpic_balance()
+
     def _run_dpic_balance(self):
         if not self.rf_mode or not self.dpic_pairs:
             return None
+        if self.process_worker is None or not self.process_worker.is_running:
+            log_print(
+                self.logger,
+                "error",
+                "[DPIC] Balance requires the processing worker to be running; "
+                "start streaming first.",
+            )
+            return None
 
         dpic_cfg = self.group_config.get("dpic_balance", {})
-        prev_cal = self._cal_enabled_at_start
+        settle_s = float(dpic_cfg.get("settle_time_s", 0.02))
+        prev_cal = self._cal_enabled
         for scheme in self.schemes_by_device.values():
             scheme.set_calibration_enabled(False)
 
         balancer = DpicBalancer(
             phase_step_deg=dpic_cfg.get("phase_step_deg", 0.1),
             amp_step=dpic_cfg.get("amp_step", 0.05),
+            coarse_phase_step_deg=dpic_cfg.get("coarse_phase_step_deg", 10.0),
+            coarse_amp_step=dpic_cfg.get("coarse_amp_step", 0.1),
+            max_amplitude=dpic_cfg.get("max_amplitude", 1.0),
             amp_target=dpic_cfg.get("amp_target", 0.5),
-            settle_time_s=dpic_cfg.get("settle_time_s", 0.5),
+            settle_time_s=settle_s,
+            gain_settle_time_s=dpic_cfg.get("gain_settle_time_s", 0.0),
+            time_budget_s=dpic_cfg.get("time_budget_s", 25.0),
         )
 
-        def set_phase(global_tx, phase_deg):
-            dev_name, local = self.global_tx_to_device[global_tx]
-            self.schemes_by_device[dev_name].tx_phase_deg[local] = float(phase_deg)
+        def _make_channel(pair):
+            dev_name, local = self.global_tx_to_device[pair.inject_tx]
+            scheme = self.schemes_by_device[dev_name]
+            measure_rx = pair.target_rx
+            read_timeout = max(1.0, settle_s * 8)
 
-        def set_amplitude(global_tx, amp):
-            dev_name, local = self.global_tx_to_device[global_tx]
-            self.schemes_by_device[dev_name].tx_amplitude[local] = float(amp)
+            def set_phase(v):
+                scheme.tx_phase_deg[local] = float(v)
 
-        def wait_settle():
-            time.sleep(dpic_cfg.get("settle_time_s", 0.5))
+            def set_amplitude(v):
+                scheme.tx_amplitude[local] = float(v)
 
-        def read_metric(inject_tx, measure_tx):
-            return self.process_worker.get_metric(measure_tx, measure_tx)
+            return DpicChannel(
+                inject_tx=pair.inject_tx,
+                measure_tx=pair.measure_tx,
+                measure_rx=measure_rx,
+                set_phase=set_phase,
+                set_amplitude=set_amplitude,
+                read_metric=lambda: self.process_worker.wait_for_metric(
+                    pair.measure_tx, measure_rx, min_new=2, timeout=read_timeout
+                ),
+                read_complex=lambda: self.process_worker.wait_for_metric_complex(
+                    pair.measure_tx, measure_rx, min_new=2, timeout=read_timeout
+                ),
+                wait_settle=lambda: time.sleep(settle_s),
+                start_phase_deg=float(scheme.tx_phase_deg[local]),
+                start_amplitude=float(scheme.get_tx_amplitude(local)),
+            )
 
-        pairs = [(p.inject_tx, p.measure_tx) for p in self.dpic_pairs]
-        results = balancer.run_all(
-            pairs, set_phase, set_amplitude, read_metric, wait_settle
-        )
+        results = balancer.balance_all([_make_channel(p) for p in self.dpic_pairs])
 
         if "dpic_balance" not in self.group_config:
             self.group_config["dpic_balance"] = {}
@@ -443,9 +472,15 @@ class DummyBackend(Backend):
             {
                 "inject_tx": r.inject_tx,
                 "measure_tx": r.measure_tx,
+                "measure_rx": r.measure_rx,
                 "best_phase_deg": r.best_phase_deg,
                 "best_amplitude": r.best_amplitude,
                 "min_metric": r.min_metric,
+                "start_metric": r.start_metric,
+                "null_depth_db": r.null_depth_db,
+                "method": r.method,
+                "elapsed_s": r.elapsed_s,
+                "converged": r.converged,
             }
             for r in results
         ]
@@ -453,6 +488,7 @@ class DummyBackend(Backend):
         if prev_cal:
             for scheme in self.schemes_by_device.values():
                 scheme.set_calibration_enabled(True)
+        self._cal_enabled = prev_cal
 
         return results
 
