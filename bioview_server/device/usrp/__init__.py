@@ -49,6 +49,17 @@ def set_device_config(device_info: dict, new_config: dict, logger=None):
         return False, "Could not write the device name cache."
 
     update_usrp_address(new_name, serial, logger=logger)
+
+    # uhd.find results are cached for a few seconds, and the alias is overlaid
+    # while building them -- without dropping that cache the very next listing
+    # would still report the old name and the rename would look like it failed.
+    try:
+        from .utils import invalidate_discovery_cache
+
+        invalidate_discovery_cache()
+    except Exception:  # UHD absent: nothing was cached to drop
+        pass
+
     return True, f"Renamed to {new_name}."
 
 

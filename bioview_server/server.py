@@ -752,6 +752,9 @@ class Server:
                 "info",
                 f"Updated {device_info.get('name')}: {message}",
             )
+            # The listing cache is keyed on device name, so a rename would
+            # otherwise leave the device sitting under its old name as well.
+            self.discovered_devices_cache.pop(device_info.get("name"), None)
             send_response(
                 self.client_control_conn,
                 Response.DEVICE_CONFIG_UPDATED,
