@@ -1,7 +1,6 @@
 import contextlib
 import multiprocessing as mp
 from ctypes import c_int
-from typing import List, Optional
 
 from bioview_common import DataSource, DeviceStatus, log_print
 
@@ -40,8 +39,8 @@ class BIOPACBackend(Backend):
         group_id: str,
         response_queue: mp.Queue,
         data_output_queue: mp.Queue = None,
-        group_config: Optional[dict] = None,
-        discovered_devices: Optional[dict] = None,
+        group_config: dict | None = None,
+        discovered_devices: dict | None = None,
     ):
         super().__init__(
             group_id=group_id,
@@ -74,9 +73,9 @@ class BIOPACBackend(Backend):
         self.save_ds = int(self.group_config.get("save_ds", 1))
 
         self.mpdev_handler = None
-        self.channels: List[int] = []
+        self.channels: list[int] = []
         self._channel_array = None
-        self.acquisition_worker: Optional[BiopacAcquisitionWorker] = None
+        self.acquisition_worker: BiopacAcquisitionWorker | None = None
 
         self.populate_data_sources()
 
@@ -86,13 +85,13 @@ class BIOPACBackend(Backend):
 
         return MODEL_CODE_MAPPING.get(model, MODEL_CODE_MAPPING["MP36"])
 
-    def _enabled_channels(self) -> List[int]:
+    def _enabled_channels(self) -> list[int]:
         raw = self.hw_entry.get(
             "channels", self.group_config.get("channels", [1, 1, 1, 1])
         )
         return list(raw)
 
-    def _acquired_channel_indices(self) -> List[int]:
+    def _acquired_channel_indices(self) -> list[int]:
         """Zero-based indices of the channels mpdev will actually return.
 
         mpdev packs one value per *enabled* channel into the sample buffer, so
@@ -118,10 +117,8 @@ class BIOPACBackend(Backend):
             label = (
                 labels[idx] if idx < len(labels) and labels[idx] else f"Ch{enabled_idx}"
             )
-            # Every acquired sample is forwarded to the display (disp_ds only sets
-            # the chunk size), so the display rate *is* the sample rate. Reporting
-            # the default 200 Hz instead made the plot window scroll at the wrong
-            # speed for any other sample rate.
+            # Every acquired sample reaches the display, so the display rate
+            # is the sample rate; disp_ds only sets the chunk size.
             source = DataSource(
                 group_id=self.group_id,
                 channel=enabled_idx - 1,
@@ -154,10 +151,8 @@ class BIOPACBackend(Backend):
             log_print(self.logger, "debug", "Successfully initialized BIOPAC device")
             return True
         except Exception as e:
-            # Raise rather than returning False. A falsy result is turned into a
-            # generic "Unable to initialize device" upstream, which is all the
-            # user ever saw; the real cause -- which mpdev error and what to do
-            # about it -- is the whole point of the message.
+            # Raised, not returned falsy: a falsy result becomes a generic
+            # "unable to initialize" upstream and loses the mpdev error.
             log_print(self.logger, "error", f"Unable to initialize BIOPAC device: {e}")
             raise
 
@@ -165,10 +160,8 @@ class BIOPACBackend(Backend):
         if self.mpdev_handler is None:
             return False
 
-        # The daemon has to be running before acquisition starts; it is what
-        # makes the buffered stream read (receiveMPData) possible. If this DLL
-        # or unit cannot provide it we fall back to per-sample polling, which
-        # works but cannot sustain a high sample rate.
+        # The daemon must be running before acquisition starts; without it we
+        # fall back to polling, which cannot sustain a high sample rate.
         use_stream = False
         try:
             use_stream = start_acq_daemon(self.mpdev_handler)
@@ -182,9 +175,7 @@ class BIOPACBackend(Backend):
         start_acquisition(self.mpdev_handler)
         self.status = DeviceStatus.STREAMING
 
-        # Without these the acquisition worker fills self.display_queue and
-        # nothing ever drains it into the client's output queue, so BIOPAC data
-        # never reached the plots. USRP and dummy have always done this here.
+        # Without these nothing drains display_queue into the output queue.
         if self.save_worker is not None:
             if not self.save_worker.is_alive():
                 self.save_worker.start()
@@ -195,10 +186,8 @@ class BIOPACBackend(Backend):
                 self.display_worker.start()
             self.display_worker.resume()
 
-        # Chunk size is the acquisition latency: with the buffered stream read
-        # the worker blocks until this many samples exist. disp_ds sets it, but
-        # a low disp_ds at a high sample rate would ask for a second of data per
-        # read and make the plot lag by that much, so cap it at 100 ms.
+        # Chunk size is the acquisition latency, so it is capped at 100 ms
+        # however low disp_ds is set.
         chunk_size = int(round(self.samp_rate / max(1, self.disp_ds)))
         chunk_size = max(1, min(chunk_size, max(1, int(self.samp_rate * 0.1))))
         self.acquisition_worker = BiopacAcquisitionWorker(
@@ -262,9 +251,8 @@ class BIOPACBackend(Backend):
                 self.channels = self._enabled_channels()
                 self._channel_array = self._ctypes_channels()
                 self.populate_data_sources()
-                # The display worker labels each emitted row; leaving it with the
-                # old source list would mislabel (or silently drop) every plot
-                # after a channel change.
+                # The display worker labels each row, so a stale source list
+                # mislabels every plot after a channel change.
                 if self.display_worker is not None:
                     self.display_worker.set_display_sources(list(self.data_sources))
                 restart_streaming = True

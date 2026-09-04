@@ -10,11 +10,8 @@ __all__ = []
 
 AVAILABLE_BACKENDS = {}
 
-#: Backends that failed to load, mapped to why. A backend whose driver or Python
-#: dependency is missing is simply absent from AVAILABLE_BACKENDS, which used to
-#: make it invisible: the reason was printed to stdout, and a server spawned by
-#: the GUI has its stdout detached, so attached hardware just never appeared.
-#: These reasons are reported to the Configurator alongside the device list.
+# Backends that failed to load, mapped to why. Reported to the Configurator
+# alongside the device list, since a GUI-spawned server has no visible stdout.
 UNAVAILABLE_BACKENDS = {}
 
 
@@ -24,11 +21,32 @@ def _backend_unavailable(device_type, error):
     print(f"{device_type} backend not available: {error}")
 
 
+def _check_uhd_numpy_abi():
+    """Warn when libpyuhd was built against a different NumPy major version."""
+    import io as _io
+    import warnings
+    from contextlib import redirect_stderr
+
+    captured = _io.StringIO()
+    with warnings.catch_warnings(record=True) as caught, redirect_stderr(captured):
+        warnings.simplefilter("always")
+        import uhd  # noqa: F401
+
+    messages = captured.getvalue() + " ".join(str(w.message) for w in caught)
+    if "compiled using NumPy 1.x" in messages:
+        import numpy
+
+        print(
+            "WARNING: the installed UHD Python bindings were built against "
+            f"NumPy 1.x but NumPy {numpy.__version__} is active. USRP streaming "
+            "may misbehave. Install 'numpy<2' in this environment, or use UHD "
+            "bindings built for NumPy 2."
+        )
+
+
 try:
-    # usrp/__init__ resolves its heavy attributes lazily, so importing it
-    # succeeds with no driver present. Import uhd itself so AVAILABLE_BACKENDS
-    # only lists backends that actually work.
-    import uhd  # noqa: F401
+    # usrp/__init__ imports fine with no driver, so probe uhd itself.
+    _check_uhd_numpy_abi()
 
     from . import usrp
 

@@ -17,18 +17,14 @@ from .constants import (
 )
 
 
-#: Identifier for hypervisor-enforced code integrity in Win32_DeviceGuard's
-#: SecurityServices lists.
+# Hypervisor-enforced code integrity, in Win32_DeviceGuard's service lists.
 _HVCI_SERVICE_ID = 2
 
-#: How long to wait for the DeviceGuard query. This runs while reporting a
-#: failure, and a diagnostic that blocks the operation it is explaining is worse
-#: than no diagnostic: the WMI call has been seen to hang indefinitely inside a
-#: backend subprocess, which stalled device initialization outright.
+# Bounded: this WMI call has been seen to hang indefinitely, and it only
+# ever runs to explain a failure.
 _HVCI_QUERY_TIMEOUT = 3.0
 
-#: Cached result. Memory Integrity cannot change without a reboot, so one
-#: successful answer holds for the life of the process.
+# Memory Integrity cannot change without a reboot, so one answer holds.
 _hvci_state = None
 
 
@@ -60,15 +56,8 @@ def _query_memory_integrity():
 def memory_integrity_state():
     """Whether Windows Memory Integrity is running, and whether it is configured.
 
-    Returns ``(running, configured)``. The two differ across a pending reboot,
-    and that difference is the point of checking: turning Memory Integrity off
-    leaves it *configured off but still running* until the machine restarts, so
-    a user who has just flipped the switch still sees the driver refused. The
-    policy registry key reports only the configured value and would suggest the
-    problem was solved while it very much is not.
-
-    The query is bounded and cached: it is only ever used to explain a failure,
-    so it must not become one.
+    Returns ``(running, configured)``; they differ across a pending reboot,
+    which is exactly the case where the driver is still refused.
     """
     global _hvci_state
     if _hvci_state is not None:
@@ -92,8 +81,8 @@ def memory_integrity_state():
         _hvci_state = result["state"]
         return _hvci_state
 
-    # The query hung or failed. Fall back to the configured value from the
-    # registry, which is instant, and do not claim to know the running state.
+    # Query hung or failed: fall back to the registry's configured value
+    # and do not claim to know the running state.
     configured = _memory_integrity_configured_in_registry()
     _hvci_state = (configured, configured)
     return _hvci_state
@@ -121,10 +110,8 @@ def _memory_integrity_configured_in_registry() -> bool:
 def driver_failure_hint() -> str:
     """What this machine's configuration adds to a driver that would not start.
 
-    Only the observation belongs here -- what it means and what to do about it
-    live in the shared issue catalogue, so the Monitor and the Configurator word
-    it identically and a change needs editing in one place. The text is what the
-    catalogue matches on.
+    Only the observation: the remedy lives in the shared issue catalogue, which
+    matches on this text.
     """
     running, configured = memory_integrity_state()
     if not running:
@@ -133,8 +120,7 @@ def driver_failure_hint() -> str:
     if configured:
         return " Memory Integrity is enabled on this machine."
 
-    # Switched off but still live until the next boot: a genuinely different
-    # situation, because the remedy is a restart rather than a settings change.
+    # Off but live until the next boot: the remedy is a restart.
     return (
         " Memory Integrity is switched off but still running until this "
         "machine is restarted."
@@ -173,10 +159,8 @@ def _model_from_name(*candidates):
 def _com_module():
     """The pythoncom module, or None when pywin32 is unavailable.
 
-    Imported plainly rather than through importlib: PyInstaller cannot follow a
-    dynamic import, so the frozen build would ship without pythoncom, COM would
-    go uninitialised on worker threads, and every WMI query -- and therefore all
-    BIOPAC discovery -- would fail there.
+    Imported plainly, not via importlib: PyInstaller cannot follow a dynamic
+    import and the frozen build would ship without it.
     """
     try:
         import pythoncom
@@ -210,9 +194,7 @@ def _discover_devices_list():
     coinit = False
     pythoncom = None
     try:
-        # Try to initialise COM for this thread so WMI works when called
-        # from worker threads. If pythoncom isn't available, continue and
-        # let wmi raise a helpful error.
+        # COM must be initialised per thread for WMI to work.
         pythoncom = _com_module()
         if pythoncom is not None:
             try:
@@ -248,8 +230,7 @@ def _discover_devices_list():
                     "present": device.Present,
                     "vid": vid,
                     "pid": pid,
-                    # Identifying details for the Configurator's device list,
-                    # which previously had nothing to show but "S/N Unknown".
+                    # Identifying details for the Configurator's device list.
                     "serial": _usb_serial_from_device_id(device.DeviceID),
                     "model": _model_from_name(name, device.Description),
                 }
@@ -273,10 +254,8 @@ def _discover_devices_list():
         logging.getLogger(__name__).error("Unable to discover BIOPAC devices: %s", e)
 
     finally:
-        # Uninitialize pythoncom if we initialized it here. A return statement
-        # does not belong in this block: it would discard whatever exception was
-        # in flight, so a genuine WMI or COM failure would look like "no BIOPAC
-        # devices attached" with nothing logged anywhere.
+        # No return in this block: it would swallow an in-flight exception
+        # and turn a COM failure into "no devices attached".
         if coinit and pythoncom is not None:
             try:
                 if hasattr(pythoncom, "CoUninitialize"):
@@ -372,10 +351,8 @@ def connect_biopac_device(
         c_int(device_code), c_int(connection_code), port_bytes
     )
     if BIOPAC_CONNECTION_CODES.get(result_code, None) != "MPSUCCESS":
-        # Raised as-is. Machine-level context (is Memory Integrity blocking the
-        # driver?) is added by the server when it records the failure: this code
-        # runs inside the backend subprocess, where that query has been seen to
-        # hang, and a stalled initialization is worse than a thinner message.
+        # Machine-level context is added by the server: the queries involved
+        # have been seen to hang inside a backend subprocess.
         raise Exception(f"BIOPAC connection failed: {describe_biopac_code(result_code)}")
 
 
@@ -399,18 +376,9 @@ def configure_biopac_device(mpdev_handler, channels, sample_rate):
 def start_acq_daemon(mpdev_handler) -> bool:
     """Start mpdev's acquisition daemon, which backs ``receiveMPData``.
 
-    The daemon is a thread inside the DLL that continuously downloads and caches
-    samples from the MP unit; ``receiveMPData`` then hands them back in order, at
-    the hardware's pace. Without it the only way to read data is
-    ``getMostRecentSample``, one driver round-trip per sample, which cannot keep
-    up with a kHz sample rate from Python.
-
-    mpdev requires this to be called *before* ``startAcquisition``, and the two
-    transfer styles must not be mixed within one acquisition.
-
-    Returns True when the daemon is running, False when this DLL has no
-    ``startMPAcqDaemon`` at all. Raises if the call is made and fails, so the
-    caller can fall back to polling rather than reading from a dead daemon.
+    Must be called before ``startAcquisition``. Returns True when the daemon is
+    running, False when this DLL has no ``startMPAcqDaemon``, and raises when
+    the call is made and fails. See bioview-docs/reference/biopac.md.
     """
     start = getattr(mpdev_handler, "startMPAcqDaemon", None)
     if start is None:
@@ -459,14 +427,6 @@ def disconnect_biopac_device(mpdev_handler):
             None,
         ):
             raise Exception(f"BIOPAC Disconnect Failed with Error Code: {result_code}")
-
-
-def wrap_result_code(result, stage=""):
-    result_code = BIOPAC_CONNECTION_CODES.get(result, "INVALID_CODE")
-    if result_code == "MPSUCCESS":
-        return True
-    else:
-        raise Exception(f"{stage} Failure - {result_code}")
 
 
 def get_mpdev_path():

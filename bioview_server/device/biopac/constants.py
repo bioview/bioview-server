@@ -46,11 +46,7 @@ BIOPAC_CODE_EXPLANATIONS = {
 
 
 def describe_biopac_code(result_code) -> str:
-    """A readable description of an mpdev result code.
-
-    Renders as e.g. "MPDRVERR (code 2): the MP device driver did not respond..."
-    so a failure explains itself instead of surfacing a bare number.
-    """
+    """A readable description of an mpdev result code."""
     name = BIOPAC_CONNECTION_CODES.get(result_code)
     if name is None:
         return f"unknown error (code {result_code})"

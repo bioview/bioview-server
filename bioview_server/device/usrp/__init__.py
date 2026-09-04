@@ -4,9 +4,8 @@ Heavy dependencies (UHD) are loaded lazily so other backends (e.g. dummy RF
 simulation) can import ``process`` without requiring USRP drivers.
 """
 
-#: Properties the Configurator may edit on a USRP, as {name: field spec}.
-#: An empty mapping (see the other backends) means "not editable", which is what
-#: greys out the Edit button for that device.
+# Properties the Configurator may edit, as {name: field spec}. An empty
+# mapping means "not editable" and greys out the Edit button.
 EDITABLE_PROPERTIES = {
     "device_name": {
         "type": "text",
@@ -21,10 +20,8 @@ EDITABLE_PROPERTIES = {
 def set_device_config(device_info: dict, new_config: dict, logger=None):
     """Apply Configurator edits to one device. Returns ``(ok, message)``.
 
-    The name is stored as a BioView-side alias keyed on the radio's serial, not
-    written to the radio's EEPROM. That keeps renaming safe and reversible; the
-    alias is applied during discovery, so configuration files and the channel
-    map see the chosen name with nothing downstream aware an alias exists.
+    Names are BioView-side aliases keyed on serial, applied during discovery;
+    no EEPROM is written. See bioview-docs/reference/usrp.md.
     """
     from .naming import get_device_aliases, set_device_alias, update_usrp_address
 
@@ -50,9 +47,8 @@ def set_device_config(device_info: dict, new_config: dict, logger=None):
 
     update_usrp_address(new_name, serial, logger=logger)
 
-    # uhd.find results are cached for a few seconds, and the alias is overlaid
-    # while building them -- without dropping that cache the very next listing
-    # would still report the old name and the rename would look like it failed.
+    # The alias is overlaid while building the uhd.find cache, so the cache
+    # has to be dropped for a rename to show up.
     try:
         from .utils import invalidate_discovery_cache
 

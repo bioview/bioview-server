@@ -1,13 +1,12 @@
 """
 Ref: uhd examples
 """
+import threading
 import time
 from datetime import datetime, timedelta
-from typing import Dict, List
 
-import numpy as np
 import uhd
-from bioview_common import DISCOVERY_CACHE_TTL, DataSource, DeviceType, log_print
+from bioview_common import DISCOVERY_CACHE_TTL, DeviceType, log_print
 
 # Name/serial bookkeeping lives in naming.py so it stays importable (and
 # testable) without the UHD driver.
@@ -31,27 +30,31 @@ if not hasattr(uhd, "usrp"):
 
 CLOCK_TIMEOUT = 1000  # 1000ms timeout for external clock locking
 
-_discovery_cache: Dict[str, dict] = {}
+_discovery_cache: dict[str, dict] = {}
 _discovery_cache_ts = 0.0
+
+# ``uhd.find()`` is not safe to call concurrently: overlapping calls have
+# taken the process down. The lock also makes the cache read/refresh atomic.
+_discovery_lock = threading.Lock()
 
 
 def invalidate_discovery_cache():
     """Clear cached UHD discovery results (e.g. after a device is unplugged)."""
     global _discovery_cache_ts
-    _discovery_cache.clear()
-    _discovery_cache_ts = 0.0
+    with _discovery_lock:
+        _discovery_cache.clear()
+        _discovery_cache_ts = 0.0
 
 
 def discover_devices(logger=None, use_cache: bool = True):
-    """
-    Devices discovered using uhd.find contain the following keys -
-    - 'type': eg. b200
-    - 'name': eg. MyB210
-    - 'serial'
-    - 'product': 'B210'
+    """Wrap a ``uhd.find`` result (type, name, serial, product) into a payload."""
+    global _discovery_cache_ts
 
-    These props are wrapped into an appropriate payload
-    """
+    with _discovery_lock:
+        return _discover_devices_locked(logger, use_cache)
+
+
+def _discover_devices_locked(logger, use_cache):
     global _discovery_cache_ts
 
     if (
@@ -89,77 +92,6 @@ def discover_devices(logger=None, use_cache: bool = True):
         log_print(logger, "error", f"Error occured in UHD device discovery: {e}")
 
     return discovered_devices
-
-
-def _check_pairing(r_idx, t_idx, rx_cumsum, tx_cumsum, pair_list):
-    fn = lambda x, y: (np.where(x - y < 0))[0][0]  # noqa: E731
-    rx_dev = fn(r_idx, rx_cumsum)
-    tx_dev = fn(t_idx, tx_cumsum)
-
-    return (
-        ((rx_dev, tx_dev) in pair_list)
-        or ((tx_dev, rx_dev) in pair_list)
-        or rx_dev == tx_dev
-    )
-
-
-def get_channel_map(
-    group_id,
-    n_devices: int,
-    rx_per_dev: List,
-    tx_per_dev: List,
-    balance: bool = False,
-    multi_pairs: List = None,
-):
-    """
-    Provide base implementations of channel mappings for the following use-cases
-    [1] MIMO
-    [2] DPIC
-    [3] Multi-Frequency
-    These two modifications are on top of the multi-band pairing
-    """
-    data_sources = set()
-
-    rx_cumsum = np.cumsum(rx_per_dev)
-    tx_cumsum = np.cumsum(tx_per_dev)
-
-    num_rxs = rx_cumsum[-1]
-    num_txs = tx_cumsum[-1]
-
-    if balance:
-        rx_enabled = [r % 2 == 0 for r in range(2 * n_devices)]
-        tx_enabled = [r % 2 == 0 for r in range(2 * n_devices)]
-    else:
-        rx_enabled = [True for _ in range(num_rxs)]
-        tx_enabled = [True for _ in range(num_txs)]
-
-    rx_ctr = 1
-    ch_ctr = 0
-
-    for r_idx, rx_state in enumerate(rx_enabled):
-        if not rx_state:
-            continue
-
-        tx_ctr = 1
-        for t_idx, tx_state in enumerate(tx_enabled):
-            if not tx_state:
-                continue
-
-            if multi_pairs is None or _check_pairing(
-                r_idx, t_idx, rx_cumsum, tx_cumsum, multi_pairs
-            ):
-                label = f"Tx{tx_ctr}Rx{rx_ctr}"
-                source = DataSource(group_id=group_id, channel=ch_ctr, label=label)
-                source.tx_idx = t_idx
-                source.rx_idx = r_idx
-                data_sources.add(source)
-                ch_ctr += 1
-
-            tx_ctr += 1
-
-        rx_ctr += 1
-
-    return data_sources
 
 
 def setup_pps(usrp, pps, num_mboards, logger=None):

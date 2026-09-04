@@ -11,7 +11,19 @@ requires-python = ">=3.12, <3.14"
 dependencies = [
     "pygame (>=2.6.1,<3.0.0)",
     "h5py (>=3.14.0,<4.0.0)",
-    "scipy (>=1.16.1,<2.0.0)",
+    # Imported directly by the device backends and the recorder; previously only
+    # a dev dependency, so a real install got whatever numpy scipy dragged in.
+    #
+    # Capped below 2 because the UHD Python bindings (uhd 4.10.0.0, the newest
+    # release) are built against the NumPy 1.x ABI and declare "numpy>=1.11,<2.0"
+    # themselves. Under NumPy 2 the transmit and receive workers deadlock on
+    # pybind11's lazy NumPy C-API import, with the GIL held, and the USRP never
+    # answers START_STREAMING. See _warm_numpy_c_api() in device/usrp/backend.py,
+    # which makes the bring-up robust but does not make the ABI mismatch safe.
+    "numpy (>=1.26,<2)",
+    # scipy 1.18 requires numpy>=2.0.0; 1.17.x is the newest series compatible
+    # with the cap above.
+    "scipy (>=1.16.1,<1.18)",
     # BIOPAC discovery enumerates USB devices through WMI. It was an opt-in
     # extra, so a normal install left the whole BIOPAC backend unavailable and
     # attached hardware simply never showed up.
@@ -37,9 +49,12 @@ build-backend = "poetry.core.masonry.api"
 
 [tool.poetry.group.dev.dependencies]
 pre-commit = "^4.2.0"
-ruff = "^0.12.8"
-pytest = "^8.4.1"
-numpy = ">=1.26"
+# Floors, not carets: the carets here capped ruff at <0.13 and pytest at <9
+# while the environment ran 0.16 and 9.x, so the declarations described nothing.
+ruff = ">=0.12.8"
+pytest = ">=8.4.1"
+# numpy is a runtime dependency now (see [project] dependencies); it is not
+# repeated here, so the <2 cap cannot be contradicted from the dev group.
 
 [tool.pytest.ini_options]
 minversion = "6.0"
@@ -49,7 +64,7 @@ python_functions = ["test_*"]
 
 [tool.ruff]
 line-length = 89
-target-version = "py38"
+target-version = "py312"
 extend-exclude = [
     ".git",
     "__pycache__",

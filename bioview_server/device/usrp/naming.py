@@ -1,18 +1,7 @@
-"""USRP name/serial bookkeeping.
+"""USRP name/serial bookkeeping. Free of any UHD import, deliberately.
 
-Deliberately free of any UHD import: assigning a device name is pure filesystem
-work, and the Configurator must be able to do it (and be tested) on a machine
-where the driver is missing.
-
-Two caches:
-
-``usrp_serial_numbers``   name   -> serial. Used by ``resolve_device_serial`` to
-                          turn the name in a configuration file into something
-                          ``uhd.find`` can address.
-``usrp_device_aliases``   serial -> user-assigned name. ``uhd.find`` reports the
-                          radio's EEPROM name; BioView layers a chosen name on
-                          top of it at discovery, so nothing downstream needs to
-                          know an alias was involved and no EEPROM is written.
+``usrp_serial_numbers`` maps name -> serial; ``usrp_device_aliases`` maps
+serial -> user-assigned name. See bioview-docs/reference/usrp.md.
 """
 
 from __future__ import annotations

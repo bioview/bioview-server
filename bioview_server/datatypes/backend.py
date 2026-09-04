@@ -1,47 +1,14 @@
-"""
-A common spec shared by all device specific Backend subclasses, in order to provide
-a semblance of sanity for every future stage of the codebase. While each device
-will have their own specific implementation, every backend is expected to provide a
-shared set of functionality, listed below.
-
-Queues:
-- Display Data Queue:
-- Response Queue:
-
-
-Functions:
-1. Device Control
-- initialize()
-- queue_param_update()
-- start_streaming()
-- stop_streaming()
-- disconnect()
-
-2. Parameter Handling
-- get_param()
-- set_param()
-
-
-Signals:
-- data_ready(DATA)
-
-
-Properties:
-- group_id: str
-- status: DeviceStatus
-- enable_save: bool
-- save_path: str
-"""
 import logging
 import multiprocessing as mp
 import queue
-from typing import Dict, Set
+import time
 
 from bioview_common import (
     DATA_OUTPUT_QUEUE_DEPTH,
     DISPLAY_QUEUE_DEPTH,
     SAVE_QUEUE_DEPTH,
     DataSource,
+    DeviceError,
     DeviceStatus,
     IPCCommand,
     Response,
@@ -52,17 +19,76 @@ from bioview_common import (
 from bioview_server.common import DisplayWorker, SaveWorker
 
 
+# Opening a radio is the slow step: USB enumeration, FPGA/CODEC bring-up and
+# clock locking, plus an OS process spawn per backend on Windows.
+CONNECT_TIMEOUT = 150
+
+# Starting a stream, by contrast, is near-instant once the device is open: every
+# worker thread already exists and is merely resumed, so the whole path is a few
+# Event.set() calls plus a sub-second buffer-filling delay. Measured bring-up is
+# ~0.4 s for a two-channel USRP and ~0.02 s for BIOPAC. A device that has not
+# answered in several seconds is wedged, not slow, and waiting longer only
+# delays the error -- and, because devices are started in sequence, holds up
+# every other device in the session behind it.
+START_STREAMING_TIMEOUT = 5
+# Stopping has real work to do: the transmit worker sends a final end-of-burst
+# buffer and the recorder flushes and closes its HDF5 file.
+STOP_STREAMING_TIMEOUT = 15
+DISCONNECT_TIMEOUT = 15
+DEFAULT_TIMEOUT = 10
+
+
+class _StepTimer:
+    """Traces a multi-step bring-up so a hang names the step it hung on.
+
+    Each step is logged when it *finishes*, so the last line in the log is the
+    last thing that completed and the hang is in whatever comes next. Elapsed
+    time is per-step; a step that is merely slow is then distinguishable from
+    one that never returned.
+    """
+
+    def __init__(self, logger, what: str):
+        self.logger = logger
+        self.what = what
+        self.started = time.monotonic()
+        self.last = self.started
+        log_print(self.logger, "debug", f"[{what}] begin")
+
+    def mark(self, step: str):
+        now = time.monotonic()
+        log_print(
+            self.logger,
+            "debug",
+            f"[{self.what}] {step} ok ({(now - self.last) * 1000:.0f} ms)",
+        )
+        self.last = now
+
+    def done(self):
+        elapsed_ms = (time.monotonic() - self.started) * 1000
+        log_print(
+            self.logger,
+            "debug",
+            f"[{self.what}] complete ({elapsed_ms:.0f} ms)",
+        )
+
+
 class Backend(mp.Process):
+    """Common contract shared by every device-specific backend.
+
+    Each backend runs as its own process, driven over ``command_queue``; replies
+    come back on ``response_queue``, correlated by request id.
+    """
+
     def __init__(
         self,
         group_id: str,
-        response_queue: mp.Queue,
+        response_queue: mp.Queue = None,
         data_output_queue: mp.Queue = None,
     ):
         super().__init__()
         # Parameters
         self.group_id = group_id
-        self.data_sources: Set[DataSource] = set()
+        self.data_sources: set[DataSource] = set()
 
         # Queues
         self.command_queue = mp.Queue()
@@ -72,7 +98,11 @@ class Backend(mp.Process):
         self.display_queue = mp.Queue(maxsize=DISPLAY_QUEUE_DEPTH)
 
         self.data_output_queue = data_output_queue
-        self.response_queue = response_queue  # Queue for responses to client commands
+        # Never shared between backends: a reply carries no sender, so two
+        # devices reading one queue steal each other's answers.
+        self.response_queue = (
+            response_queue if response_queue is not None else mp.Queue()
+        )
 
         self.enable_save = False
 
@@ -84,13 +114,13 @@ class Backend(mp.Process):
         self.status = DeviceStatus.DISCONNECTED
         self._running = mp.Event()
         self._streaming = mp.Event()
+        self._request_id = 0
 
-    # Internal Implementations
+    #: Step tracer for bring-up paths; see _StepTimer.
+    _StepTimer = _StepTimer
+
     # Common setup
-    def _setup_saving(self, save_config: Dict = None):
-        """
-        Sets up workers to save data in a common format
-        """
+    def _setup_saving(self, save_config: dict = None):
         self.enable_save = save_config.get("enable_save", False)
         self.save_path = save_config.get("save_path", None)
 
@@ -100,6 +130,10 @@ class Backend(mp.Process):
             drain(self.save_queue)
 
         if self.enable_save and self.save_path:
+            # Stop the previous recorder before replacing it, or its thread stays
+            # alive holding an unflushed HDF5 file open.
+            if self.save_worker is not None:
+                self.save_worker.stop()
             self.save_worker = SaveWorker(
                 save_path=self.save_path,
                 data_queue=self.save_queue,
@@ -107,29 +141,40 @@ class Backend(mp.Process):
                 logger=self.logger,
             )
 
-        # Any other specific functionality can be implemented by subclasses
-
     def stop_saving(self):
         if self.save_worker:
             self.save_worker.stop()
 
-        # Drain, not a single get: the old code removed exactly one item and
-        # left the rest queued for the next session.
         drain(self.save_queue)
 
-    def _setup_display(self, display_config: Dict = None):
+    def _display_sources(self):
+        """Rows this device emits, in the order the display payload carries them.
+
+        Overridden where the emitted rows are not simply ``data_sources`` -- the
+        USRP appends calibration-reference rows.
         """
-        Sets up workers to save data in a common format
-        """
+        return list(self.data_sources)
+
+    def _setup_display(self, display_config: dict = None):
         if not self.data_output_queue:
             self.data_output_queue = mp.Queue(maxsize=DATA_OUTPUT_QUEUE_DEPTH)
-        else:
-            drain(self.data_output_queue)
+        # The output queue is deliberately *not* drained here. The server hands
+        # the same queue to every backend, so draining it on one device's Start
+        # discards the chunks another device has already queued -- data loss
+        # that only shows up once two devices stream together. It is bounded and
+        # evicted oldest-first anyway, and the server's data handler drains it
+        # continuously, so nothing stale can accumulate.
 
-        # The client receives the full stream (so it can save everything) and then
-        # decides which sources to plot. Therefore we forward all data sources.
+        # The client receives the full stream and decides what to plot, so all
+        # sources are forwarded. The worker is reused across Start/Stop cycles:
+        # replacing it leaks the old thread, which stays alive on the same
+        # input queue.
+        if self.display_worker is not None:
+            self.display_worker.set_display_sources(self._display_sources())
+            return
+
         self.display_worker = DisplayWorker(
-            display_sources=list(self.data_sources),
+            display_sources=self._display_sources(),
             data_input_queue=self.display_queue,
             data_output_queue=self.data_output_queue,
             logger=self.logger,
@@ -141,28 +186,17 @@ class Backend(mp.Process):
 
         drain(self.display_queue)
 
-    # Device Control
+    # Device control, implemented per device
     def _initialize(self):
         raise NotImplementedError
 
     def _queue_param_update(self):
-        """
-        Backends that implement this function will be able to handle
-        real-time update of parameters by implementing multiprocessing
-        queues internally
-        """
         raise NotImplementedError
 
     def populate_data_sources(self):
         raise NotImplementedError
 
     def get_data_sources(self):
-        """
-        Broadcasts available data sources to server handler which can
-        then choose to enable/disable on a per-device basis, as specified
-        by the client handler. Since the handler only needs to know labels,
-        we can deal accordingly.
-        """
         return self.data_sources
 
     def _start_streaming(self):
@@ -174,24 +208,20 @@ class Backend(mp.Process):
     def _disconnect(self):
         raise NotImplementedError
 
-    # Parameter handling
-    def get_param(self, param, default_value):
-        try:
-            value = getattr(self, param)
-        except AttributeError:
-            value = default_value
-        return value
+    def _run_dpic_balance(self):
+        """Overridden by the USRP backend."""
+        return None
 
-    def set_param(self, param, value):
-        current_type = type(getattr(self, param, None))
-        if current_type is not None:
-            setattr(self, param, current_type(value))
-        else:
-            setattr(self, param, value)
+    def _post_start_streaming(self):
+        """Hook for work that must run after START_STREAMING has been answered."""
+        return None
 
-    # Handle multiprocessing
+    def _apply_param_update_local(self, params: dict):
+        """Parent-side mirror of the parameters that change ``data_sources``."""
+        return None
+
+    # Child process
     def run(self):
-        # Create a new logger
         self.logger = logging.getLogger(__name__)
         logging.basicConfig(
             level=logging.DEBUG,
@@ -201,10 +231,8 @@ class Backend(mp.Process):
 
         self._running.set()
 
-        # Start thread to handle display
         while self._running.is_set():
             try:
-                # Process commands from parent
                 cmd_data = self.command_queue.get(timeout=1)
                 self._handle_command(cmd_data)
             except queue.Empty:
@@ -212,9 +240,14 @@ class Backend(mp.Process):
             except Exception as e:
                 self.logger.error(f"Error in subprocess: {e}")
 
+    def _reply(self, request_id, payload: dict):
+        self.response_queue.put({**payload, "request_id": request_id})
+
     def _handle_command(self, data):
+        cmd = data.get("command")
+        request_id = data.get("request_id")
+
         try:
-            cmd = data["command"]
             cmd_args = data.get("args", {})
 
             match cmd:
@@ -222,42 +255,46 @@ class Backend(mp.Process):
                     result = self._initialize()
                     if not result:
                         raise RuntimeError("Unable to initialize device")
-                    self.response_queue.put({"type": Response.SUCCESS, "result": result})
+                    self._reply(request_id, {"type": Response.SUCCESS, "result": result})
 
                 case IPCCommand.START_STREAMING:
                     cmd_args = cmd_args or {}
                     save_cfg = cmd_args.get("save_config", {}) or {}
                     display_cfg = cmd_args.get("display_config", {}) or {}
+                    step = _StepTimer(self.logger, f"{self.group_id} START_STREAMING")
                     if save_cfg.get("enable_save"):
                         self._setup_saving(save_cfg)
+                        step.mark("saving set up")
                     self._setup_display(display_cfg)
+                    step.mark("display set up")
                     result = self._start_streaming()
-                    self.response_queue.put({"type": Response.SUCCESS, "result": result})
+                    step.mark("device started")
+                    self._reply(request_id, {"type": Response.SUCCESS, "result": result})
+                    step.done()
                     self._streaming.set()
-                    # Anything slow that must happen once streaming is live (an
-                    # auto DPIC balance can run for a minute or more) goes here,
-                    # *after* the response, so start_streaming() never blocks the
-                    # caller past its timeout.
+                    # Slow post-start work (an auto DPIC balance runs for a
+                    # minute or more) goes after the reply, never before it.
                     if result:
                         self._post_start_streaming()
 
                 case IPCCommand.STOP_STREAMING:
                     self._streaming.clear()
                     result = self._stop_streaming()
-                    self.response_queue.put({"type": Response.SUCCESS, "result": result})
+                    self._reply(request_id, {"type": Response.SUCCESS, "result": result})
 
                 case IPCCommand.DISCONNECT_DEVICES:
                     result = self._disconnect()
-                    self.response_queue.put({"type": Response.SUCCESS, "result": result})
+                    self._reply(request_id, {"type": Response.SUCCESS, "result": result})
 
                 case IPCCommand.UPDATE_RUNNING_PARAMETER:
                     self._queue_param_update(cmd_args)
-                    self.response_queue.put({"type": Response.SUCCESS, "result": None})
+                    self._reply(request_id, {"type": Response.SUCCESS, "result": None})
 
                 case IPCCommand.RUN_DPIC_BALANCE:
                     result = self._run_dpic_balance()
-                    self.response_queue.put(
-                        {"type": Response.SUCCESS, "result": result is not None}
+                    self._reply(
+                        request_id,
+                        {"type": Response.SUCCESS, "result": result is not None},
                     )
 
                 case IPCCommand.SHUTDOWN:
@@ -266,75 +303,111 @@ class Backend(mp.Process):
 
         except Exception as e:
             log_print(self.logger, "error", f"Command {cmd} failed: {e}")
-            self.response_queue.put({"type": Response.ERROR, "message": str(e)})
+            self._reply(
+                request_id,
+                {
+                    "type": Response.ERROR,
+                    "message": str(e) or f"{type(e).__name__} in {self.group_id}",
+                },
+            )
 
-    def _run_dpic_balance(self):
-        """Override in USRP backend for DPIC balancing."""
-        return None
+    # Parent-side API
+    @staticmethod
+    def _command_name(command) -> str:
+        return getattr(command, "name", str(command))
 
-    def _post_start_streaming(self):
-        """Hook for work that must run after START_STREAMING has been answered."""
-        return None
+    def _request(self, command, args: dict = None, timeout: float = DEFAULT_TIMEOUT):
+        """Send a command to the child and wait for *its* reply.
 
-    # Public API for non-blocking calls
+        Replies are matched by request id, so a late answer to a request that
+        already timed out is discarded rather than handed to the next caller.
+        """
+        self._request_id += 1
+        request_id = self._request_id
+        self.command_queue.put(
+            {"command": command, "args": args or {}, "request_id": request_id}
+        )
+
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise DeviceError(
+                    f"{self.group_id} did not answer "
+                    f"{self._command_name(command)} within {timeout:.0f}s"
+                )
+            try:
+                response = self.response_queue.get(timeout=min(remaining, 0.25))
+            except queue.Empty:
+                # A child that died -- a native crash inside a driver leaves no
+                # Python traceback -- would otherwise be indistinguishable from
+                # a slow one until the full timeout expired, and would then be
+                # reported as "did not answer", which points at the wrong thing.
+                # Checked only after an empty read, so a reply already queued by
+                # a child that exited straight afterwards is still delivered.
+                if self.pid is not None and not self.is_alive():
+                    raise DeviceError(
+                        f"{self.group_id} backend process exited while handling "
+                        f"{self._command_name(command)} "
+                        f"(exit code {self.exitcode})"
+                    ) from None
+                continue
+
+            if not isinstance(response, dict):
+                continue
+            if response.get("request_id") not in (None, request_id):
+                continue
+            return response
+
+    def _request_or_raise(self, command, args=None, timeout=DEFAULT_TIMEOUT):
+        response = self._request(command, args, timeout)
+        if response.get("type") in (Response.ERROR, Response.ERROR.name):
+            message = response.get("message") or "unknown backend error"
+            raise DeviceError(f"{self.group_id}: {message}")
+        return response
+
     def initialize(self, **kwargs):
-        self.command_queue.put({"command": IPCCommand.CONNECT_DEVICES, "args": kwargs})
-        response = self.response_queue.get(timeout=150)
-        return response
+        return self._request(IPCCommand.CONNECT_DEVICES, kwargs, timeout=CONNECT_TIMEOUT)
 
-    def start_streaming(self, cfg_dict: Dict = None):
-        self.command_queue.put({"command": IPCCommand.START_STREAMING, "args": cfg_dict})
-        response = self.response_queue.get(timeout=10)
-        return response
+    def start_streaming(self, cfg_dict: dict = None):
+        return self._request_or_raise(
+            IPCCommand.START_STREAMING, cfg_dict, timeout=START_STREAMING_TIMEOUT
+        )
 
     def stop_streaming(self):
-        self.command_queue.put({"command": IPCCommand.STOP_STREAMING})
-        response = self.response_queue.get(timeout=10)
-        return response
+        return self._request_or_raise(
+            IPCCommand.STOP_STREAMING, timeout=STOP_STREAMING_TIMEOUT
+        )
 
     def queue_param_update(self, **params):
+        # Fire and forget: applying this can restart the device stream, and the
+        # server must not block its command thread on that.
+        self._request_id += 1
         self.command_queue.put(
-            {"command": IPCCommand.UPDATE_RUNNING_PARAMETER, "args": params}
+            {
+                "command": IPCCommand.UPDATE_RUNNING_PARAMETER,
+                "args": params,
+                "request_id": self._request_id,
+            }
         )
-        # The command above is applied in the child process, which owns its own
-        # copy of this object. get_data_sources() is answered by the *parent*, so
-        # without mirroring the source-affecting parameters here the server would
-        # keep advertising the channel list the device started with.
+        # get_data_sources() is answered by the parent, so source-affecting
+        # parameters have to be mirrored here as well as in the child.
         try:
             self._apply_param_update_local(params)
         except Exception as e:
-            # self.logger only exists inside the child; this runs in the parent.
             log_print(
                 getattr(self, "logger", None),
                 "warning",
                 f"Local param mirror failed: {e}",
             )
 
-    def _apply_param_update_local(self, params: Dict):
-        """Parent-side mirror of the parameters that change ``data_sources``.
-
-        Subclasses whose data sources depend on configuration override this;
-        the default is a no-op because most parameters do not change the set of
-        streams a device produces.
-        """
-        return None
-
     def run_dpic_balance(self, timeout: float = 1800):
-        # A full balance is bounded by (number of pairs) x (search points) x
-        # settle_time_s, which at conservative settings runs into minutes.
-        self.command_queue.put(
-            {
-                "command": IPCCommand.RUN_DPIC_BALANCE,
-                "args": {},
-            }
-        )
-        response = self.response_queue.get(timeout=timeout)
-        return response
+        return self._request(IPCCommand.RUN_DPIC_BALANCE, timeout=timeout)
 
     def disconnect(self):
-        self.command_queue.put({"command": IPCCommand.DISCONNECT_DEVICES})
-        response = self.response_queue.get(timeout=5)
-        return response
+        return self._request_or_raise(
+            IPCCommand.DISCONNECT_DEVICES, timeout=DISCONNECT_TIMEOUT
+        )
 
     def shutdown(self):
         self.command_queue.put({"command": IPCCommand.SHUTDOWN})

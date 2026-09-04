@@ -62,9 +62,8 @@ class MimoChannelModel:
             s_meas = tx_waveforms[measure_tx]
             rx[measure_rx] += self.direct_leak * s_meas
 
-            # Scale the inject Tx's own samples, not the measure Tx's: using
-            # the latter would hide that an inject Tx on a different IF cannot
-            # cancel anything once the Rx band-pass is applied.
+            # The inject Tx's own samples: using the measure Tx's would hide
+            # that a different IF cannot cancel once band-passed.
             if inject_tx >= tx_waveforms.shape[0]:
                 continue
             rx[measure_rx] += (self.dpic_coupling * tx_waveforms[inject_tx]).astype(

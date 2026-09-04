@@ -13,31 +13,18 @@ from .utils import daemon_last_error
 #: mpdev's MPSUCCESS. Every mpdev entry point returns one of these codes.
 MPSUCCESS = 1
 
-#: How far behind real time the polling fallback may drift before it says so.
-#: The plot's x-axis is drawn from the *nominal* sample rate, so a worker that
-#: only manages half the requested rate makes the trace scroll at half speed --
-#: silently, unless we measure it.
+# How far behind real time the polling fallback may drift before saying so;
+# the plot's x-axis assumes the nominal rate.
 _LAG_WARN_RATIO = 0.9
 _LAG_WARN_INTERVAL_S = 5.0
 
 
 class BiopacAcquisitionWorker(PausableWorker):
-    """Read samples from mpdev and emit (num_channels, num_samples) numpy chunks.
+    """Read samples from mpdev and emit (num_channels, num_samples) chunks.
 
-    Two strategies, picked at construction:
-
-    * ``receiveMPData`` -- the buffered stream read. It blocks until the MP unit
-      has produced the requested number of points and returns them *in order*,
-      so the emitted timeline matches the hardware clock exactly and one DLL
-      call covers a whole chunk.
-    * ``getMostRecentSample`` -- a per-sample poll, used only when the DLL does
-      not export ``receiveMPData``. This asks the device for whatever value it
-      happens to be holding, so it neither paces itself nor guarantees distinct
-      consecutive samples: the loop has to hit the sample rate on its own, and
-      at 1 kHz a Python loop plus a driver round-trip per sample often cannot.
-      Falling short does not look like dropped data -- it looks like a plot that
-      scrolls slowly, because the samples that do arrive are stretched over the
-      x-axis of the rate we asked for.
+    Uses the buffered ``receiveMPData`` stream read where available, and falls
+    back to per-sample ``getMostRecentSample`` polling otherwise. See
+    bioview-docs/reference/biopac.md for the trade-off between them.
     """
 
     def __init__(
@@ -61,17 +48,13 @@ class BiopacAcquisitionWorker(PausableWorker):
         self.channel_count = len(channels)
         self._period_s = 1.0 / self.samp_rate
 
-        # Bulk read, when the DLL offers it *and* the caller managed to start
-        # the acquisition daemon that feeds it. receiveMPData returns nothing
-        # without that daemon, so the flag is the caller's to set.
+        # Bulk read: receiveMPData returns nothing without the acquisition
+        # daemon, so the caller sets this flag.
         self._receive = getattr(mpdev_handler, "receiveMPData", None)
         if use_stream is False:
             self._receive = None
-        # mpdev counts *values*, not samples: the buffer comes back with the
-        # enabled channels interleaved. The allocation carries a factor of
-        # channel_count more room than the request needs, so that a DLL which
-        # (contrary to the header) reads the count as samples-per-channel
-        # overruns nothing.
+        # mpdev counts values, not samples, and interleaves channels. The
+        # extra room guards a DLL that reads the count as samples-per-channel.
         self._values_per_chunk = self.chunk_size * self.channel_count
         self._stream_buffer = (
             (c_double * (self._values_per_chunk * self.channel_count))()
@@ -123,10 +106,8 @@ class BiopacAcquisitionWorker(PausableWorker):
         flat = np.frombuffer(
             self._stream_buffer, dtype=np.float64, count=samples * self.channel_count
         )
-        # Interleaved (sample-major) -> one row per channel, contiguous. np.array
-        # copies unconditionally, which is required here: the source is the
-        # ctypes buffer the next call overwrites. (ascontiguousarray would not
-        # copy for a single channel, where the transpose is already C-order.)
+        # np.array copies unconditionally, which is required: the source is
+        # the ctypes buffer the next call overwrites.
         rows = flat.reshape(samples, self.channel_count).T
         self._emit(np.array(rows, dtype=np.float64, order="C"))
 

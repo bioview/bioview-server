@@ -1,5 +1,4 @@
 import queue
-from typing import List
 
 import numpy as np
 import uhd
@@ -15,8 +14,8 @@ class ReceiveWorker(PausableWorker):
     def __init__(
         self,
         usrp,
-        rx_gain: List[float],
-        rx_channels: List[int],
+        rx_gain: list[float],
+        rx_channels: list[int],
         rx_streamer,
         rx_queue: queue.Queue,
         cmd_queue: queue.Queue,
@@ -140,9 +139,7 @@ class ReceiveWorker(PausableWorker):
                     )
             elif rx_metadata.error_code == uhd.types.RXMetadataErrorCode.overflow:
                 had_an_overflow = True
-                # Need to make sure that last_overflow is a new TimeSpec object, not
-                # a reference to metadata.time_spec, or it would not be useful
-                # further up.
+                # A new TimeSpec, not a reference to metadata.time_spec.
                 last_overflow = uhd.types.TimeSpec(
                     rx_metadata.time_spec.get_full_secs(),
                     rx_metadata.time_spec.get_frac_secs(),
@@ -180,9 +177,8 @@ class ReceiveWorker(PausableWorker):
 
             total_samps_received += num_rx_samps
 
-            # Copy so the next recv() cannot overwrite queued samples.
-            # Blocking here would stall recv() and turn a processing backlog
-            # into a UHD overflow, so wait briefly and then drop.
+            # Copied so the next recv() cannot overwrite queued samples.
+            # Blocking here would turn a backlog into a UHD overflow.
             if not put_or_drop(
                 self.rx_queue, recv_buffer.copy(), timeout=QUEUE_PUT_TIMEOUT_S
             ):

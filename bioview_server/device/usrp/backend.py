@@ -3,14 +3,45 @@ import multiprocessing as mp
 import os
 import queue
 import time
-from typing import Dict
 
 
 os.environ["UHD_LOG_LEVEL"] = "error"
 
 import uhd
+
+
+def _warm_numpy_c_api():
+    """Load NumPy's C-API modules here, on the main thread, before any worker runs.
+
+    ``libpyuhd`` is a pybind11 module built against NumPy 1.x, and pybind11
+    bootstraps the NumPy C-API *lazily* -- the first ``tx_streamer.send()`` or
+    ``rx_streamer.recv()`` in the process runs ``import numpy.core.multiarray``
+    from inside the extension, with the GIL held.
+
+    Under NumPy 1.x that import is a ``sys.modules`` hit and costs nothing.
+    Under NumPy 2 ``numpy.core`` is a compatibility shim that is *not* loaded by
+    ``import numpy``, so the import machinery genuinely runs -- and
+    ``_start_streaming`` resumes the transmit and receive workers in the same
+    instant, so two threads enter that first import together, from inside a C
+    extension. They deadlock on the import lock without ever dropping the GIL,
+    which freezes the whole backend process: ``_start_streaming`` never returns,
+    START_STREAMING is never answered, and the server times the device out.
+
+    Importing the modules up front leaves pybind11's lazy import as a plain
+    ``sys.modules`` lookup, so no worker thread ever enters the import machinery.
+    """
+    import contextlib
+    import importlib
+
+    for name in ("numpy.core.multiarray", "numpy.core.umath"):
+        # NumPy 3 may drop the shim entirely; by then the bindings that needed
+        # it are gone too, and there is nothing left to warm up.
+        with contextlib.suppress(Exception):
+            importlib.import_module(name)
+
+
+_warm_numpy_c_api()
 from bioview_common import (
-    DATA_OUTPUT_QUEUE_DEPTH,
     RX_QUEUE_DEPTH,
     DataSource,
     DeviceStatus,
@@ -142,7 +173,7 @@ class USRPBackend(Backend):
         self,
         group_id: str,
         samp_rate: int,
-        devices: Dict,
+        devices: dict,
         group_config: dict,
         response_queue: mp.Queue,
         data_output_queue: mp.Queue = None,
@@ -151,7 +182,7 @@ class USRPBackend(Backend):
         save_ds: int = 10,
         save_iq: bool = False,
         save_imaginary: bool = True,
-        discovered_devices: Dict = None,
+        discovered_devices: dict = None,
     ):
         super().__init__(
             group_id=group_id,
@@ -174,6 +205,9 @@ class USRPBackend(Backend):
         self.tx_command_queue = {}
         self.receive_workers = {}
         self.rx_command_queue = {}
+        # Built by _initialize(); _display_sources() already reads it as
+        # possibly-None, so it must exist before the device is connected.
+        self.process_worker = None
         self.schemes_by_device = {}
         self.global_tx_to_device = {}
         self.global_tx_offsets = {}
@@ -183,7 +217,6 @@ class USRPBackend(Backend):
         self.cal_ref_sources = []
         self.registry = None
         self.rx_device_order = []
-        self._cal_enabled_at_start = False
         self._cal_enabled = False
         self.global_rx_to_device = {}
         self.rx_gains_global = []
@@ -230,8 +263,7 @@ class USRPBackend(Backend):
         self.if_filter_bw = list(self.registry.tx_filter_bw)
 
         cal_cfg = self.group_config.get("calibration", {})
-        self._cal_enabled_at_start = bool(cal_cfg.get("enabled", False))
-        self._cal_enabled = self._cal_enabled_at_start
+        self._cal_enabled = bool(cal_cfg.get("enabled", False))
         self.cal_ref_sources = []
         if cal_cfg.get("record_reference", True):
             inject = cal_cfg.get("inject_channels", [0])
@@ -320,9 +352,8 @@ class USRPBackend(Backend):
                     )
 
                 self.usrp_handlers[device_name] = response["usrp"]
-                # Bounded: this queue used to grow without limit whenever the
-                # ProcessWorker was slow or (before the start-order fix) not
-                # yet running at all.
+                # Bounded: an unbounded queue grows without limit whenever the
+                # ProcessWorker falls behind.
                 self.rx_data_queue[device_name] = queue.Queue(maxsize=RX_QUEUE_DEPTH)
                 self.rx_command_queue[device_name] = queue.Queue()
 
@@ -392,44 +423,84 @@ class USRPBackend(Backend):
         )
         return True
 
-    def _setup_saving(self, save_config: Dict):
+    def _setup_saving(self, save_config: dict):
         super()._setup_saving(save_config)
         self.process_worker.save_imaginary = self.save_imaginary
         self.process_worker.save_iq = self.save_iq
         self.process_worker.save_ds = self.save_ds
         self.process_worker.save_queue = self.save_queue
 
+    def _workers_in_start_order(self):
+        """Every worker thread this device runs, paired with a name for logs."""
+        workers = [
+            (f"transmit worker {name}", worker)
+            for name, worker in self.transmit_workers.items()
+        ]
+        workers += [
+            (f"receive worker {name}", worker)
+            for name, worker in self.receive_workers.items()
+        ]
+        workers += [
+            (label, worker)
+            for label, worker in (
+                ("process worker", self.process_worker),
+                ("save worker", self.save_worker),
+                ("display worker", self.display_worker),
+            )
+            if worker is not None
+        ]
+        return workers
+
     def _start_streaming(self):
+        # Every thread is created before *any* of them is resumed, and the two
+        # halves are not interleaved.
+        #
+        # `Thread.start()` does not return until the new thread has been
+        # scheduled and has run far enough to set its started event, and it
+        # waits for that without a timeout. Starting a thread after the
+        # transmit and receive threads are already spinning inside UHD means
+        # queueing for the GIL behind two tight native loops, and the start
+        # does not complete: the backend never answers START_STREAMING, the
+        # server times out after 90 s and tears down every other device in the
+        # session, so a working BIOPAC plots nothing either.
+        #
+        # Workers are constructed paused (``PausableWorker(running=False)``),
+        # so bringing them all up first costs nothing and leaves `resume()` as
+        # a bare `Event.set()` with no scheduling to wait on. The steps are
+        # traced because a stall here names no line by itself.
+        step = self._StepTimer(self.logger, "start_streaming")
+
+        for label, worker in self._workers_in_start_order():
+            if not worker.is_alive():
+                worker.start()
+            step.mark(f"{label} thread up")
+
+        # Resume order, unlike start order, is load-bearing: the process worker
+        # drains the Rx queues, and DPIC balance has no metrics to read until it
+        # has produced some.
         for worker in self.transmit_workers.values():
-            if not worker.is_alive():
-                worker.start()
             worker.resume()
-
         for worker in self.receive_workers.values():
-            if not worker.is_alive():
-                worker.start()
             worker.resume()
-
-        # Start this before anything else: it drains the Rx queues, and DPIC
-        # balance has no metrics to read until it has produced some.
         if self.process_worker:
-            if not self.process_worker.is_alive():
-                self.process_worker.start()
             self.process_worker.resume()
+        step.mark("radio running")
 
         time.sleep(FILLING_TIME)
+        step.mark("filling delay")
 
-        self._set_calibration_enabled(self._cal_enabled_at_start)
+        # The current calibration state, not the config's start-up value: the
+        # overlay is toggled at runtime and would be reset on every Start.
+        self._set_calibration_enabled(self._cal_enabled)
+        step.mark("calibration state")
 
         if self.save_worker:
-            if not self.save_worker.is_alive():
-                self.save_worker.start()
             self.save_worker.resume()
-
         if self.display_worker:
-            if not self.display_worker.is_alive():
-                self.display_worker.start()
             self.display_worker.resume()
+        step.mark("consumers running")
+
+        step.done()
 
         return True
 
@@ -580,9 +651,8 @@ class USRPBackend(Backend):
 
         dev_name, _ = self.global_tx_to_device[pair.inject_tx]
         worker = self.transmit_workers[dev_name]
-        # Metric freshness timeout: two chunks plus slack. Long enough that a
-        # slow chunk does not read as "no data", short enough that a genuinely
-        # silent path fails fast instead of eating the time budget.
+        # Metric freshness timeout: two chunks plus slack, so a silent path
+        # fails fast without a slow chunk reading as "no data".
         read_timeout = max(1.0, settle_s * 8)
 
         return DpicChannel(
@@ -649,9 +719,8 @@ class USRPBackend(Backend):
         dpic_cfg = self.group_config.get("dpic_balance", {})
         settle_s = float(dpic_cfg.get("settle_time_s", 0.02))
 
-        # The calibration AM overlay modulates the very amplitude the search
-        # minimizes, so it must be off for the duration -- and restored to the
-        # state it was actually in, not to the config's start-up value.
+        # The calibration overlay modulates the amplitude the search minimizes,
+        # so it is disabled for the duration and restored to its actual state.
         prev_cal = self._cal_enabled
         if prev_cal:
             self._set_calibration_enabled(False)
@@ -723,30 +792,33 @@ class USRPBackend(Backend):
     def get_data_sources(self):
         return set(self.mimo_sources) | set(self.cal_ref_sources)
 
-    def _setup_display(self, display_config=None):
-        if not self.data_output_queue:
-            self.data_output_queue = mp.Queue(maxsize=DATA_OUTPUT_QUEUE_DEPTH)
-        else:
-            drain(self.data_output_queue)
+    def _display_sources(self):
+        """Rows the ProcessWorker emits, in channel order.
 
-        from bioview_server.common import DisplayWorker
-
-        self.display_worker = DisplayWorker(
-            display_sources=list(self.mimo_sources),
-            data_input_queue=self.display_queue,
-            data_output_queue=self.data_output_queue,
-            logger=self.logger,
-        )
+        Cal-ref sources are advertised by ``get_data_sources()``, so they must
+        appear in the display payload too or their plots never get a row.
+        """
+        sources = list(self.mimo_sources)
+        if self.process_worker is None or self.process_worker.record_cal_ref:
+            sources += list(self.cal_ref_sources)
+        return sorted(sources, key=lambda s: s.channel)
 
     def _queue_param_update(self, params):
         for param, value in (params or {}).items():
             if param == "calibration.enabled":
                 self._cal_enabled = bool(value)
+                self.group_config.setdefault("calibration", {})[
+                    "enabled"
+                ] = self._cal_enabled
             elif param == "calibration" and isinstance(value, dict):
                 self._cal_enabled = bool(value.get("enabled", self._cal_enabled))
-            elif param == "rx_gain" and isinstance(value, (list, tuple)):
+                self.group_config["calibration"] = dict(value)
+            elif param.startswith("calibration."):
+                key = param.split(".", 1)[1]
+                self.group_config.setdefault("calibration", {})[key] = value
+            elif param == "rx_gain" and isinstance(value, list | tuple):
                 self.rx_gains_global = [float(v) for v in value]
-            elif param == "tx_gain" and isinstance(value, (list, tuple)):
+            elif param == "tx_gain" and isinstance(value, list | tuple):
                 self.tx_gains_global = [float(v) for v in value]
 
             if param in GLOBAL_TX_PARAMS and self.hardware:
@@ -784,7 +856,7 @@ class USRPBackend(Backend):
         return True
 
 
-def build_hardware_dict_from_group(group_config, devices: Dict, group_id: str) -> Dict:
+def build_hardware_dict_from_group(group_config, devices: dict, group_id: str) -> dict:
     """Build hardware dict from group config or legacy devices argument."""
     if group_config.get("hardware"):
         return dict(group_config["hardware"])

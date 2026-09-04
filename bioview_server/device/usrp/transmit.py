@@ -1,5 +1,4 @@
 import queue
-from typing import List
 
 import numpy as np
 import uhd
@@ -29,8 +28,8 @@ class TransmitWorker(PausableWorker):
     def __init__(
         self,
         usrp,
-        tx_gain: List[float],
-        tx_channels: List[int],
+        tx_gain: list[float],
+        tx_channels: list[int],
         samp_rate: int,
         tx_streamer,
         scheme: SignalScheme,
@@ -102,11 +101,10 @@ class TransmitWorker(PausableWorker):
             self.tx_gain = local_gains
         elif param in ("global_tx_phase", "global_tx_amplitude", "global_tx_gain"):
             self._apply_global_tx_param(param, val)
-        # These lists arrive in *global* Tx indexing and must be sliced to this
-        # device's window. They are all in TX_PARAMS, so they must precede the
-        # generic branch below or device 2 gets device 1's values.
+        # Global Tx indexing, sliced to this device's window. Must precede the
+        # generic TX_PARAMS branch below.
         elif param in ("tx_amplitude", "if_freq", "tx_phase"):
-            values = val if isinstance(val, (list, tuple)) else [val]
+            values = val if isinstance(val, list | tuple) else [val]
             local = list(
                 values[
                     self.global_tx_offset : self.global_tx_offset + len(self.tx_channels)
@@ -155,10 +153,8 @@ class TransmitWorker(PausableWorker):
     def set_global_tx_param(self, global_tx_idx: int, param: str, value):
         """Queue a per-Tx phase/amplitude change.
 
-        This must go through ``cmd_queue`` rather than mutating ``self.scheme``
-        directly: the caller (the backend's DPIC balance) runs on a different
-        thread from ``work()``, which reads the scheme's parameter lists on every
-        buffer. Direct mutation races with waveform generation.
+        Goes through ``cmd_queue``: mutating the scheme directly would race
+        waveform generation in ``work()``.
         """
         if self._local_idx(global_tx_idx) is None:
             return
@@ -229,13 +225,7 @@ class TransmitWorker(PausableWorker):
                 if self._use_cyclic:
                     buffer_iter = self._generate_chunk(self.tx_buffer_size)
                 else:
-                    if (
-                        self.tx_waveform is None
-                        or self.tx_waveform.shape[1] != self.tx_buffer_size
-                    ):
-                        self.tx_waveform = self._generate_chunk(self.tx_buffer_size)
-                    else:
-                        self.tx_waveform = self._generate_chunk(self.tx_buffer_size)
+                    self.tx_waveform = self._generate_chunk(self.tx_buffer_size)
                     buffer_iter = self.tx_waveform
 
                 num_samps = self.tx_streamer.send(buffer_iter, self.tx_metadata)

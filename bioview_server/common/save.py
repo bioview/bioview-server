@@ -1,10 +1,6 @@
 """HDF5 recorder for demodulated chunks.
 
-The file handle is opened once for the session and held; chunks are accumulated
-and appended in batches. The previous implementation reopened the file with
-``h5py.File(path, "a")`` on *every* chunk, which at a 20 ms chunk cadence meant
-50 open/flush/close cycles a second -- by far the most expensive thing on the
-streaming path, and enough to back the whole pipeline up on a slow disk.
+The file handle is held open for the session and chunks are appended in batches.
 """
 
 import contextlib
@@ -16,9 +12,7 @@ import numpy as np
 from bioview_common import PausableWorker, log_print
 
 
-#: Chunks accumulated before one append. Each append is a resize + a write, so
-#: batching amortizes both. At ~20 ms chunks this is a write roughly every third
-#: of a second.
+# Chunks accumulated before one append; each append is a resize + a write.
 DEFAULT_BATCH_CHUNKS = 16
 
 #: HDF5 dataset chunk width (columns). Reads and writes are aligned to this.
@@ -28,10 +22,8 @@ DEFAULT_CHUNK_COLS = 500
 def flatten_chunk(chunk) -> np.ndarray:
     """Fold a chunk into a 2-D ``(rows, samples)`` block ready to append.
 
-    A complex chunk arrives as ``(channels, samples, 2)`` and is stored as all
-    real rows followed by all imaginary rows. A real-valued chunk is already
-    ``(channels, samples)`` and passes through -- the old code indexed
-    ``chunk[:, :, 1]`` unconditionally and raised on the real-valued case.
+    A complex ``(channels, samples, 2)`` chunk is stored as all real rows then
+    all imaginary rows; a real-valued chunk passes through.
     """
     arr = np.asarray(chunk)
     if arr.ndim == 3:
@@ -72,11 +64,7 @@ class SaveWorker(PausableWorker):
     def _ensure_open(self, n_rows: int):
         """Create the file on the first append, sized to the actual chunk.
 
-        The row count is only known once a chunk arrives: it is
-        ``num_channels`` for a real stream and ``2 * num_channels`` for a
-        complex one. Creating it up front with ``num_channels`` and a matching
-        ``maxshape`` meant the first complex append tried to resize a fixed
-        axis and failed.
+        The row count is only known then: ``num_channels``, doubled if complex.
         """
         if self._dset is not None:
             return
@@ -155,29 +143,3 @@ class SaveWorker(PausableWorker):
             finally:
                 self._file = None
                 self._dset = None
-
-
-# --------------------------------------------------------------------------
-# Standalone helpers, kept for one-shot writes and tests.
-# --------------------------------------------------------------------------
-
-
-def init_save_file(file_path, num_channels: int, chunk_size: int = DEFAULT_CHUNK_COLS):
-    with h5py.File(file_path, "w") as f:
-        f.create_dataset(
-            "data",
-            shape=(num_channels, 0),
-            maxshape=(num_channels, None),
-            dtype="float64",
-            chunks=(num_channels, chunk_size),
-        )
-
-
-def update_save_file(file_path, chunk):
-    save_chunk = flatten_chunk(chunk)
-    with h5py.File(file_path, "a") as f:
-        dset = f["data"]
-        cur_cols = dset.shape[1]
-        new_cols = cur_cols + save_chunk.shape[1]
-        dset.resize((dset.shape[0], new_cols))
-        dset[:, cur_cols:new_cols] = save_chunk

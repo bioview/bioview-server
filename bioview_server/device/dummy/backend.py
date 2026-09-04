@@ -152,7 +152,6 @@ class DummyBackend(Backend):
         self.channel_ifs = []
         self.if_filter_bw = []
         self.channel_model = None
-        self._cal_enabled_at_start = False
         self.display_ds = int(self.group_config.get("disp_ds", 10))
         self.display_imaginary = bool(self.group_config.get("display_imaginary", False))
         self.save_ds = int(self.group_config.get("save_ds", 100))
@@ -193,7 +192,7 @@ class DummyBackend(Backend):
         self.if_filter_bw = list(self.registry.tx_filter_bw)
 
         cal_cfg = self.group_config.get("calibration", {})
-        self._cal_enabled_at_start = bool(cal_cfg.get("enabled", False))
+        self._cal_enabled = bool(cal_cfg.get("enabled", False))
         self.cal_ref_sources = []
         if cal_cfg.get("record_reference", True):
             inject = cal_cfg.get("inject_channels", [0])
@@ -286,26 +285,6 @@ class DummyBackend(Backend):
             self.process_worker.save_ds = self.save_ds
             self.process_worker.save_queue = self.save_queue
 
-    def _setup_display(self, display_config=None):
-        if not self.rf_mode:
-            super()._setup_display(display_config)
-            return
-
-        if not self.data_output_queue:
-            self.data_output_queue = mp.Queue()
-        else:
-            while not self.data_output_queue.empty():
-                self.data_output_queue.get_nowait()
-
-        from bioview_server.common import DisplayWorker
-
-        self.display_worker = DisplayWorker(
-            display_sources=list(self.mimo_sources),
-            data_input_queue=self.display_queue,
-            data_output_queue=self.data_output_queue,
-            logger=self.logger,
-        )
-
     def _start_streaming(self):
         if self.rf_mode:
             return self._start_rf_streaming()
@@ -368,9 +347,9 @@ class DummyBackend(Backend):
 
         time.sleep(0.35)
 
-        for scheme in self.schemes_by_device.values():
-            scheme.set_calibration_enabled(self._cal_enabled_at_start)
-        self._cal_enabled = self._cal_enabled_at_start
+        # The current calibration state, not the config's start-up value: the
+        # overlay is toggled at runtime and would be reset on every Start.
+        self._set_calibration_enabled(self._cal_enabled)
 
         if self.save_worker:
             if not self.save_worker.is_alive():
@@ -405,6 +384,12 @@ class DummyBackend(Backend):
         if dpic_cfg.get("auto_on_start") and self.dpic_pairs:
             self._run_dpic_balance()
 
+    def _set_calibration_enabled(self, enabled: bool):
+        enabled = bool(enabled)
+        for scheme in self.schemes_by_device.values():
+            scheme.set_calibration_enabled(enabled)
+        self._cal_enabled = enabled
+
     def _run_dpic_balance(self):
         if not self.rf_mode or not self.dpic_pairs:
             return None
@@ -420,8 +405,8 @@ class DummyBackend(Backend):
         dpic_cfg = self.group_config.get("dpic_balance", {})
         settle_s = float(dpic_cfg.get("settle_time_s", 0.02))
         prev_cal = self._cal_enabled
-        for scheme in self.schemes_by_device.values():
-            scheme.set_calibration_enabled(False)
+        if prev_cal:
+            self._set_calibration_enabled(False)
 
         balancer = DpicBalancer(
             phase_step_deg=dpic_cfg.get("phase_step_deg", 0.1),
@@ -486,9 +471,7 @@ class DummyBackend(Backend):
         ]
 
         if prev_cal:
-            for scheme in self.schemes_by_device.values():
-                scheme.set_calibration_enabled(True)
-        self._cal_enabled = prev_cal
+            self._set_calibration_enabled(True)
 
         return results
 
@@ -497,13 +480,23 @@ class DummyBackend(Backend):
             return set(self.mimo_sources) | set(self.cal_ref_sources)
         return self.data_sources
 
+    def _display_sources(self):
+        """Rows the ProcessWorker emits, in channel order."""
+        if not self.rf_mode:
+            return super()._display_sources()
+        sources = list(self.mimo_sources)
+        if self.process_worker is None or self.process_worker.record_cal_ref:
+            sources += list(self.cal_ref_sources)
+        return sorted(sources, key=lambda s: s.channel)
+
     def _queue_param_update(self, params):
         if self.rf_mode:
             for param, value in (params or {}).items():
                 if param == "calibration.enabled":
-                    enabled = bool(value)
-                    for scheme in self.schemes_by_device.values():
-                        scheme.set_calibration_enabled(enabled)
+                    self.group_config.setdefault("calibration", {})["enabled"] = bool(
+                        value
+                    )
+                    self._set_calibration_enabled(value)
                 elif param in GLOBAL_TX_PARAMS:
                     apply_global_tx_param_to_schemes(
                         self.schemes_by_device,
@@ -516,6 +509,12 @@ class DummyBackend(Backend):
                 elif param == "calibration" or param.startswith("calibration."):
                     for scheme in self.schemes_by_device.values():
                         scheme.update_param(param, value)
+                    if param == "calibration" and isinstance(value, dict):
+                        self.group_config["calibration"] = dict(value)
+                        self._cal_enabled = bool(value.get("enabled", self._cal_enabled))
+                    else:
+                        key = param.split(".", 1)[1]
+                        self.group_config.setdefault("calibration", {})[key] = value
                 elif param == "samp_rate":
                     self.samp_rate = int(value)
                     self.group_config["samp_rate"] = value

@@ -1,7 +1,6 @@
 import queue
 import threading
 import time
-from typing import Dict, List, Optional
 
 import numpy as np
 from bioview_common import (
@@ -27,12 +26,12 @@ class ProcessWorker(PausableWorker):
         samp_rate,
         channel_ifs,
         if_filter_bw,
-        rx_queues: Dict,
-        rx_device_order: List[str],
-        schemes_by_device: Dict,
-        global_tx_to_device: Dict,
+        rx_queues: dict,
+        rx_device_order: list[str],
+        schemes_by_device: dict,
+        global_tx_to_device: dict,
         signal_scheme: str = "cw",
-        fmcw_scheme: Optional[FmcwScheme] = None,
+        fmcw_scheme: FmcwScheme | None = None,
         save_queue: queue.Queue = None,
         display_queue: queue.Queue = None,
         save_ds: int = 1,
@@ -69,9 +68,8 @@ class ProcessWorker(PausableWorker):
         self.display_queue = display_queue
 
         self.global_sample_idx = 0
-        # (measure_tx, measure_rx) -> (magnitude, phasor, seq). ``seq`` lets DPIC
-        # balance wait for a measurement taken *after* it changed the injection,
-        # rather than reading whatever value happens to be sitting there.
+        # (measure_tx, measure_rx) -> (magnitude, phasor, seq); ``seq`` lets
+        # DPIC wait for a measurement taken after it changed the injection.
         self.latest_metrics = {}
         self._metrics_cv = threading.Condition()
         self._partial_rows = {}
@@ -113,29 +111,17 @@ class ProcessWorker(PausableWorker):
                 f"{self.display_chunks_dropped} display chunks dropped",
             )
 
-    def get_metric(self, measure_tx: int, measure_rx: int) -> Optional[float]:
-        with self._metrics_cv:
-            entry = self.latest_metrics.get((measure_tx, measure_rx))
-        return entry[0] if entry else None
-
-    def get_metric_complex(self, measure_tx: int, measure_rx: int) -> Optional[complex]:
-        with self._metrics_cv:
-            entry = self.latest_metrics.get((measure_tx, measure_rx))
-        return entry[1] if entry else None
-
     def wait_for_metric(
         self,
         measure_tx: int,
         measure_rx: int,
         min_new: int = 2,
         timeout: float = 2.0,
-    ) -> Optional[float]:
-        """Block until ``min_new`` fresh chunks have been measured, then return.
+    ) -> float | None:
+        """Block until ``min_new`` fresh chunks have been measured.
 
-        The Rx path buffers ~20 packets plus whatever is queued, so a value read
-        immediately after a phase/amplitude change still describes the *old*
-        setting. Waiting for new sequence numbers removes that stale-read bias
-        from the DPIC search.
+        The Rx path buffers deeply, so a value read straight after a setting
+        change still describes the old one.
         """
         entry = self._wait_for_entry(measure_tx, measure_rx, min_new, timeout)
         return entry[0] if entry else None
@@ -146,7 +132,7 @@ class ProcessWorker(PausableWorker):
         measure_rx: int,
         min_new: int = 2,
         timeout: float = 2.0,
-    ) -> Optional[complex]:
+    ) -> complex | None:
         """Fresh complex residual phasor, for DPIC's closed-form solve."""
         entry = self._wait_for_entry(measure_tx, measure_rx, min_new, timeout)
         return entry[1] if entry else None
@@ -169,10 +155,8 @@ class ProcessWorker(PausableWorker):
     def _process_chunk(self, data, source, filt, if_freq, scheme):
         """Returns (first_comp, second_comp, metric).
 
-        ``metric`` is always the mean baseband magnitude, normalized by the Tx
-        amplitude. It must not be derived from ``first_comp``: under ``save_iq``
-        that is mean(Re{.}), a signed quantity whose minimum is the most
-        negative excursion rather than a null.
+        ``metric`` is always the normalized mean baseband magnitude; it must
+        not be derived from ``first_comp``, which is signed under ``save_iq``.
         """
         if len(data) == 0:
             return np.array([]), np.array([]), None
@@ -202,9 +186,8 @@ class ProcessWorker(PausableWorker):
         if num_windows <= 0:
             return np.array([]), np.array([]), None
 
-        # Save windows are contiguous, non-overlapping blocks of ``step``
-        # samples, so a reshape is an exact substitute for the old fancy-index
-        # gather -- and it is a view rather than an (n_windows, step) copy.
+        # Save windows are contiguous blocks of ``step`` samples, so this
+        # reshape is a view rather than a copy.
         usable = num_windows * step
         windows = baseband_data[:usable].reshape(num_windows, step)
 
@@ -225,9 +208,8 @@ class ProcessWorker(PausableWorker):
             if tx_amp > 0:
                 first_comp = first_comp / tx_amp
 
-            # Phase: unwrap the chunk once, carrying continuity in from the
-            # previous chunk, then reduce per window. Chaining np.unwrap per
-            # window (the old loop) produces exactly this, one window at a time.
+            # Unwrap once with continuity from the previous chunk, then
+            # reduce per window.
             angles = np.angle(baseband_data[:usable])
             if source.prev_phase is None:
                 unwrapped = np.unwrap(angles)
@@ -235,9 +217,8 @@ class ProcessWorker(PausableWorker):
                 unwrapped = np.unwrap(np.concatenate(([source.prev_phase], angles)))[1:]
             source.prev_phase = float(unwrapped[-1])
 
-            # Static Tx phase only. tx_phase_at() also carries the
-            # 2*pi*f_if*n/fs ramp that the downconversion above already removed;
-            # subtracting it twice turns this channel into a ramp.
+            # Static Tx phase only: tx_phase_at() also carries the IF ramp
+            # that the downconversion already removed.
             tx_phase = (
                 active_scheme.tx_phase_offset(local_tx_idx)
                 if active_scheme is not None
@@ -247,8 +228,7 @@ class ProcessWorker(PausableWorker):
 
         # Magnitude metric for DPIC, independent of the save format.
         metric = normalized_amplitude(baseband_data, tx_amp)
-        # Complex residual phasor (the DC term of the downconverted signal).
-        # DPIC's closed-form solve needs the phasor, not just its magnitude.
+        # Complex residual phasor; DPIC's closed-form solve needs the phase.
         metric_complex = complex(np.mean(baseband_data))
         if tx_amp > 0:
             metric_complex /= tx_amp
@@ -295,12 +275,15 @@ class ProcessWorker(PausableWorker):
         num_cal = len(self.cal_ref_sources) if self.record_cal_ref else 0
         len_samples = int(buffer.shape[1] // self.save_ds)
 
+        # Calibration reference rows go to the display as well as to disk;
+        # the backend advertises a CalRef_* source for each.
+        n_rows = num_mimo + num_cal
         if self.save_imaginary:
-            save_list = np.empty((num_mimo + num_cal, len_samples, 2))
-            display_list = np.empty((num_mimo, len_samples, 2))
+            save_list = np.zeros((n_rows, len_samples, 2))
+            display_list = np.zeros((n_rows, len_samples, 2))
         else:
-            save_list = np.empty((num_mimo + num_cal, len_samples))
-            display_list = np.empty((num_mimo, len_samples))
+            save_list = np.zeros((n_rows, len_samples))
+            display_list = np.zeros((n_rows, len_samples))
 
         for source in self.mimo_sources:
             first_comp, second_comp = mimo_results[source.channel]
@@ -323,17 +306,22 @@ class ProcessWorker(PausableWorker):
                 )
                 cal_data = self._decimate_cal_ref(raw_env)
                 if self.save_imaginary:
-                    # Calibration reference is a real-valued envelope.
-                    # Store it in channel 0 and keep the imaginary component at 0.
+                    # Real-valued envelope: channel 0, imaginary left at 0.
                     save_list[source.channel, : len(cal_data), 0] = cal_data
                     save_list[source.channel, : len(cal_data), 1] = 0.0
+                    display_list[source.channel, : len(cal_data), 0] = cal_data
                 else:
                     save_list[source.channel, : len(cal_data)] = cal_data
+                    display_list[source.channel, : len(cal_data)] = cal_data
 
         self.global_sample_idx += buffer.shape[1]
         return save_list, display_list
 
     def work(self):
+        # work() is re-entered on every resume; rows held from before the
+        # pause would misalign the MIMO buffer.
+        self._partial_rows.clear()
+
         while self.is_running:
             try:
                 for key in self.rx_device_order:
@@ -342,22 +330,26 @@ class ProcessWorker(PausableWorker):
                         self._partial_rows[key] = rx_q.get_nowait()
 
                 rows = [self._partial_rows[key].copy() for key in self.rx_device_order]
-                buffer = np.vstack(rows)
                 self._partial_rows.clear()
+                widths = {row.shape[1] for row in rows}
+                if len(widths) > 1:
+                    # Different-length buffers: trim to the common length
+                    # rather than letting vstack raise per chunk.
+                    n = min(widths)
+                    rows = [row[:, :n] for row in rows]
+                buffer = np.vstack(rows)
 
                 mimo_results = self._process_mimo_chunk(buffer)
                 save_data, display_data = self._assemble_outputs(buffer, mimo_results)
 
-                # Save path: recorded data matters, so absorb a short disk
-                # stall before giving up on a chunk.
+                # Save path: absorb a short disk stall before dropping.
                 if self.save_queue is not None and not put_or_drop(
                     self.save_queue, save_data, timeout=QUEUE_PUT_TIMEOUT_S
                 ):
                     self.save_chunks_dropped += 1
                     self._log_drops()
 
-                # Display path: only the newest chunk is useful, so evict the
-                # oldest instead of adding latency.
+                # Display path: evict the oldest rather than add latency.
                 if self.display_queue is not None:
                     if self.save_imaginary is False:
                         display_payload = display_data
@@ -365,8 +357,7 @@ class ProcessWorker(PausableWorker):
                         display_payload = display_data[:, :, 1]
                     else:
                         display_payload = display_data[:, :, 0]
-                    # float32 on the wire halves the streamed volume; no plot
-                    # resolves more. The save path stays float64.
+                    # float32 on the wire; the save path stays float64.
                     display_payload = np.ascontiguousarray(
                         display_payload, dtype=np.float32
                     )
