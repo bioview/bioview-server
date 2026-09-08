@@ -222,9 +222,8 @@ def test_metric_is_magnitude_based_under_save_iq():
         _f, _s, metric = worker._process_chunk(
             _test_signal(20000), source, worker.if_filts[0], IF_HZ, scheme
         )
-        magnitude, phasor = metric
-        assert magnitude > 0
-        assert isinstance(phasor, complex)
+        assert isinstance(metric, float)
+        assert metric > 0
 
 
 def test_demod_keeps_up_with_real_time():

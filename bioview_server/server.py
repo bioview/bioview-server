@@ -138,6 +138,24 @@ class Server:
         self._streaming_active = False
         self._device_op_thread = None
 
+        # DPIC balance is a minute-long hardware search. It is answered
+        # immediately and run on its own thread; the client watches
+        # ``pending`` on GET_DEVICE_STATUS for the outcome. Running it inline
+        # blocked this session's whole command loop -- no Stop, no parameter
+        # change, no status poll -- for the duration.
+        self._dpic_lock = Lock()
+        self._dpic_thread = None
+        self._dpic_state = {
+            "pending": False,
+            "ok": None,
+            "message": "",
+            "results": [],
+            "device_id": None,
+            # The balancer's live phase/amplitude/gain, so the client's poll
+            # can drive the settings panel while the search runs.
+            "progress": None,
+        }
+
         self.data_socket = None
         self.control_socket = None
 
@@ -518,6 +536,20 @@ class Server:
         return {device_id: DeviceStatus.CONNECTING.value for device_id in config.devices}
 
     def _handle_get_device_status(self):
+        with self._dpic_lock:
+            dpic_state = dict(self._dpic_state)
+        # Drained on the way out rather than pushed: the client polls this
+        # while a balance runs, and the newest entry is the only one that
+        # matters for showing phase, amplitude and gain moving.
+        handler = self.device_group_handlers.get(dpic_state.get("device_id"))
+        if handler is not None and hasattr(handler, "drain_balance_progress"):
+            progress = handler.drain_balance_progress()
+            if progress is not None:
+                dpic_state["progress"] = progress
+                with self._dpic_lock:
+                    self._dpic_state["progress"] = progress
+            else:
+                dpic_state["progress"] = self._dpic_state.get("progress")
         send_response(
             sock=self.client_control_conn,
             response=Response.SUCCESS,
@@ -526,6 +558,9 @@ class Server:
                 "device_status": self.device_group_states,
                 "device_errors": dict(self.device_group_errors),
                 "data_sources": [src.to_dict() for src in self.data_sources],
+                # The client polls this to follow a balance it started; the
+                # command itself only acknowledges the start.
+                "dpic_balance": dpic_state,
             },
             logger=self.logger,
         )
@@ -1145,15 +1180,31 @@ class Server:
         Rebuilt, not merged: a set union can never drop a disabled channel.
         """
         sources = set()
-        for handler in self.device_group_handlers.values():
+        for device_id, handler in self.device_group_handlers.items():
             if handler is None:
                 continue
-            with contextlib.suppress(Exception):
+            try:
                 sources.update(handler.get_data_sources())
+            except Exception as e:
+                # Swallowing this used to drop the group's channels from the
+                # display and the recording with nothing said anywhere.
+                log_print(
+                    self.logger,
+                    "error",
+                    f"{device_id} could not report its data sources ({e}); "
+                    "its channels will be missing from this session.",
+                )
         self.data_sources = sources
         return self.data_sources
 
     def _run_dpic_balance(self, payload):
+        """Start a balance and answer at once; the result arrives by polling.
+
+        The search drives real hardware for a minute or more. Waiting for it
+        here held the command thread -- and, on the far side of one socket, the
+        client's control lock -- for the whole run, so the UI froze and Stop
+        could not be delivered until it finished.
+        """
         device_id = payload.get("id") if payload else None
         if not device_id and self.device_group_handlers:
             device_id = next(iter(self.device_group_handlers))
@@ -1168,33 +1219,77 @@ class Server:
             )
             return
 
-        try:
-            response = handler.run_dpic_balance()
-            if response.get("type") in (
-                Response.SUCCESS,
-                Response.SUCCESS.name,
-                Response.SUCCESS.value,
-            ):
-                send_response(
-                    self.client_control_conn,
-                    Response.SUCCESS,
-                    params={"message": "DPIC balance complete"},
-                    logger=self.logger,
-                )
-            else:
+        with self._dpic_lock:
+            if self._dpic_state["pending"]:
                 send_response(
                     self.client_control_conn,
                     Response.ERROR,
-                    params={"message": response.get("message", "DPIC failed")},
+                    params={
+                        "message": "A DPIC balance is already running on "
+                        f"{self._dpic_state['device_id']}"
+                    },
                     logger=self.logger,
                 )
-        except Exception as e:
-            send_response(
-                self.client_control_conn,
-                Response.ERROR,
-                params={"message": str(e)},
-                logger=self.logger,
+                return
+            self._dpic_state = {
+                "pending": True,
+                "ok": None,
+                "message": f"DPIC balance running on {device_id}",
+                "results": [],
+                "device_id": device_id,
+                "progress": None,
+            }
+
+        send_response(
+            self.client_control_conn,
+            Response.SUCCESS,
+            params={
+                "pending": True,
+                "message": f"DPIC balance started on {device_id}",
+                "results": [],
+            },
+            logger=self.logger,
+        )
+
+        self._dpic_thread = Thread(
+            target=self._dpic_balance_work,
+            args=(device_id, handler),
+            daemon=True,
+        )
+        self._dpic_thread.start()
+
+    def _dpic_balance_work(self, device_id, handler):
+        """Drive one balance to completion and record its outcome for polling."""
+        try:
+            response = handler.run_dpic_balance()
+            ok = response.get("type") in (
+                Response.SUCCESS,
+                Response.SUCCESS.name,
+                Response.SUCCESS.value,
             )
+            # The backend's own message either way: "complete" for a balance
+            # that never ran is how a no-op looked like a success.
+            message = response.get("message") or (
+                "DPIC balance complete" if ok else "DPIC balance failed"
+            )
+            results = response.get("result", []) or []
+        except Exception as e:
+            ok, message, results = False, str(e), []
+
+        log_print(
+            self.logger,
+            "info" if ok else "error",
+            f"[DPIC] {device_id}: {message}",
+        )
+        with self._dpic_lock:
+            self._dpic_state = {
+                "pending": False,
+                "ok": ok,
+                "message": message,
+                "results": results,
+                "device_id": device_id,
+                "progress": self._dpic_state.get("progress"),
+            }
 
     def stop(self):
         log_print(self.logger, "debug", "Attempting to shutdown server")

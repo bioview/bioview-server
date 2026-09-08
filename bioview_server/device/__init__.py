@@ -21,37 +21,14 @@ def _backend_unavailable(device_type, error):
     print(f"{device_type} backend not available: {error}")
 
 
-def _check_uhd_numpy_abi():
-    """Warn when libpyuhd was built against a different NumPy major version."""
-    import io as _io
-    import warnings
-    from contextlib import redirect_stderr
-
-    captured = _io.StringIO()
-    with warnings.catch_warnings(record=True) as caught, redirect_stderr(captured):
-        warnings.simplefilter("always")
-        import uhd  # noqa: F401
-
-    messages = captured.getvalue() + " ".join(str(w.message) for w in caught)
-    if "compiled using NumPy 1.x" in messages:
-        import numpy
-
-        print(
-            "WARNING: the installed UHD Python bindings were built against "
-            f"NumPy 1.x but NumPy {numpy.__version__} is active. USRP streaming "
-            "may misbehave. Install 'numpy<2' in this environment, or use UHD "
-            "bindings built for NumPy 2."
-        )
-
-
 try:
-    # usrp/__init__ imports fine with no driver, so probe uhd itself.
-    _check_uhd_numpy_abi()
-
     from . import usrp
 
-    if not callable(getattr(usrp, "discover_devices", None)):
-        raise ImportError("usrp.discover_devices is unavailable")
+    # usrp/__init__ resolves its heavy attributes lazily, so importing the
+    # package alone touches no UHD. Import through to utils, which is what
+    # actually loads the bindings: a broken or absent UHD then fails here, with
+    # a reason, instead of at first use inside a device subprocess.
+    from .usrp.utils import discover_devices  # noqa: F401
 
     __all__.append("usrp")
     AVAILABLE_BACKENDS[DeviceType.USRP.value] = usrp

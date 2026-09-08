@@ -35,6 +35,7 @@ class ProcessWorker(PausableWorker):
         save_queue: queue.Queue = None,
         display_queue: queue.Queue = None,
         save_ds: int = 1,
+        display_ds: int = 1,
         save_imaginary: bool = False,
         save_iq: bool = False,
         display_imaginary: bool = False,
@@ -52,6 +53,7 @@ class ProcessWorker(PausableWorker):
         self.samp_rate = samp_rate
         self.channel_ifs = channel_ifs
         self.save_ds = save_ds
+        self.display_ds = max(1, int(display_ds))
         self.save_imaginary = save_imaginary
         self.save_iq = save_iq
         self.display_imaginary = display_imaginary
@@ -68,13 +70,16 @@ class ProcessWorker(PausableWorker):
         self.display_queue = display_queue
 
         self.global_sample_idx = 0
-        # (measure_tx, measure_rx) -> (magnitude, phasor, seq); ``seq`` lets
-        # DPIC wait for a measurement taken after it changed the injection.
+        # (measure_tx, measure_rx) -> (magnitude, seq); ``seq`` lets DPIC
+        # wait for a measurement taken after it changed the injection.
         self.latest_metrics = {}
         self._metrics_cv = threading.Condition()
         self._partial_rows = {}
 
         num_tx = len(channel_ifs)
+        # Kept so a channel can be retuned after construction; DPIC balance
+        # moves the inject Tx onto the measure Tx's IF.
+        self.if_filter_bw = list(if_filter_bw)
         self.if_filts = [
             self._load_filter(channel_ifs[idx], if_filter_bw[idx])
             for idx in range(num_tx)
@@ -99,6 +104,57 @@ class ProcessWorker(PausableWorker):
             btype="band",
             order=order,
         )
+
+    def set_channel_if(self, tx_idx: int, freq: float):
+        """Retune one Tx's demodulation IF and its band-pass, live.
+
+        ``channel_ifs`` is the backend's own list, so the frequency may already
+        be updated by the time this is called; the filter is not, and a stale
+        band-pass would reject the very tone it is meant to pass. Filter state
+        is dropped for the affected sources because it describes the old
+        passband.
+        """
+        if tx_idx < 0 or tx_idx >= len(self.if_filts):
+            return
+        freq = float(freq)
+        self.channel_ifs[tx_idx] = freq
+        self.if_filts[tx_idx] = self._load_filter(freq, self.if_filter_bw[tx_idx])
+        for source in self.all_sources:
+            if getattr(source, "tx_idx", None) == tx_idx:
+                source.filter_state = None
+
+    def set_sources(self, data_sources, cal_ref_sources, channel_ifs, if_filter_bw):
+        """Adopt a new channel map's rows, filters and per-source state.
+
+        Everything ``__init__`` derives from the source list, redone: the
+        channel map decides how many rows are emitted and what each one is, so
+        a stale list here means rows demodulated against the wrong Tx.
+        Per-source demodulator state and the DPIC metrics are dropped -- both
+        are indexed by the meanings that just changed.
+        """
+        self.mimo_sources = sorted(data_sources, key=lambda s: s.channel)
+        self.cal_ref_sources = sorted(cal_ref_sources or [], key=lambda s: s.channel)
+        self.all_sources = self.mimo_sources + self.cal_ref_sources
+        self.data_sources = self.all_sources
+
+        # Held by reference, as in __init__: the backend mutates this list when
+        # DPIC coerces an inject Tx's IF.
+        self.channel_ifs = channel_ifs
+        self.if_filter_bw = list(if_filter_bw)
+        self.if_filts = [
+            self._load_filter(self.channel_ifs[idx], self.if_filter_bw[idx])
+            for idx in range(len(self.channel_ifs))
+        ]
+
+        self._partial_rows.clear()
+        with self._metrics_cv:
+            self.latest_metrics.clear()
+
+        for source in self.mimo_sources:
+            source.accumulated_phase = 0.0
+            source.filter_state = None
+            source.prev_phase = None
+            source.accumulated_sample_idx = 0
 
     def _log_drops(self):
         total = self.save_chunks_dropped + self.display_chunks_dropped
@@ -126,26 +182,15 @@ class ProcessWorker(PausableWorker):
         entry = self._wait_for_entry(measure_tx, measure_rx, min_new, timeout)
         return entry[0] if entry else None
 
-    def wait_for_metric_complex(
-        self,
-        measure_tx: int,
-        measure_rx: int,
-        min_new: int = 2,
-        timeout: float = 2.0,
-    ) -> complex | None:
-        """Fresh complex residual phasor, for DPIC's closed-form solve."""
-        entry = self._wait_for_entry(measure_tx, measure_rx, min_new, timeout)
-        return entry[1] if entry else None
-
     def _wait_for_entry(self, measure_tx, measure_rx, min_new, timeout):
         key = (measure_tx, measure_rx)
         deadline = time.monotonic() + timeout
         with self._metrics_cv:
             entry = self.latest_metrics.get(key)
-            target = (entry[2] if entry else -1) + min_new
+            target = (entry[1] if entry else -1) + min_new
             while True:
                 entry = self.latest_metrics.get(key)
-                if entry and entry[2] >= target:
+                if entry and entry[1] >= target:
                     return entry
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -228,11 +273,26 @@ class ProcessWorker(PausableWorker):
 
         # Magnitude metric for DPIC, independent of the save format.
         metric = normalized_amplitude(baseband_data, tx_amp)
-        # Complex residual phasor; DPIC's closed-form solve needs the phase.
-        metric_complex = complex(np.mean(baseband_data))
-        if tx_amp > 0:
-            metric_complex /= tx_amp
-        return first_comp, second_comp, (metric, metric_complex)
+        return first_comp, second_comp, metric
+
+    def _decimate_display(self, payload: np.ndarray) -> np.ndarray:
+        """Reduce the display stream by ``display_ds`` on top of ``save_ds``.
+
+        The advertised ``disp_freq`` on every source is
+        ``samp_rate / (save_ds * display_ds)``; the two must stay in step or
+        the client's time axis scrolls at the wrong speed.
+        """
+        step = self.display_ds
+        if step <= 1:
+            return payload
+        n_rows, n_samples = payload.shape
+        num_windows = n_samples // step
+        if num_windows <= 0:
+            # Chunk shorter than one display window: keep a single averaged
+            # point rather than dropping the chunk entirely.
+            return payload.mean(axis=1, keepdims=True)
+        usable = num_windows * step
+        return payload[:, :usable].reshape(n_rows, num_windows, step).mean(axis=2)
 
     def _decimate_cal_ref(self, envelope: np.ndarray) -> np.ndarray:
         step = self.save_ds
@@ -265,8 +325,8 @@ class ProcessWorker(PausableWorker):
         if metrics:
             with self._metrics_cv:
                 for key, value in metrics.items():
-                    prev_seq = self.latest_metrics.get(key, (None, None, -1))[2]
-                    self.latest_metrics[key] = (float(value[0]), value[1], prev_seq + 1)
+                    prev_seq = self.latest_metrics.get(key, (None, -1))[1]
+                    self.latest_metrics[key] = (float(value), prev_seq + 1)
                 self._metrics_cv.notify_all()
         return results
 
@@ -357,6 +417,7 @@ class ProcessWorker(PausableWorker):
                         display_payload = display_data[:, :, 1]
                     else:
                         display_payload = display_data[:, :, 0]
+                    display_payload = self._decimate_display(display_payload)
                     # float32 on the wire; the save path stays float64.
                     display_payload = np.ascontiguousarray(
                         display_payload, dtype=np.float32

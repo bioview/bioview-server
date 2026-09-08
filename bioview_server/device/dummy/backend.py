@@ -28,11 +28,11 @@ from bioview_common.datatypes.configuration.hardware_params import (
 )
 from bioview_common.datatypes.configuration.usrp_channel_map import resolve_channel_map
 from bioview_common.signal_schemes import (
-    DpicBalancer,
     DpicChannel,
     scheme_from_config,
 )
 
+from bioview_server.common import balance_outcome, build_balancer
 from bioview_server.datatypes import Backend
 
 from .rf_simulation import MimoChannelModel
@@ -160,6 +160,18 @@ class DummyBackend(Backend):
 
         self.populate_data_sources()
 
+    def get_display_frequency(self) -> float:
+        """Rate (Hz) at which this device emits display samples.
+
+        The non-RF sine path forwards every sample, so it is the sample rate.
+        The RF path runs the USRP ProcessWorker, which averages ``save_ds``
+        samples per point and then drops by ``display_ds``.
+        """
+        if not self.rf_mode:
+            return float(self.samp_rate)
+        divisor = max(1, int(self.save_ds)) * max(1, int(self.display_ds))
+        return float(self.samp_rate) / divisor
+
     def populate_data_sources(self):
         if not self.rf_mode:
             for ch in range(self.num_channels):
@@ -179,6 +191,7 @@ class DummyBackend(Backend):
             self.group_id,
             channel_map,
             self.hardware,
+            disp_freq=self.get_display_frequency(),
         )
         self.data_sources = set(self.mimo_sources)
 
@@ -200,7 +213,10 @@ class DummyBackend(Backend):
             for i, tx_idx in enumerate(inject):
                 label = f"CalRef_Tx{tx_idx + 1}"
                 source = DataSource(
-                    group_id=self.group_id, channel=ch_base + i, label=label
+                    group_id=self.group_id,
+                    channel=ch_base + i,
+                    label=label,
+                    disp_freq=self.get_display_frequency(),
                 )
                 source.tx_idx = tx_idx
                 source.rx_idx = -1
@@ -260,6 +276,7 @@ class DummyBackend(Backend):
                 save_imaginary=self.save_imaginary,
                 save_iq=self.save_iq,
                 save_ds=self.save_ds,
+                display_ds=self.display_ds,
                 record_cal_ref=bool(
                     self.group_config.get("calibration", {}).get(
                         "record_reference", True
@@ -284,6 +301,12 @@ class DummyBackend(Backend):
             self.process_worker.save_iq = self.save_iq
             self.process_worker.save_ds = self.save_ds
             self.process_worker.save_queue = self.save_queue
+            # save_ds also sets the display rate; keep disp_freq in step.
+            disp_freq = self.get_display_frequency()
+            for source in list(self.mimo_sources) + list(self.cal_ref_sources):
+                source.disp_freq = disp_freq
+            if self.display_worker is not None:
+                self.display_worker.set_display_sources(self._display_sources())
 
     def _start_streaming(self):
         if self.rf_mode:
@@ -382,7 +405,10 @@ class DummyBackend(Backend):
     def _post_start_streaming(self):
         dpic_cfg = self.group_config.get("dpic_balance", {})
         if dpic_cfg.get("auto_on_start") and self.dpic_pairs:
-            self._run_dpic_balance()
+            # On its own thread, like a requested balance: this runs after the
+            # START_STREAMING reply but still on the command loop, so calling
+            # the search inline here left Stop unservable for its duration.
+            self._start_balance_thread()
 
     def _set_calibration_enabled(self, enabled: bool):
         enabled = bool(enabled)
@@ -390,17 +416,80 @@ class DummyBackend(Backend):
             scheme.set_calibration_enabled(enabled)
         self._cal_enabled = enabled
 
-    def _run_dpic_balance(self):
-        if not self.rf_mode or not self.dpic_pairs:
-            return None
-        if self.process_worker is None or not self.process_worker.is_running:
+    def _apply_channel_if(self, global_tx: int, freq: float):
+        """Move one simulated Tx onto ``freq`` everywhere the IF is held."""
+        freq = float(freq)
+        self.channel_ifs[global_tx] = freq
+        if global_tx < len(self.registry.tx_if_freq):
+            self.registry.tx_if_freq[global_tx] = freq
+
+        dev_name, local = self.global_tx_to_device[global_tx]
+        hw = self.hardware.get(dev_name)
+        if hw is not None:
+            if_freqs = list(hw.get("if_freq", []) or [])
+            while len(if_freqs) <= local:
+                if_freqs.append(freq)
+            if_freqs[local] = freq
+            hw["if_freq"] = if_freqs
+            self.group_config["hardware"] = self.hardware
+
+        scheme = self.schemes_by_device[dev_name]
+        local_ifs = [
+            float(f)
+            for idx, f in enumerate(self.channel_ifs)
+            if self.global_tx_to_device.get(idx, (None, None))[0] == dev_name
+        ]
+        scheme.update_param("if_freq", local_ifs)
+
+        model = self.channel_model
+        if model is not None and global_tx < len(model.if_freq):
+            model.if_freq[global_tx] = freq
+        if self.process_worker is not None:
+            self.process_worker.set_channel_if(global_tx, freq)
+
+    def _coerce_dpic_inject_frequencies(self):
+        """Put every inject Tx on its measure Tx's IF before balancing.
+
+        Same rule as the USRP backend: the Rx band-passes around the measure
+        Tx's IF, so an injection anywhere else cannot cancel the direct path.
+        """
+        num_tx = len(self.channel_ifs)
+        for pair in self.dpic_pairs:
+            if pair.inject_tx >= num_tx or pair.measure_tx >= num_tx:
+                continue
+            target_if = self.channel_ifs[pair.measure_tx]
+            inject_if = self.channel_ifs[pair.inject_tx]
+            if abs(inject_if - target_if) <= 1e-6:
+                continue
             log_print(
                 self.logger,
-                "error",
-                "[DPIC] Balance requires the processing worker to be running; "
-                "start streaming first.",
+                "info",
+                f"[DPIC] Coercing inject Tx{pair.inject_tx} from "
+                f"{inject_if:.0f} Hz to {target_if:.0f} Hz to match measure "
+                f"Tx{pair.measure_tx}",
             )
-            return None
+            self._apply_channel_if(pair.inject_tx, target_if)
+
+    def _run_dpic_balance(self):
+        if not self.rf_mode:
+            message = "DPIC balance needs RF simulation mode (a 'hardware' block)."
+            log_print(self.logger, "error", f"[DPIC] {message}")
+            return {"ok": False, "message": message, "results": []}
+        if not self.dpic_pairs:
+            message = (
+                "No DPIC pairs are configured for this device group; nothing to balance."
+            )
+            log_print(self.logger, "error", f"[DPIC] {message}")
+            return {"ok": False, "message": message, "results": []}
+        if self.process_worker is None or not self.process_worker.is_running:
+            message = (
+                "Balance requires the processing worker to be running; "
+                "start streaming first."
+            )
+            log_print(self.logger, "error", f"[DPIC] {message}")
+            return {"ok": False, "message": message, "results": []}
+
+        self._coerce_dpic_inject_frequencies()
 
         dpic_cfg = self.group_config.get("dpic_balance", {})
         settle_s = float(dpic_cfg.get("settle_time_s", 0.02))
@@ -408,16 +497,10 @@ class DummyBackend(Backend):
         if prev_cal:
             self._set_calibration_enabled(False)
 
-        balancer = DpicBalancer(
-            phase_step_deg=dpic_cfg.get("phase_step_deg", 0.1),
-            amp_step=dpic_cfg.get("amp_step", 0.05),
-            coarse_phase_step_deg=dpic_cfg.get("coarse_phase_step_deg", 10.0),
-            coarse_amp_step=dpic_cfg.get("coarse_amp_step", 0.1),
-            max_amplitude=dpic_cfg.get("max_amplitude", 1.0),
-            amp_target=dpic_cfg.get("amp_target", 0.5),
-            settle_time_s=settle_s,
-            gain_settle_time_s=dpic_cfg.get("gain_settle_time_s", 0.0),
-            time_budget_s=dpic_cfg.get("time_budget_s", 25.0),
+        balancer = build_balancer(
+            dpic_cfg,
+            should_abort=self.balance_aborted,
+            on_progress=self.publish_balance_progress,
         )
 
         def _make_channel(pair):
@@ -441,39 +524,22 @@ class DummyBackend(Backend):
                 read_metric=lambda: self.process_worker.wait_for_metric(
                     pair.measure_tx, measure_rx, min_new=2, timeout=read_timeout
                 ),
-                read_complex=lambda: self.process_worker.wait_for_metric_complex(
-                    pair.measure_tx, measure_rx, min_new=2, timeout=read_timeout
-                ),
-                wait_settle=lambda: time.sleep(settle_s),
+                wait_settle=time.sleep,
                 start_phase_deg=float(scheme.tx_phase_deg[local]),
                 start_amplitude=float(scheme.get_tx_amplitude(local)),
             )
 
         results = balancer.balance_all([_make_channel(p) for p in self.dpic_pairs])
+        outcome = balance_outcome(self.logger, results)
 
         if "dpic_balance" not in self.group_config:
             self.group_config["dpic_balance"] = {}
-        self.group_config["dpic_balance"]["last_results"] = [
-            {
-                "inject_tx": r.inject_tx,
-                "measure_tx": r.measure_tx,
-                "measure_rx": r.measure_rx,
-                "best_phase_deg": r.best_phase_deg,
-                "best_amplitude": r.best_amplitude,
-                "min_metric": r.min_metric,
-                "start_metric": r.start_metric,
-                "null_depth_db": r.null_depth_db,
-                "method": r.method,
-                "elapsed_s": r.elapsed_s,
-                "converged": r.converged,
-            }
-            for r in results
-        ]
+        self.group_config["dpic_balance"]["last_results"] = outcome["results"]
 
         if prev_cal:
             self._set_calibration_enabled(True)
 
-        return results
+        return outcome
 
     def get_data_sources(self):
         if self.rf_mode:
@@ -489,9 +555,70 @@ class DummyBackend(Backend):
             sources += list(self.cal_ref_sources)
         return sorted(sources, key=lambda s: s.channel)
 
+    def _reload_channel_map(self, channel_map):
+        """Rebuild everything the channel map decides, in place.
+
+        Same path as the USRP backend: DPIC pairs are specified in the channel
+        map, which is edited in the settings panel, so an edit that stops here
+        is an edit the balance never sees.
+        """
+        if self._streaming.is_set():
+            log_print(
+                self.logger,
+                "error",
+                "[DUMMY] Channel map changed while streaming; it takes "
+                "effect on the next Start.",
+            )
+            return False
+
+        self.group_config["channel_map"] = channel_map
+
+        # The rf worker and the channel model hold these scheme objects, so
+        # they must survive the rebuild; schemes depend on `hardware`, which a
+        # channel-map edit never touches.
+        preserved_schemes = dict(self.schemes_by_device)
+        cal_enabled = self._cal_enabled
+
+        self.populate_data_sources()
+
+        for device_name, scheme in preserved_schemes.items():
+            self.schemes_by_device[device_name] = scheme
+        self._cal_enabled = cal_enabled
+
+        if self.channel_model is not None:
+            self.channel_model.dpic_pairs = list(self.dpic_pairs)
+        if self.process_worker is not None:
+            self.process_worker.set_sources(
+                self.mimo_sources,
+                self.cal_ref_sources,
+                self.channel_ifs,
+                self.if_filter_bw,
+            )
+        if self.display_worker is not None:
+            self.display_worker.set_display_sources(self._display_sources())
+
+        log_print(
+            self.logger,
+            "info",
+            f"[DUMMY] Channel map reloaded: {len(self.mimo_sources)} "
+            f"measurement source(s), {len(self.dpic_pairs)} DPIC pair(s)",
+        )
+        return True
+
+    def _apply_param_update_local(self, params):
+        """Parent-side mirror; see the USRP backend's copy for why."""
+        channel_map = (params or {}).get("channel_map")
+        if isinstance(channel_map, dict):
+            self.group_config["channel_map"] = channel_map
+            self.populate_data_sources()
+
     def _queue_param_update(self, params):
         if self.rf_mode:
             for param, value in (params or {}).items():
+                if param == "channel_map" and isinstance(value, dict):
+                    self._reload_channel_map(value)
+                    continue
+
                 if param == "calibration.enabled":
                     self.group_config.setdefault("calibration", {})["enabled"] = bool(
                         value

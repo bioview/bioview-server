@@ -1,4 +1,3 @@
-import math
 import multiprocessing as mp
 import os
 import queue
@@ -8,39 +7,6 @@ import time
 os.environ["UHD_LOG_LEVEL"] = "error"
 
 import uhd
-
-
-def _warm_numpy_c_api():
-    """Load NumPy's C-API modules here, on the main thread, before any worker runs.
-
-    ``libpyuhd`` is a pybind11 module built against NumPy 1.x, and pybind11
-    bootstraps the NumPy C-API *lazily* -- the first ``tx_streamer.send()`` or
-    ``rx_streamer.recv()`` in the process runs ``import numpy.core.multiarray``
-    from inside the extension, with the GIL held.
-
-    Under NumPy 1.x that import is a ``sys.modules`` hit and costs nothing.
-    Under NumPy 2 ``numpy.core`` is a compatibility shim that is *not* loaded by
-    ``import numpy``, so the import machinery genuinely runs -- and
-    ``_start_streaming`` resumes the transmit and receive workers in the same
-    instant, so two threads enter that first import together, from inside a C
-    extension. They deadlock on the import lock without ever dropping the GIL,
-    which freezes the whole backend process: ``_start_streaming`` never returns,
-    START_STREAMING is never answered, and the server times the device out.
-
-    Importing the modules up front leaves pybind11's lazy import as a plain
-    ``sys.modules`` lookup, so no worker thread ever enters the import machinery.
-    """
-    import contextlib
-    import importlib
-
-    for name in ("numpy.core.multiarray", "numpy.core.umath"):
-        # NumPy 3 may drop the shim entirely; by then the bindings that needed
-        # it are gone too, and there is nothing left to warm up.
-        with contextlib.suppress(Exception):
-            importlib.import_module(name)
-
-
-_warm_numpy_c_api()
 from bioview_common import (
     RX_QUEUE_DEPTH,
     DataSource,
@@ -62,11 +28,11 @@ from bioview_common.datatypes.configuration.usrp_channel_map import (
     resolve_device_serial,
 )
 from bioview_common.signal_schemes import (
-    DpicBalancer,
     DpicChannel,
     scheme_from_config,
 )
 
+from bioview_server.common import balance_outcome, build_balancer
 from bioview_server.datatypes import Backend
 
 from .process import ProcessWorker
@@ -102,11 +68,6 @@ def initialize_usrp_device(
     wire_format,
     logger=None,
 ):
-    if not hasattr(uhd, "usrp"):
-        raise RuntimeError(
-            "UHD Python bindings are incomplete (uhd.usrp missing). "
-            "Reinstall UHD from Ettus for your Python version."
-        )
     usrp = uhd.usrp.MultiUSRP(f"serial={serial},num_recv_frames=1024")
 
     usrp.set_rx_subdev_spec(uhd.usrp.SubdevSpec(rx_subdev))
@@ -129,22 +90,7 @@ def initialize_usrp_device(
         )
         return None
 
-    def _tune_request(freq_hz):
-        """UHD 4.10+ Python API expects a tune_request object."""
-        try:
-            if hasattr(uhd, "types") and hasattr(uhd.types, "TuneRequest"):
-                return uhd.types.TuneRequest(float(freq_hz))
-        except Exception:
-            pass
-        try:
-            lib_types = getattr(getattr(uhd, "libpyuhd", None), "types", None)
-            if lib_types and hasattr(lib_types, "tune_request"):
-                return lib_types.tune_request(float(freq_hz))
-        except Exception:
-            pass
-        return float(freq_hz)
-
-    tune = _tune_request(carrier_freq)
+    tune = uhd.types.TuneRequest(float(carrier_freq))
 
     for idx, chan in enumerate(rx_channels):
         usrp.set_rx_rate(samp_rate, chan)
@@ -239,12 +185,24 @@ class USRPBackend(Backend):
 
         self.populate_data_sources()
 
+    def get_display_frequency(self) -> float:
+        """Rate (Hz) at which the pipeline emits display samples.
+
+        ProcessWorker averages ``save_ds`` raw samples per output point and the
+        display path drops that again by ``display_ds``. The client sizes its
+        plot ring buffer from this number, so anything else makes the trace
+        scroll at the wrong speed.
+        """
+        divisor = max(1, int(self.save_ds)) * max(1, int(self.display_ds))
+        return float(self.samp_rate) / divisor
+
     def populate_data_sources(self):
         channel_map = self.group_config.get("channel_map")
         self.mimo_sources, self.registry, self.dpic_pairs = resolve_channel_map(
             self.group_id,
             channel_map,
             self.hardware,
+            disp_freq=self.get_display_frequency(),
         )
         self.data_sources = set(self.mimo_sources)
 
@@ -271,7 +229,10 @@ class USRPBackend(Backend):
             for i, tx_idx in enumerate(inject):
                 label = f"CalRef_Tx{tx_idx + 1}"
                 source = DataSource(
-                    group_id=self.group_id, channel=ch_base + i, label=label
+                    group_id=self.group_id,
+                    channel=ch_base + i,
+                    label=label,
+                    disp_freq=self.get_display_frequency(),
                 )
                 source.tx_idx = tx_idx
                 source.rx_idx = -1
@@ -416,6 +377,7 @@ class USRPBackend(Backend):
             save_imaginary=self.save_imaginary,
             save_iq=self.save_iq,
             save_ds=self.save_ds,
+            display_ds=self.display_ds,
             record_cal_ref=bool(
                 self.group_config.get("calibration", {}).get("record_reference", True)
             ),
@@ -429,6 +391,16 @@ class USRPBackend(Backend):
         self.process_worker.save_iq = self.save_iq
         self.process_worker.save_ds = self.save_ds
         self.process_worker.save_queue = self.save_queue
+        # save_ds sets the display rate too, so the advertised disp_freq has to
+        # follow it or the client keeps sizing buffers for the old rate.
+        self._refresh_display_frequency()
+
+    def _refresh_display_frequency(self):
+        disp_freq = self.get_display_frequency()
+        for source in list(self.mimo_sources) + list(self.cal_ref_sources):
+            source.disp_freq = disp_freq
+        if self.display_worker is not None:
+            self.display_worker.set_display_sources(self._display_sources())
 
     def _workers_in_start_order(self):
         """Every worker thread this device runs, paired with a name for logs."""
@@ -520,7 +492,10 @@ class USRPBackend(Backend):
     def _post_start_streaming(self):
         dpic_cfg = self.group_config.get("dpic_balance", {})
         if dpic_cfg.get("auto_on_start") and self.dpic_pairs:
-            self._run_dpic_balance()
+            # On its own thread, like a requested balance: this runs after the
+            # START_STREAMING reply but still on the command loop, so calling
+            # the search inline here left Stop unservable for its duration.
+            self._start_balance_thread()
 
     def _set_calibration_enabled(self, enabled: bool):
         """Toggle the calibration overlay through the Tx command queues.
@@ -534,6 +509,68 @@ class USRPBackend(Backend):
         for q in self.tx_command_queue.values():
             q.put({"param": "calibration.enabled", "value": enabled})
         self._cal_enabled = enabled
+
+    def _apply_channel_if(self, global_tx: int, freq: float):
+        """Move one Tx onto ``freq``, everywhere the IF is held.
+
+        Four places, all of which must agree or the tone is generated at one
+        frequency and looked for at another: the backend's own list (shared by
+        reference with the ProcessWorker), the ProcessWorker's band-pass, the
+        transmit workers' waveform generators, and the config the client reads
+        back.
+        """
+        freq = float(freq)
+        self.channel_ifs[global_tx] = freq
+        if global_tx < len(self.registry.tx_if_freq):
+            self.registry.tx_if_freq[global_tx] = freq
+
+        # Config, so the settings panel and a saved config show the IF the
+        # radio is actually driven at.
+        dev_name, local = self.global_tx_to_device[global_tx]
+        hw = self.hardware.get(dev_name)
+        if hw is not None:
+            if_freqs = list(hw.get("if_freq", []) or [])
+            while len(if_freqs) <= local:
+                if_freqs.append(freq)
+            if_freqs[local] = freq
+            hw["if_freq"] = if_freqs
+            self.group_config["hardware"] = self.hardware
+
+        if self.process_worker is not None:
+            self.process_worker.set_channel_if(global_tx, freq)
+
+        # Whole-group list: each transmit worker slices its own window out of
+        # it, so every device has to be told.
+        for q in self.tx_command_queue.values():
+            q.put({"param": "if_freq", "value": list(self.channel_ifs)})
+
+    def _coerce_dpic_inject_frequencies(self):
+        """Put every inject Tx on its measure Tx's IF before balancing.
+
+        The receive chain band-passes around the measure Tx's IF, so an inject
+        Tx anywhere else is rejected by that filter and no phase/amplitude can
+        cancel the direct path (see the rule in ENGINEERING_NOTES 3.5). A
+        mismatch used to be reported as an error and the balance ran anyway,
+        sweeping 241 points against a tone the Rx could not see; the frequency
+        is a consequence of which pair is being cancelled, not an independent
+        setting, so it is coerced rather than complained about.
+        """
+        num_tx = len(self.channel_ifs)
+        for pair in self.dpic_pairs:
+            if pair.inject_tx >= num_tx or pair.measure_tx >= num_tx:
+                continue
+            target_if = self.channel_ifs[pair.measure_tx]
+            inject_if = self.channel_ifs[pair.inject_tx]
+            if abs(inject_if - target_if) <= 1e-6:
+                continue
+            log_print(
+                self.logger,
+                "info",
+                f"[DPIC] Coercing inject Tx{pair.inject_tx} from "
+                f"{inject_if:.0f} Hz to {target_if:.0f} Hz to match measure "
+                f"Tx{pair.measure_tx}",
+            )
+            self._apply_channel_if(pair.inject_tx, target_if)
 
     def _validate_dpic_pairs(self):
         """Warn about pairs that cannot physically null the direct path."""
@@ -552,6 +589,7 @@ class USRPBackend(Backend):
             inject_if = self.channel_ifs[pair.inject_tx]
             measure_if = self.channel_ifs[pair.measure_tx]
             if abs(inject_if - measure_if) > 1e-6:
+                # Only reachable if the coercion above could not run.
                 log_print(
                     self.logger,
                     "error",
@@ -577,65 +615,7 @@ class USRPBackend(Backend):
         except Exception:
             return (0.0, 76.0)
 
-    def _auto_gain_rx(
-        self,
-        global_rx: int,
-        measure_tx: int,
-        target: float,
-        settle_s: float,
-        max_steps: int = 4,
-        tolerance_db: float = 1.0,
-    ):
-        """Bring the measured level on ``global_rx`` up to ``target``.
-
-        This is the 'boost Rx power to a usable level' step: a null search is
-        meaningless if the direct path sits in the noise floor.
-
-        The correction is proportional -- ``20*log10(target/level)`` dB in one
-        move -- rather than a fixed 3 dB ladder. A ladder needs up to ~25 steps
-        to cross a B2xx's gain range, and at roughly 100 ms per measurement that
-        alone would consume most of the balance time budget.
-        """
-        entry = self.global_rx_to_device.get(global_rx)
-        if entry is None or global_rx >= len(self.rx_gains_global):
-            return
-        dev_name, _local = entry
-        min_gain, max_gain = self._rx_gain_range(dev_name)
-        read_timeout = max(1.0, settle_s * 8)
-
-        for _ in range(max(int(max_steps), 1)):
-            level = self.process_worker.wait_for_metric(
-                measure_tx, global_rx, min_new=2, timeout=read_timeout
-            )
-            if level is None:
-                return
-            if level <= 0:
-                delta_db = max_gain - self.rx_gains_global[global_rx]
-            else:
-                delta_db = 20.0 * math.log10(target / level)
-            if abs(delta_db) <= tolerance_db:
-                break
-
-            new_gain = min(
-                max(self.rx_gains_global[global_rx] + delta_db, min_gain), max_gain
-            )
-            if abs(new_gain - self.rx_gains_global[global_rx]) < 1e-6:
-                break
-            self.rx_gains_global[global_rx] = new_gain
-            self.rx_command_queue[dev_name].put(
-                {"param": "rx_gain", "value": list(self.rx_gains_global)}
-            )
-            time.sleep(settle_s)
-
-        log_print(
-            self.logger,
-            "debug",
-            f"[DPIC] Rx{global_rx} gain set to "
-            f"{self.rx_gains_global[global_rx]:.1f} dB (target {target})",
-        )
-
     def _tx_gain_range(self, device_name: str):
-        """Analog Tx gain limits for a device, with a safe B2xx default."""
         usrp = self.usrp_handlers.get(device_name)
         try:
             rng = usrp.get_tx_gain_range()
@@ -643,42 +623,74 @@ class USRPBackend(Backend):
         except Exception:
             return (0.0, 89.75)
 
+    def _set_global_rx_gain(self, global_rx: int, value: float):
+        """Apply one Rx channel's analog gain, keeping the group list in step.
+
+        The command carries the whole global list because that is what the
+        ReceiveWorker's ``rx_gain`` handler consumes.
+        """
+        entry = self.global_rx_to_device.get(global_rx)
+        if entry is None or global_rx >= len(self.rx_gains_global):
+            return
+        dev_name, _local = entry
+        self.rx_gains_global[global_rx] = float(value)
+        apply_global_rx_values_to_hardware(
+            self.hardware, "rx_gain", list(self.rx_gains_global), self.group_config
+        )
+        self.rx_command_queue[dev_name].put(
+            {"param": "rx_gain", "value": list(self.rx_gains_global)}
+        )
+
+    def _set_global_tx_gain(self, global_tx: int, value: float):
+        """Apply one Tx channel's analog gain through its transmit worker."""
+        if global_tx >= len(self.tx_gains_global):
+            return
+        dev_name, _local = self.global_tx_to_device[global_tx]
+        self.tx_gains_global[global_tx] = float(value)
+        apply_global_tx_values_to_hardware(
+            self.hardware, "tx_gain", list(self.tx_gains_global), self.group_config
+        )
+        self.transmit_workers[dev_name].set_global_tx_param(global_tx, "gain", value)
+
     def _build_dpic_channel(self, pair, dpic_cfg) -> DpicChannel:
         settle_s = float(dpic_cfg.get("settle_time_s", 0.02))
-        gain_settle_s = float(dpic_cfg.get("gain_settle_time_s", 0.05))
-        amp_target = float(dpic_cfg.get("amp_target", 0.5))
         measure_rx = pair.target_rx
+        measure_tx = pair.measure_tx
 
         dev_name, _ = self.global_tx_to_device[pair.inject_tx]
         worker = self.transmit_workers[dev_name]
-        # Metric freshness timeout: two chunks plus slack, so a silent path
-        # fails fast without a slow chunk reading as "no data".
-        read_timeout = max(1.0, settle_s * 8)
+        # Metric freshness timeout: the longest dwell the balancer can ask for,
+        # plus slack, so a silent path fails fast without a slow chunk reading
+        # as "no data".
+        read_timeout = max(2.0, settle_s * 8, float(dpic_cfg.get("read_timeout_s", 0)))
+
+        rx_entry = self.global_rx_to_device.get(measure_rx)
+        rx_device = rx_entry[0] if rx_entry else dev_name
+        tx_device = self.global_tx_to_device[measure_tx][0]
 
         return DpicChannel(
             inject_tx=pair.inject_tx,
-            measure_tx=pair.measure_tx,
+            measure_tx=measure_tx,
             measure_rx=measure_rx,
             set_phase=lambda v: worker.set_global_tx_param(pair.inject_tx, "phase", v),
             set_amplitude=lambda v: worker.set_global_tx_param(
                 pair.inject_tx, "amplitude", v
             ),
-            set_gain=lambda v: self._set_inject_gain(pair.inject_tx, v),
             get_gain=lambda: self._get_inject_gain(pair.inject_tx),
-            gain_range=self._tx_gain_range(dev_name),
-            # Both readers wait for chunks captured *after* the change, so the
-            # search is never biased by the Rx buffering latency.
+            # Waits for chunks captured *after* the change, so the search is
+            # never biased by the Rx buffering latency.
             read_metric=lambda: self.process_worker.wait_for_metric(
-                pair.measure_tx, measure_rx, min_new=2, timeout=read_timeout
+                measure_tx, measure_rx, min_new=2, timeout=read_timeout
             ),
-            read_complex=lambda: self.process_worker.wait_for_metric_complex(
-                pair.measure_tx, measure_rx, min_new=2, timeout=read_timeout
-            ),
-            wait_settle=lambda: time.sleep(settle_s),
-            wait_gain_settle=lambda: time.sleep(gain_settle_s),
-            auto_gain_rx=lambda: self._auto_gain_rx(
-                measure_rx, pair.measure_tx, amp_target, settle_s
-            ),
+            # The balancer names the dwell; the VI's per-point waits.
+            wait_settle=time.sleep,
+            # The VI's gain stage moves the measure Tx and the Rx together.
+            get_rx_gain=lambda: float(self.rx_gains_global[measure_rx]),
+            set_rx_gain=lambda v: self._set_global_rx_gain(measure_rx, v),
+            get_tx_gain=lambda: float(self.tx_gains_global[measure_tx]),
+            set_tx_gain=lambda v: self._set_global_tx_gain(measure_tx, v),
+            rx_gain_range=self._rx_gain_range(rx_device),
+            tx_gain_range=self._tx_gain_range(tx_device),
             start_phase_deg=worker.get_global_tx_param(pair.inject_tx, "phase") or 0.0,
             start_amplitude=(
                 worker.get_global_tx_param(pair.inject_tx, "amplitude") or 0.0
@@ -692,28 +704,25 @@ class USRPBackend(Backend):
         val = self.transmit_workers[dev_name].get_global_tx_param(global_tx, "gain")
         return 0.0 if val is None else float(val)
 
-    def _set_inject_gain(self, global_tx: int, gain_db: float):
-        dev_name, _ = self.global_tx_to_device[global_tx]
-        self.transmit_workers[dev_name].set_global_tx_param(
-            global_tx, "gain", float(gain_db)
-        )
-        # Mirror locally so get_gain reflects the intent immediately rather than
-        # lagging by however long the Tx thread takes to drain its queue.
-        if global_tx < len(self.tx_gains_global):
-            self.tx_gains_global[global_tx] = float(gain_db)
-
     def _run_dpic_balance(self):
         if not self.dpic_pairs:
-            return None
-        if self.process_worker is None or not self.process_worker.is_running:
-            log_print(
-                self.logger,
-                "error",
-                "[DPIC] Balance requires the processing worker to be running; "
-                "start streaming first.",
+            message = (
+                "No DPIC pairs are configured for this device group; nothing to balance."
             )
-            return None
+            log_print(self.logger, "error", f"[DPIC] {message}")
+            return {"ok": False, "message": message, "results": []}
+        if self.process_worker is None or not self.process_worker.is_running:
+            message = (
+                "Balance requires the processing worker to be running; "
+                "start streaming first."
+            )
+            log_print(self.logger, "error", f"[DPIC] {message}")
+            return {"ok": False, "message": message, "results": []}
 
+        # Before validation: the IF mismatch it warns about is the one this
+        # resolves, and before the settle below, so the retuned waveform is on
+        # the air by the time the first metric is read.
+        self._coerce_dpic_inject_frequencies()
         self._validate_dpic_pairs()
 
         dpic_cfg = self.group_config.get("dpic_balance", {})
@@ -724,70 +733,28 @@ class USRPBackend(Backend):
         prev_cal = self._cal_enabled
         if prev_cal:
             self._set_calibration_enabled(False)
-            time.sleep(settle_s)
+        # One settle covers both the calibration overlay coming off and any IF
+        # coercion above landing on the next transmit buffer.
+        time.sleep(settle_s)
 
-        balancer = DpicBalancer(
-            phase_step_deg=dpic_cfg.get("phase_step_deg", 0.1),
-            amp_step=dpic_cfg.get("amp_step", 0.05),
-            coarse_phase_step_deg=dpic_cfg.get("coarse_phase_step_deg", 10.0),
-            coarse_amp_step=dpic_cfg.get("coarse_amp_step", 0.1),
-            max_amplitude=dpic_cfg.get("max_amplitude", 1.0),
-            amp_target=dpic_cfg.get("amp_target", 0.5),
-            settle_time_s=settle_s,
-            gain_settle_time_s=dpic_cfg.get("gain_settle_time_s", 0.05),
-            time_budget_s=dpic_cfg.get("time_budget_s", 25.0),
-            probe_amplitude=dpic_cfg.get("probe_amplitude", 0.5),
-            target_weight=dpic_cfg.get("target_weight", 0.5),
-            min_weight=dpic_cfg.get("min_weight", 0.15),
-            refine_iterations=dpic_cfg.get("refine_iterations", 3),
+        balancer = build_balancer(
+            dpic_cfg,
+            should_abort=self.balance_aborted,
+            on_progress=self.publish_balance_progress,
         )
 
         channels = [self._build_dpic_channel(p, dpic_cfg) for p in self.dpic_pairs]
         results = balancer.balance_all(channels)
-
-        for r in results:
-            if not r.converged:
-                log_print(
-                    self.logger,
-                    "error",
-                    f"[DPIC] Tx{r.inject_tx}->Tx{r.measure_tx}/Rx{r.measure_rx}: no "
-                    "metric was readable; previous phase/amplitude restored.",
-                )
-            else:
-                log_print(
-                    self.logger,
-                    "info",
-                    f"[DPIC] Tx{r.inject_tx}->Tx{r.measure_tx}/Rx{r.measure_rx} "
-                    f"[{r.method}]: phase={r.best_phase_deg:.2f} deg "
-                    f"amp={r.best_amplitude:.3f} gain={r.inject_gain_db:.1f} dB "
-                    f"null={r.null_depth_db:.1f} dB "
-                    f"({r.num_measurements} reads in {r.elapsed_s:.1f} s)",
-                )
+        outcome = balance_outcome(self.logger, results)
 
         if "dpic_balance" not in self.group_config:
             self.group_config["dpic_balance"] = {}
-        self.group_config["dpic_balance"]["last_results"] = [
-            {
-                "inject_tx": r.inject_tx,
-                "measure_tx": r.measure_tx,
-                "measure_rx": r.measure_rx,
-                "best_phase_deg": r.best_phase_deg,
-                "best_amplitude": r.best_amplitude,
-                "inject_gain_db": r.inject_gain_db,
-                "min_metric": r.min_metric,
-                "start_metric": r.start_metric,
-                "null_depth_db": r.null_depth_db,
-                "method": r.method,
-                "elapsed_s": r.elapsed_s,
-                "converged": r.converged,
-            }
-            for r in results
-        ]
+        self.group_config["dpic_balance"]["last_results"] = outcome["results"]
 
         if prev_cal:
             self._set_calibration_enabled(True)
 
-        return results
+        return outcome
 
     def get_data_sources(self):
         return set(self.mimo_sources) | set(self.cal_ref_sources)
@@ -803,8 +770,89 @@ class USRPBackend(Backend):
             sources += list(self.cal_ref_sources)
         return sorted(sources, key=lambda s: s.channel)
 
+    def _reload_channel_map(self, channel_map):
+        """Rebuild everything the channel map decides, in place.
+
+        DPIC pairs are *specified* in the channel map, and the channel map is
+        edited in the settings panel -- so this is the path a pair actually
+        arrives by. It used to fall through `_queue_param_update` untouched:
+        the value never reached `group_config`, `populate_data_sources()` was
+        never re-run, and `dpic_pairs` kept whatever the config file had at
+        connect time. Adding a pair in the UI and pressing Balance therefore
+        reported "No DPIC pairs are configured".
+        """
+        if self._streaming.is_set():
+            # The map decides how many rows the pipeline emits, so changing it
+            # mid-recording would desynchronise the file from its own header.
+            log_print(
+                self.logger,
+                "error",
+                "[USRP] Channel map changed while streaming; it takes "
+                "effect on the next Start.",
+            )
+            return False
+
+        self.group_config["channel_map"] = channel_map
+
+        # Schemes are a function of `hardware`, which a channel-map edit never
+        # touches, and the live transmit workers hold these exact objects --
+        # letting populate_data_sources() replace them would leave the workers
+        # driving detached schemes while the ProcessWorker demodulated against
+        # the new ones. Same for the runtime gains, which auto-gain moves
+        # without writing back to `hardware`.
+        preserved_schemes = dict(self.schemes_by_device)
+        preserved_rx_gains = list(self.rx_gains_global)
+        preserved_tx_gains = list(self.tx_gains_global)
+        cal_enabled = self._cal_enabled
+
+        self.populate_data_sources()
+
+        for device_name, scheme in preserved_schemes.items():
+            self.schemes_by_device[device_name] = scheme
+        if len(preserved_rx_gains) == len(self.rx_gains_global):
+            self.rx_gains_global = preserved_rx_gains
+        if len(preserved_tx_gains) == len(self.tx_gains_global):
+            self.tx_gains_global = preserved_tx_gains
+        self._cal_enabled = cal_enabled
+
+        if self.process_worker is not None:
+            self.process_worker.set_sources(
+                self.mimo_sources,
+                self.cal_ref_sources,
+                self.channel_ifs,
+                self.if_filter_bw,
+            )
+        self._refresh_display_frequency()
+
+        log_print(
+            self.logger,
+            "info",
+            f"[USRP] Channel map reloaded: {len(self.mimo_sources)} "
+            f"measurement source(s), {len(self.dpic_pairs)} DPIC pair(s)",
+        )
+        return True
+
+    def _apply_param_update_local(self, params):
+        """Parent-side mirror of the channel map.
+
+        ``get_data_sources()`` is answered out of the parent process, and the
+        parent's own `dpic_pairs` is what the balance command is dispatched
+        against, so the new map has to land here as well as in the child.
+        There are no workers on this side, so the plain rebuild is enough.
+        """
+        channel_map = (params or {}).get("channel_map")
+        if isinstance(channel_map, dict):
+            self.group_config["channel_map"] = channel_map
+            self.populate_data_sources()
+
     def _queue_param_update(self, params):
         for param, value in (params or {}).items():
+            if param == "channel_map" and isinstance(value, dict):
+                # Not forwarded to a worker queue: nothing down there reads it,
+                # and everything it decides is rebuilt here.
+                self._reload_channel_map(value)
+                continue
+
             if param == "calibration.enabled":
                 self._cal_enabled = bool(value)
                 self.group_config.setdefault("calibration", {})[

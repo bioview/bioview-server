@@ -4,6 +4,9 @@ Heavy dependencies (UHD) are loaded lazily so other backends (e.g. dummy RF
 simulation) can import ``process`` without requiring USRP drivers.
 """
 
+from bioview_common import log_print
+
+
 # Properties the Configurator may edit, as {name: field spec}. An empty
 # mapping means "not editable" and greys out the Edit button.
 EDITABLE_PROPERTIES = {
@@ -53,8 +56,15 @@ def set_device_config(device_info: dict, new_config: dict, logger=None):
         from .utils import invalidate_discovery_cache
 
         invalidate_discovery_cache()
-    except Exception:  # UHD absent: nothing was cached to drop
-        pass
+    except ImportError:
+        pass  # UHD absent: nothing was cached to drop.
+    except Exception as e:
+        log_print(
+            logger,
+            "warning",
+            f"Renamed to {new_name}, but the discovery cache could not be "
+            f"dropped ({e}); the old name may persist until the next rescan.",
+        )
 
     return True, f"Renamed to {new_name}."
 

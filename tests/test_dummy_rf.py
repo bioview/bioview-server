@@ -1,5 +1,6 @@
 """Tests for dummy RF MIMO / DPIC simulation."""
 
+import time
 from pathlib import Path
 
 import numpy as np
@@ -112,7 +113,7 @@ def test_dpic_pair_measure_rx_defaults_and_overrides():
     assert pairs[0].target_rx == 0
 
 
-def _channel(schemes, pair, read_metric, read_complex=None, **kw):
+def _channel(schemes, pair, read_metric, **kw):
     return DpicChannel(
         inject_tx=pair.inject_tx,
         measure_tx=pair.measure_tx,
@@ -120,7 +121,6 @@ def _channel(schemes, pair, read_metric, read_complex=None, **kw):
         set_phase=lambda v: schemes["MyB210_7"].tx_phase_deg.__setitem__(0, v),
         set_amplitude=lambda v: schemes["MyB210_7"].tx_amplitude.__setitem__(0, v),
         read_metric=read_metric,
-        read_complex=read_complex,
         start_phase_deg=schemes["MyB210_7"].tx_phase_deg[0],
         start_amplitude=schemes["MyB210_7"].tx_amplitude[0],
         **kw,
@@ -139,9 +139,7 @@ def test_dpic_balancer_finds_minimum_on_channel_model():
             schemes["MyB210_7"].tx_amplitude[0],
         )
 
-    balancer = DpicBalancer(
-        phase_step_deg=0.5, amp_step=0.02, settle_time_s=0.0, time_budget_s=30.0
-    )
+    balancer = DpicBalancer(time_budget_s=30.0)
     result = balancer.balance(_channel(schemes, dpic_pairs[0], read_metric))
 
     baseline = _measure_rx_power(model, schemes, global_tx_to_device, 0.0, 0.0)
@@ -160,7 +158,12 @@ def test_dpic_balancer_restores_settings_when_metric_unavailable():
     schemes["MyB210_7"].tx_phase_deg[0] = 137.0
     schemes["MyB210_7"].tx_amplitude[0] = 0.6
 
-    balancer = DpicBalancer(phase_step_deg=10.0, amp_step=0.1, settle_time_s=0.0)
+    balancer = DpicBalancer(
+        coarse_phase_step_deg=30.0,
+        phase_step_deg=10.0,
+        coarse_amp_step=0.2,
+        amp_step=0.1,
+    )
     result = balancer.balance(_channel(schemes, dpic_pairs[0], lambda: None))
 
     assert not result.converged
@@ -169,7 +172,7 @@ def test_dpic_balancer_restores_settings_when_metric_unavailable():
     assert schemes["MyB210_7"].tx_amplitude[0] == 0.6
 
 
-def test_dpic_grid_fallback_is_cheaper_than_a_flat_sweep():
+def test_dpic_grid_is_cheaper_than_a_flat_sweep():
     """Coarse-to-fine must not cost a full-resolution sweep of the whole range."""
     _model, schemes, _map, dpic_pairs = _build_rf_context()
     calls = []
@@ -183,87 +186,57 @@ def test_dpic_grid_fallback_is_cheaper_than_a_flat_sweep():
             * np.exp(1j * np.deg2rad(schemes["MyB210_7"].tx_phase_deg[0]))
         )
 
-    balancer = DpicBalancer(
-        phase_step_deg=0.1, amp_step=0.05, settle_time_s=0.0, time_budget_s=60.0
-    )
-    # No read_complex, so the closed-form solve is unavailable.
+    balancer = DpicBalancer(time_budget_s=60.0)
     result = balancer.balance(_channel(schemes, dpic_pairs[0], read_metric))
 
     assert result.converged
     assert result.method == "grid"
-    # A flat 0.1 deg sweep alone would be 3600 points.
-    assert len(calls) < 400
-    assert abs(result.best_phase_deg - (np.rad2deg(2.1) + 180.0) % 360.0) < 1.0
+    # A flat 0.2 deg sweep alone would be 1800 points.
+    assert len(calls) == 241
+    assert abs(result.best_phase_deg - (np.rad2deg(2.1) + 180.0) % 360.0) < 0.3
 
 
-def test_dpic_closed_form_beats_grid_on_measurement_count():
-    """With a phasor available the solve should need a handful of reads."""
+def test_dpic_grid_resolves_a_minimum_off_the_coarse_lattice():
+    """The fine pass must cover +/- a full coarse step, either side of the winner."""
     _model, schemes, _map, dpic_pairs = _build_rf_context()
-    # Chosen so the ideal weight |w*| = |d/h| = 0.6 sits inside the digital
-    # range; the clipping case is covered by the analog-gain test below.
-    d = 0.30 * np.exp(1j * 2.1)
-    h = 0.50 * np.exp(-1j * 0.7)
-    calls = []
+    # 3 deg off the 6 deg coarse lattice, so the coarse winner is on one side.
+    target_phase, target_amp = 123.0, 0.427
 
-    def residual():
-        calls.append(1)
-        w = schemes["MyB210_7"].tx_amplitude[0] * np.exp(
-            1j * np.deg2rad(schemes["MyB210_7"].tx_phase_deg[0])
+    def read_metric():
+        return abs(
+            target_amp * np.exp(1j * np.deg2rad(target_phase))
+            - schemes["MyB210_7"].tx_amplitude[0]
+            * np.exp(1j * np.deg2rad(schemes["MyB210_7"].tx_phase_deg[0]))
         )
-        return complex(d + h * w)
 
-    balancer = DpicBalancer(settle_time_s=0.0, time_budget_s=30.0)
+    balancer = DpicBalancer(time_budget_s=60.0)
+    result = balancer.balance(_channel(schemes, dpic_pairs[0], read_metric))
+
+    assert result.converged
+    assert abs(result.best_phase_deg - target_phase) <= 0.2
+    assert abs(result.best_amplitude - target_amp) <= 0.001
+
+
+def test_dpic_time_budget_keeps_the_best_point_seen():
+    """A sweep cut short must not restore the start point or leave amplitude 0."""
+    _model, schemes, _map, dpic_pairs = _build_rf_context()
+    schemes["MyB210_7"].tx_phase_deg[0] = 137.0
+    schemes["MyB210_7"].tx_amplitude[0] = 0.6
+
+    # Budget expires partway through the first coarse sweep.
+    balancer = DpicBalancer(time_budget_s=0.05)
     result = balancer.balance(
         _channel(
             schemes,
             dpic_pairs[0],
-            read_metric=lambda: abs(residual()),
-            read_complex=residual,
+            lambda: 1.0 - schemes["MyB210_7"].tx_phase_deg[0] / 1e4,
+            wait_settle=lambda _s: time.sleep(0.005),
         )
     )
 
     assert result.converged
-    assert result.method == "closed_form"
-    assert len(calls) <= 20
-    assert result.min_metric < 1e-6
-    ideal = -d / h
-    assert abs(result.best_amplitude - abs(ideal)) < 1e-3
-
-
-def test_dpic_uses_analog_gain_when_digital_weight_would_clip():
-    """|w*| > 1 is only reachable by raising the inject Tx's analog gain."""
-    _model, schemes, _map, dpic_pairs = _build_rf_context()
-    state = {"gain": 20.0}
-    d = 3.0 * np.exp(1j * 0.3)
-    h_ref = 0.30 * np.exp(1j * 1.1)
-
-    def residual():
-        h = h_ref * (10 ** ((state["gain"] - 20.0) / 20.0))
-        w = schemes["MyB210_7"].tx_amplitude[0] * np.exp(
-            1j * np.deg2rad(schemes["MyB210_7"].tx_phase_deg[0])
-        )
-        return complex(d + h * w)
-
-    balancer = DpicBalancer(
-        settle_time_s=0.0, gain_settle_time_s=0.0, time_budget_s=30.0
-    )
-    result = balancer.balance(
-        _channel(
-            schemes,
-            dpic_pairs[0],
-            read_metric=lambda: abs(residual()),
-            read_complex=residual,
-            set_gain=lambda g: state.__setitem__("gain", g),
-            get_gain=lambda: state["gain"],
-            gain_range=(0.0, 89.75),
-            wait_gain_settle=lambda: None,
-        )
-    )
-
-    assert result.converged
-    assert result.inject_gain_db > 20.0
-    assert result.best_amplitude <= 1.0
-    assert result.min_metric < 1e-6
+    assert result.num_measurements < 241
+    assert schemes["MyB210_7"].tx_amplitude[0] == result.best_amplitude
 
 
 def test_dummy_dpic_config_file_exists():

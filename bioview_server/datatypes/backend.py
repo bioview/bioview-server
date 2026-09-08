@@ -1,6 +1,8 @@
+import contextlib
 import logging
 import multiprocessing as mp
 import queue
+import threading
 import time
 
 from bioview_common import (
@@ -36,6 +38,11 @@ START_STREAMING_TIMEOUT = 5
 STOP_STREAMING_TIMEOUT = 15
 DISCONNECT_TIMEOUT = 15
 DEFAULT_TIMEOUT = 10
+
+# One entry per measurement, drained about once a second by the client's poll.
+# Deep enough to survive a slow poll, shallow enough that a client which stops
+# polling costs nothing.
+BALANCE_PROGRESS_QUEUE_DEPTH = 64
 
 
 class _StepTimer:
@@ -89,6 +96,9 @@ class Backend(mp.Process):
         # Parameters
         self.group_id = group_id
         self.data_sources: set[DataSource] = set()
+        # Replaced in run(), inside the child. Defined here so any code touching
+        # it from the parent gets a no-op logger rather than an AttributeError.
+        self.logger = None
 
         # Queues
         self.command_queue = mp.Queue()
@@ -96,6 +106,11 @@ class Backend(mp.Process):
         # Bounded: an unbounded display queue grows without limit whenever the
         # client or the socket writer falls behind.
         self.display_queue = mp.Queue(maxsize=DISPLAY_QUEUE_DEPTH)
+
+        # Balance progress, child -> parent. Small dicts, one per measurement;
+        # bounded because a UI that stops draining must never grow it without
+        # limit, and only the newest entry is worth anything anyway.
+        self.progress_queue = mp.Queue(maxsize=BALANCE_PROGRESS_QUEUE_DEPTH)
 
         self.data_output_queue = data_output_queue
         # Never shared between backends: a reply carries no sender, so two
@@ -115,6 +130,47 @@ class Backend(mp.Process):
         self._running = mp.Event()
         self._streaming = mp.Event()
         self._request_id = 0
+        self._init_local_state()
+
+    def _init_local_state(self):
+        """Locks, events and threads that must not cross the process boundary.
+
+        Parent-side reply routing: a balance is answered on its own thread
+        while Stop is answered on the command thread, so two callers can be
+        inside ``_request()`` on one response queue; whichever reads a reply
+        that is not its own parks it in ``_pending_replies`` for the thread
+        waiting on it. Dropping it -- what the old ``continue`` did -- lost the
+        other caller's answer and timed it out.
+
+        Child-side balance state: the search runs on its own thread so
+        STOP_STREAMING and SHUTDOWN are still answered while it is in flight.
+
+        Both sides are rebuilt after unpickling (see ``__setstate__``): spawn
+        pickles this object into the child, and a lock, an event or a live
+        thread cannot survive that.
+        """
+        self._reply_lock = threading.Lock()
+        self._pending_replies = {}
+        self._balance_thread = None
+        self._balance_abort = threading.Event()
+
+    #: Rebuilt in the child rather than shipped to it; see _init_local_state.
+    _LOCAL_STATE_KEYS = (
+        "_reply_lock",
+        "_pending_replies",
+        "_balance_thread",
+        "_balance_abort",
+    )
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        for key in self._LOCAL_STATE_KEYS:
+            state.pop(key, None)
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._init_local_state()
 
     #: Step tracer for bring-up paths; see _StepTimer.
     _StepTimer = _StepTimer
@@ -209,12 +265,111 @@ class Backend(mp.Process):
         raise NotImplementedError
 
     def _run_dpic_balance(self):
-        """Overridden by the USRP backend."""
-        return None
+        """Overridden by backends that support DPIC.
+
+        Returns ``{"ok": bool, "message": str, "results": list}``.
+        """
+        return {
+            "ok": False,
+            "message": f"{self.group_id} does not support DPIC balance.",
+            "results": [],
+        }
 
     def _post_start_streaming(self):
         """Hook for work that must run after START_STREAMING has been answered."""
         return None
+
+    def publish_balance_progress(self, payload: dict):
+        """Child side: offer the balancer's live state to the parent.
+
+        Dropped rather than blocked on when the queue is full: a stalled UI must
+        never slow the search down, and the next measurement supersedes this one
+        anyway.
+        """
+        with contextlib.suppress(Exception):
+            self.progress_queue.put_nowait(payload)
+
+    def drain_balance_progress(self):
+        """Parent side: the most recent progress entry, or None if there is none.
+
+        Everything queued is drained, not just one entry, so a poll that runs
+        after a burst of measurements reports where the search *is* rather than
+        walking through where it has been.
+        """
+        latest = None
+        while True:
+            try:
+                latest = self.progress_queue.get_nowait()
+            except queue.Empty:
+                return latest
+            except (OSError, ValueError):
+                return latest
+
+    def balance_aborted(self) -> bool:
+        """True once a running balance has been asked to stop.
+
+        Handed to ``DpicBalancer.should_abort`` by the backends that support
+        DPIC, so an abort takes effect at the next sweep point instead of after
+        the whole time budget.
+        """
+        return self._balance_abort.is_set()
+
+    def _abort_balance(self, join_timeout: float = 5.0):
+        """Ask a running balance to stop and wait briefly for it to unwind."""
+        thread = self._balance_thread
+        if thread is None or not thread.is_alive():
+            return
+        log_print(
+            self.logger,
+            "info",
+            f"[DPIC] Aborting the running balance on {self.group_id}",
+        )
+        self._balance_abort.set()
+        thread.join(timeout=join_timeout)
+
+    def _balance_in_progress(self) -> bool:
+        return self._balance_thread is not None and self._balance_thread.is_alive()
+
+    def _start_balance_thread(self, request_id=None):
+        """Run one balance off the command loop and reply when it finishes.
+
+        ``request_id`` is None for the auto-balance that follows START_STREAMING:
+        nobody is waiting on a reply for it, and putting one on the queue with a
+        null id would let an unrelated caller claim it.
+        """
+
+        # Safety net for the caller that does not check first (the
+        # auto-balance): two searches driving one radio would fight.
+        if self._balance_in_progress():
+            return False
+
+        def _worker():
+            try:
+                # Always a dict: a balance that bails out early carries the
+                # reason, so it can never reach the client as a success.
+                outcome = self._run_dpic_balance()
+                ok = bool(outcome.get("ok"))
+                payload = {
+                    "type": Response.SUCCESS if ok else Response.ERROR,
+                    "message": outcome.get("message", ""),
+                    "result": outcome.get("results", []),
+                }
+            except Exception as e:
+                log_print(self.logger, "error", f"DPIC balance failed: {e}")
+                payload = {
+                    "type": Response.ERROR,
+                    "message": str(e) or f"{type(e).__name__} in {self.group_id}",
+                    "result": [],
+                }
+            if request_id is not None:
+                self._reply(request_id, payload)
+
+        self._balance_abort.clear()
+        self._balance_thread = threading.Thread(
+            target=_worker, name=f"dpic-balance-{self.group_id}", daemon=True
+        )
+        self._balance_thread.start()
+        return True
 
     def _apply_param_update_local(self, params: dict):
         """Parent-side mirror of the parameters that change ``data_sources``."""
@@ -279,10 +434,16 @@ class Backend(mp.Process):
 
                 case IPCCommand.STOP_STREAMING:
                     self._streaming.clear()
+                    # A balance measures a live stream; stopping the radio out
+                    # from under it would leave it waiting on metrics that can
+                    # never arrive until its read timeout expires, once per
+                    # sweep point.
+                    self._abort_balance()
                     result = self._stop_streaming()
                     self._reply(request_id, {"type": Response.SUCCESS, "result": result})
 
                 case IPCCommand.DISCONNECT_DEVICES:
+                    self._abort_balance()
                     result = self._disconnect()
                     self._reply(request_id, {"type": Response.SUCCESS, "result": result})
 
@@ -291,14 +452,27 @@ class Backend(mp.Process):
                     self._reply(request_id, {"type": Response.SUCCESS, "result": None})
 
                 case IPCCommand.RUN_DPIC_BALANCE:
-                    result = self._run_dpic_balance()
-                    self._reply(
-                        request_id,
-                        {"type": Response.SUCCESS, "result": result is not None},
-                    )
+                    # Answered from the balance thread, not from here: the
+                    # search takes a minute or more and the command loop has to
+                    # keep serving Stop and Shutdown throughout.
+                    if self._balance_in_progress():
+                        self._reply(
+                            request_id,
+                            {
+                                "type": Response.ERROR,
+                                "message": (
+                                    f"A DPIC balance is already running on "
+                                    f"{self.group_id}"
+                                ),
+                                "result": [],
+                            },
+                        )
+                    else:
+                        self._start_balance_thread(request_id)
 
                 case IPCCommand.SHUTDOWN:
                     self._streaming.clear()
+                    self._abort_balance()
                     self._running.clear()
 
         except Exception as e:
@@ -322,16 +496,24 @@ class Backend(mp.Process):
         Replies are matched by request id, so a late answer to a request that
         already timed out is discarded rather than handed to the next caller.
         """
-        self._request_id += 1
-        request_id = self._request_id
+        with self._reply_lock:
+            self._request_id += 1
+            request_id = self._request_id
         self.command_queue.put(
             {"command": command, "args": args or {}, "request_id": request_id}
         )
 
         deadline = time.monotonic() + timeout
         while True:
+            with self._reply_lock:
+                parked = self._pending_replies.pop(request_id, None)
+            if parked is not None:
+                return parked
+
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                with self._reply_lock:
+                    self._pending_replies.pop(request_id, None)
                 raise DeviceError(
                     f"{self.group_id} did not answer "
                     f"{self._command_name(command)} within {timeout:.0f}s"
@@ -355,9 +537,15 @@ class Backend(mp.Process):
 
             if not isinstance(response, dict):
                 continue
-            if response.get("request_id") not in (None, request_id):
-                continue
-            return response
+            reply_id = response.get("request_id")
+            if reply_id in (None, request_id):
+                return response
+            with self._reply_lock:
+                # Bounded: a reply to a request that already timed out is never
+                # claimed, and this map must not grow for the life of the run.
+                if len(self._pending_replies) >= 32:
+                    self._pending_replies.pop(next(iter(self._pending_replies)))
+                self._pending_replies[reply_id] = response
 
     def _request_or_raise(self, command, args=None, timeout=DEFAULT_TIMEOUT):
         response = self._request(command, args, timeout)
@@ -382,12 +570,14 @@ class Backend(mp.Process):
     def queue_param_update(self, **params):
         # Fire and forget: applying this can restart the device stream, and the
         # server must not block its command thread on that.
-        self._request_id += 1
+        with self._reply_lock:
+            self._request_id += 1
+            request_id = self._request_id
         self.command_queue.put(
             {
                 "command": IPCCommand.UPDATE_RUNNING_PARAMETER,
                 "args": params,
-                "request_id": self._request_id,
+                "request_id": request_id,
             }
         )
         # get_data_sources() is answered by the parent, so source-affecting
@@ -395,11 +585,7 @@ class Backend(mp.Process):
         try:
             self._apply_param_update_local(params)
         except Exception as e:
-            log_print(
-                getattr(self, "logger", None),
-                "warning",
-                f"Local param mirror failed: {e}",
-            )
+            log_print(self.logger, "warning", f"Local param mirror failed: {e}")
 
     def run_dpic_balance(self, timeout: float = 1800):
         return self._request(IPCCommand.RUN_DPIC_BALANCE, timeout=timeout)

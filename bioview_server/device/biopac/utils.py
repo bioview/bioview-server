@@ -8,7 +8,7 @@ from ctypes import byref, c_double, c_int
 from pathlib import Path
 
 import wmi
-from bioview_common import get_cache_file
+from bioview_common import get_cache_file, log_print
 
 from .constants import (
     BIOPAC_CONNECTION_CODES,
@@ -198,11 +198,7 @@ def _discover_devices_list():
         pythoncom = _com_module()
         if pythoncom is not None:
             try:
-                # Prefer CoInitializeEx for safety; fallback to CoInitialize
-                if hasattr(pythoncom, "CoInitializeEx"):
-                    pythoncom.CoInitializeEx(0x2)  # COINIT_MULTITHREADED
-                else:
-                    pythoncom.CoInitialize()
+                pythoncom.CoInitializeEx(0x2)  # COINIT_MULTITHREADED
                 coinit = True
             except Exception:
                 pythoncom = None
@@ -257,11 +253,8 @@ def _discover_devices_list():
         # No return in this block: it would swallow an in-flight exception
         # and turn a COM failure into "no devices attached".
         if coinit and pythoncom is not None:
-            try:
-                if hasattr(pythoncom, "CoUninitialize"):
-                    pythoncom.CoUninitialize()
-            except Exception:
-                pass
+            with contextlib.suppress(Exception):
+                pythoncom.CoUninitialize()
 
     return discovered_devices
 
@@ -393,14 +386,18 @@ def start_acq_daemon(mpdev_handler) -> bool:
     return True
 
 
-def daemon_last_error(mpdev_handler):
+def daemon_last_error(mpdev_handler, logger=None):
     """mpdev's daemon-specific error code, or None if the DLL cannot report one."""
     last_error = getattr(mpdev_handler, "getMPDaemonLastError", None)
     if last_error is None:
         return None
-    with contextlib.suppress(Exception):
+    try:
         return last_error()
-    return None
+    except Exception as e:
+        # Called while diagnosing another failure, so this must not raise --
+        # but it must not vanish either, or the diagnosis loses its detail.
+        log_print(logger, "debug", f"getMPDaemonLastError failed: {e}")
+        return None
 
 
 def start_acquisition(mpdev_handler):
@@ -420,26 +417,33 @@ def stop_acquisition(mpdev_handler):
 
 
 def disconnect_biopac_device(mpdev_handler):
-    if hasattr(mpdev_handler, "disconnectMPDev"):
-        result_code = mpdev_handler.disconnectMPDev()
-        if BIOPAC_CONNECTION_CODES.get(result_code, None) not in (
-            "MPSUCCESS",
-            None,
-        ):
-            raise Exception(f"BIOPAC Disconnect Failed with Error Code: {result_code}")
+    result_code = mpdev_handler.disconnectMPDev()
+    if BIOPAC_CONNECTION_CODES.get(result_code, None) not in ("MPSUCCESS", None):
+        raise Exception(f"BIOPAC Disconnect Failed with Error Code: {result_code}")
 
 
-def get_mpdev_path():
+def get_mpdev_path(logger=None):
+    """Cached mpdev.dll path, or None when there is not one to use.
+
+    Absent is the normal first-run case. Present-but-unreadable is a fault and
+    is reported: it used to print to a stdout a GUI-spawned server has nobody
+    reading, so the DLL was silently re-searched for on every start.
+    """
     cache_file = get_cache_file("mpdev_path")
-
     try:
         with open(cache_file) as fobj:
-            dll_path = json.load(fobj)
-    except Exception:
-        print("mpdev path is not cached")
+            return json.load(fobj)
+    except FileNotFoundError:
+        log_print(logger, "debug", "mpdev path is not cached yet")
         return None
-
-    return dll_path
+    except (OSError, json.JSONDecodeError) as e:
+        log_print(
+            logger,
+            "warning",
+            f"mpdev path cache at {cache_file} is unreadable ({e}); "
+            "searching for the DLL again.",
+        )
+        return None
 
 
 def update_mpdev_path(dll_path):

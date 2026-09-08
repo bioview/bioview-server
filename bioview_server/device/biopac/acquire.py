@@ -148,7 +148,7 @@ class BiopacAcquisitionWorker(PausableWorker):
         if now - self._last_lag_warning < _LAG_WARN_INTERVAL_S:
             return
         self._last_lag_warning = now
-        detail = daemon_last_error(self.mpdev_handler)
+        detail = daemon_last_error(self.mpdev_handler, self.logger)
         suffix = f" (daemon error {detail})" if detail is not None else ""
         log_print(
             self.logger,
