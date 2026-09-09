@@ -92,19 +92,10 @@ def test_a_server_without_the_idle_flag_stays_up(server, clients):
     assert server.running
 
 
-def test_discovery_probes_do_not_keep_an_idle_server_alive(idle_server):
-    """The idle check must not hang off accept() timing out.
+def _probe_loop(control_port, command, stop, params=None):
+    """Hammer the control port with one command until told to stop."""
 
-    A GUI hunting for a server probes localhost once a second, and a LAN scan
-    probes every host; either would keep accept() busy and, if the check only
-    ran when accept() timed out, hold an abandoned server open indefinitely.
-    """
-    srv, client, thread = idle_server(1.0)
-    control_port = srv.control_port
-
-    stop = threading.Event()
-
-    def keep_probing():
+    def _run():
         while not stop.is_set():
             with (
                 contextlib.suppress(OSError),
@@ -112,14 +103,107 @@ def test_discovery_probes_do_not_keep_an_idle_server_alive(idle_server):
                     ("127.0.0.1", control_port), timeout=0.5
                 ) as sock,
             ):
-                send_command(sock, Command.DISCOVER_SERVERS)
+                send_command(sock, command, params=params)
             time.sleep(0.1)
 
-    prober = threading.Thread(target=keep_probing, daemon=True)
-    prober.start()
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    return thread
+
+
+def _claim(token="window-1", heartbeat=0.5, **extra):
+    return {"window": token, "heartbeat": heartbeat, **extra}
+
+
+def test_the_idle_check_does_not_hang_off_accept_timing_out(idle_server):
+    """Traffic that is not a claim must not postpone the idle shutdown.
+
+    The check used to run only when accept() timed out, so anything keeping the
+    accept loop busy -- here, connections the server rejects -- would hold an
+    abandoned server open indefinitely.
+    """
+    srv, _client, thread = idle_server(1.0)
+
+    stop = threading.Event()
+    prober = _probe_loop(srv.control_port, Command.GET_DEVICE_STATUS, stop)
     try:
         thread.join(timeout=10)
         assert not srv.running, "server stayed up while being probed"
     finally:
         stop.set()
         prober.join(timeout=2)
+
+
+def test_a_window_holds_its_server_open_without_ever_connecting(idle_server):
+    """A claiming window is a window that intends to connect.
+
+    It may not have authenticated yet -- the Monitor builds its client only
+    once its configuration dialog has been answered, and that can take as long
+    as the user likes. So a window's heartbeat holds the server open, and the
+    server only retires once nothing claims it any more.
+    """
+    srv, _client, thread = idle_server(1.0)
+
+    stop = threading.Event()
+    prober = _probe_loop(
+        srv.control_port, Command.DISCOVER_SERVERS, stop, params=_claim()
+    )
+    try:
+        time.sleep(3.0)
+        assert srv.running, "a server a window still wanted was retired"
+    finally:
+        stop.set()
+        prober.join(timeout=2)
+
+    # ...and it is not immortal: once the last window stops calling, so is it.
+    thread.join(timeout=10)
+    assert not srv.running, "server stayed up after its last window went quiet"
+
+
+def test_an_anonymous_probe_answers_but_claims_nothing(idle_server):
+    """A subnet scan sweeps every host on the network. Answering one must not
+    be enough to keep an abandoned server alive."""
+    srv, _client, thread = idle_server(1.0)
+
+    stop = threading.Event()
+    prober = _probe_loop(srv.control_port, Command.DISCOVER_SERVERS, stop)
+    try:
+        thread.join(timeout=10)
+        assert not srv.running, "an unclaimed server was held open by a bare probe"
+    finally:
+        stop.set()
+        prober.join(timeout=2)
+
+
+def test_a_window_that_says_goodbye_is_forgotten_at_once(idle_server):
+    """Closing a window must not leave its claim to time out: the next window
+    to close would then see a phantom and decline to shut the server down."""
+    srv, _client, _thread = idle_server(0)
+
+    with socket.create_connection(("127.0.0.1", srv.control_port), timeout=5) as sock:
+        raw = send_command(sock, Command.DISCOVER_SERVERS, params=_claim(heartbeat=60))
+        _, payload = parse_and_validate_response(raw)
+    assert payload["windows"] == 1
+
+    with socket.create_connection(("127.0.0.1", srv.control_port), timeout=5) as sock:
+        raw = send_command(
+            sock, Command.DISCOVER_SERVERS, params=_claim(heartbeat=60, leaving=True)
+        )
+        _, payload = parse_and_validate_response(raw)
+    assert payload["windows"] == 0, "the reply counts everyone but the leaver"
+
+
+def test_windows_are_counted_separately_not_collapsed(idle_server):
+    """Two windows, two claims: the second to close is the one that may kill."""
+    srv, _client, _thread = idle_server(0)
+
+    for token in ("window-a", "window-b"):
+        with socket.create_connection(
+            ("127.0.0.1", srv.control_port), timeout=5
+        ) as sock:
+            raw = send_command(
+                sock, Command.DISCOVER_SERVERS, params=_claim(token, heartbeat=60)
+            )
+            _, payload = parse_and_validate_response(raw)
+
+    assert payload["windows"] == 2

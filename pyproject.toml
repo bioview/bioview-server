@@ -26,7 +26,12 @@ dependencies = [
     # BIOPAC discovery enumerates USB devices through WMI. It was an opt-in
     # extra, so a normal install left the whole BIOPAC backend unavailable and
     # attached hardware simply never showed up.
-    "wmi (>=1.5.1) ; platform_system == 'Windows'"
+    "wmi (>=1.5.1) ; platform_system == 'Windows'",
+    # PortAudio bindings for the microphone backend. A regular dependency
+    # rather than an extra: the backend registry probes it at import and
+    # reports "not available" if it is missing, which looks to a user like
+    # broken hardware rather than an install choice.
+    "sounddevice (>=0.4.6,<0.6)"
 ]
 
 [project.scripts]

@@ -14,8 +14,10 @@ from bioview_common.signal_schemes.dpic import DpicBalancer, DpicChannel
 from bioview_server.device.dummy.rf_simulation import MimoChannelModel
 
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-DUMMY_DPIC_CFG = REPO_ROOT / "dummy_dpic_2x2_mimo_cfg.json"
+# Kept beside the tests: the server is checked out on its own in CI,
+# so a path above the repo root does not exist there.
+DATA_DIR = Path(__file__).resolve().parent / "data"
+DUMMY_DPIC_CFG = DATA_DIR / "dummy_dpic_2x2_mimo_cfg.json"
 
 
 def _build_rf_context():

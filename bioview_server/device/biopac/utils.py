@@ -7,7 +7,15 @@ import threading
 from ctypes import byref, c_double, c_int
 from pathlib import Path
 
-import wmi
+
+# BIOPAC is a Windows-only backend and wmi is a Windows-only package, but
+# the module still has to import elsewhere so its non-WMI helpers stay
+# testable. device/__init__ refuses to load this backend off Windows, so
+# nothing reaches the WMI calls below with wmi set to None.
+try:
+    import wmi
+except ImportError:  # pragma: no cover - not running on Windows
+    wmi = None
 from bioview_common import get_cache_file, log_print
 
 from .constants import (

@@ -204,8 +204,13 @@ def test_the_save_queue_gets_its_own_copy(display_queue):
 
     displayed = display_queue.get_nowait()
     saved = save_queue.get_nowait()
-    np.testing.assert_array_equal(displayed, saved)
-    assert displayed is not saved
+    # The save path carries a tagged record; the samples inside must match the
+    # displayed chunk without sharing its buffer.
+    np.testing.assert_array_equal(displayed, saved["data"])
+    assert displayed is not saved["data"]
+    assert not np.shares_memory(displayed, saved["data"])
+    assert saved["sample_idx"] == 0
+    assert saved["t_wall"] > 0
 
 
 # --- Backend wiring -------------------------------------------------------

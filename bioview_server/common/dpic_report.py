@@ -30,6 +30,7 @@ BALANCER_KEYS = (
     "gain_step_db",
     "gain_settle_time_s",
     "max_gain_steps",
+    "parallel_devices",
 )
 
 

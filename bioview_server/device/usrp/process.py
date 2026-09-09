@@ -89,11 +89,44 @@ class ProcessWorker(PausableWorker):
         self.display_chunks_dropped = 0
         self._last_drops_logged = 0
 
+        self._rebuild_demod_sources()
+
+    def _rebuild_demod_sources(self):
+        """Pick one source per (Tx, Rx) pair to carry the demodulator state.
+
+        A group streaming both amplitude and phase advertises two sources for
+        the same physical pair. Demodulation is per pair, not per row: running
+        it once per source would advance the phase accumulator and the filter
+        state twice per chunk, and the second pass would see a buffer it has
+        already consumed. Only the representative holds state; the other rows
+        read the components it produced.
+        """
+        seen = {}
+        for source in self.mimo_sources:
+            seen.setdefault((source.tx_idx, source.rx_idx), source)
+        self._demod_sources = list(seen.values())
+
+        # More rows than pairs means components were named explicitly, so each
+        # row already carries exactly one component and the save path stores
+        # them as plain rows rather than as a stacked real/imaginary pair.
+        self._per_source_components = len(self.mimo_sources) > len(self._demod_sources)
+
         for source in self.mimo_sources:
             source.accumulated_phase = 0.0
             source.filter_state = None
             source.prev_phase = None
             source.accumulated_sample_idx = 0
+
+    def _component_of(self, source) -> str:
+        """Which of the two derived quantities this row carries.
+
+        Falls back to the legacy group-wide ``display_imaginary`` switch for
+        sources built before components were named per row.
+        """
+        component = getattr(source, "component", None)
+        if component is not None:
+            return component
+        return "phase" if self.display_imaginary else "amplitude"
 
     def _load_filter(self, freq: float, bandwidth: float, order: int = 2):
         low_cutoff = freq - bandwidth / 2
@@ -150,11 +183,7 @@ class ProcessWorker(PausableWorker):
         with self._metrics_cv:
             self.latest_metrics.clear()
 
-        for source in self.mimo_sources:
-            source.accumulated_phase = 0.0
-            source.filter_state = None
-            source.prev_phase = None
-            source.accumulated_sample_idx = 0
+        self._rebuild_demod_sources()
 
     def _log_drops(self):
         total = self.save_chunks_dropped + self.display_chunks_dropped
@@ -302,10 +331,14 @@ class ProcessWorker(PausableWorker):
         return envelope[: num_windows * step].reshape(num_windows, step).mean(axis=1)
 
     def _process_mimo_chunk(self, buffer):
-        """Process all MIMO sources once; update metrics and return per-source comps."""
+        """Demodulate every (Tx, Rx) pair once.
+
+        Keyed by ``(tx_idx, rx_idx)`` rather than by channel because several
+        display rows can share one pair -- one per streamed component.
+        """
         results = {}
         metrics = {}
-        for source in self.mimo_sources:
+        for source in self._demod_sources:
             data = buffer[source.rx_idx, :]
             dev_name, _ = self.global_tx_to_device.get(
                 source.tx_idx, (self.rx_device_order[0], source.tx_idx)
@@ -318,7 +351,7 @@ class ProcessWorker(PausableWorker):
                 if_freq=self.channel_ifs[source.tx_idx],
                 scheme=scheme,
             )
-            results[source.channel] = (first_comp, second_comp)
+            results[(source.tx_idx, source.rx_idx)] = (first_comp, second_comp)
             if metric is not None:
                 metrics[(source.tx_idx, source.rx_idx)] = metric
 
@@ -338,23 +371,28 @@ class ProcessWorker(PausableWorker):
         # Calibration reference rows go to the display as well as to disk;
         # the backend advertises a CalRef_* source for each.
         n_rows = num_mimo + num_cal
-        if self.save_imaginary:
+        # The display payload is always one value per advertised source: the
+        # component that source names. The save path keeps its older stacked
+        # (row, sample, 2) form unless the rows already carry one component
+        # each, in which case stacking would just duplicate them.
+        stack_save = self.save_imaginary and not self._per_source_components
+        if stack_save:
             save_list = np.zeros((n_rows, len_samples, 2))
-            display_list = np.zeros((n_rows, len_samples, 2))
         else:
             save_list = np.zeros((n_rows, len_samples))
-            display_list = np.zeros((n_rows, len_samples))
+        display_list = np.zeros((n_rows, len_samples))
 
         for source in self.mimo_sources:
-            first_comp, second_comp = mimo_results[source.channel]
-            if self.save_imaginary:
+            first_comp, second_comp = mimo_results[(source.tx_idx, source.rx_idx)]
+            component = (
+                second_comp if self._component_of(source) == "phase" else first_comp
+            )
+            display_list[source.channel, :] = component
+            if stack_save:
                 save_list[source.channel, :, 0] = first_comp
                 save_list[source.channel, :, 1] = second_comp
-                display_list[source.channel, :, 0] = first_comp
-                display_list[source.channel, :, 1] = second_comp
             else:
-                save_list[source.channel, :] = first_comp
-                display_list[source.channel, :] = first_comp
+                save_list[source.channel, :] = component
 
         if self.record_cal_ref:
             for source in self.cal_ref_sources:
@@ -365,14 +403,13 @@ class ProcessWorker(PausableWorker):
                     local_tx, self.global_sample_idx, buffer.shape[1]
                 )
                 cal_data = self._decimate_cal_ref(raw_env)
-                if self.save_imaginary:
+                if stack_save:
                     # Real-valued envelope: channel 0, imaginary left at 0.
                     save_list[source.channel, : len(cal_data), 0] = cal_data
                     save_list[source.channel, : len(cal_data), 1] = 0.0
-                    display_list[source.channel, : len(cal_data), 0] = cal_data
                 else:
                     save_list[source.channel, : len(cal_data)] = cal_data
-                    display_list[source.channel, : len(cal_data)] = cal_data
+                display_list[source.channel, : len(cal_data)] = cal_data
 
         self.global_sample_idx += buffer.shape[1]
         return save_list, display_list
@@ -400,24 +437,27 @@ class ProcessWorker(PausableWorker):
                 buffer = np.vstack(rows)
 
                 mimo_results = self._process_mimo_chunk(buffer)
+                # Index of this chunk's first *save* sample, taken before
+                # _assemble_outputs advances the raw counter. The recorder uses
+                # it to tell a contiguous chunk from one that follows a drop.
+                save_sample_idx = self.global_sample_idx // max(1, int(self.save_ds))
                 save_data, display_data = self._assemble_outputs(buffer, mimo_results)
 
                 # Save path: absorb a short disk stall before dropping.
+                save_item = {
+                    "data": save_data,
+                    "sample_idx": save_sample_idx,
+                    "t_wall": time.time(),
+                }
                 if self.save_queue is not None and not put_or_drop(
-                    self.save_queue, save_data, timeout=QUEUE_PUT_TIMEOUT_S
+                    self.save_queue, save_item, timeout=QUEUE_PUT_TIMEOUT_S
                 ):
                     self.save_chunks_dropped += 1
                     self._log_drops()
 
                 # Display path: evict the oldest rather than add latency.
                 if self.display_queue is not None:
-                    if self.save_imaginary is False:
-                        display_payload = display_data
-                    elif self.display_imaginary:
-                        display_payload = display_data[:, :, 1]
-                    else:
-                        display_payload = display_data[:, :, 0]
-                    display_payload = self._decimate_display(display_payload)
+                    display_payload = self._decimate_display(display_data)
                     # float32 on the wire; the save path stays float64.
                     display_payload = np.ascontiguousarray(
                         display_payload, dtype=np.float32

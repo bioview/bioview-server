@@ -3,11 +3,13 @@ import types
 import pytest
 
 
-# The BIOPAC backend is Windows-only and imports the `wmi` package at module
-# load; skip the whole module cleanly on platforms where it is unavailable.
+# The BIOPAC backend is Windows-only, but the module imports everywhere now
+# (`wmi` is guarded), so these tests -- which stub WMI out entirely -- run on
+# every platform. importorskip stays as the backstop for a genuinely broken
+# import rather than as an expected skip.
 utils = pytest.importorskip(
     "bioview_server.device.biopac.utils",
-    reason="BIOPAC backend (wmi) is only available on Windows",
+    reason="BIOPAC backend module failed to import",
 )
 
 

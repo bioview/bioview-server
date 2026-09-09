@@ -1,12 +1,19 @@
 import multiprocessing as mp
 import os
 import queue
+import threading
 import time
 
 
 os.environ["UHD_LOG_LEVEL"] = "error"
 
-import uhd
+# See the note in receive.py: the backend module must import without UHD so
+# its pure-logic paths stay reachable (and testable) on machines and CI
+# runners with no driver. Every uhd use below is inside a function.
+try:
+    import uhd
+except ImportError:  # pragma: no cover - no USRP driver installed
+    uhd = None
 from bioview_common import (
     RX_QUEUE_DEPTH,
     DataSource,
@@ -24,6 +31,7 @@ from bioview_common.datatypes.configuration.hardware_params import (
 )
 from bioview_common.datatypes.configuration.usrp_channel_map import (
     build_hardware_dict,
+    components_from_config,
     resolve_channel_map,
     resolve_device_serial,
 )
@@ -38,13 +46,6 @@ from bioview_server.datatypes import Backend
 from .process import ProcessWorker
 from .receive import ReceiveWorker
 from .transmit import TX_PARAMS, TransmitWorker
-from .utils import (
-    check_channels,
-    discover_devices,
-    get_usrp_address,
-    setup_pps,
-    setup_ref,
-)
 
 
 SETTLING_TIME = 0.3
@@ -68,6 +69,10 @@ def initialize_usrp_device(
     wire_format,
     logger=None,
 ):
+    # Deferred: .utils imports uhd unconditionally (device/__init__ uses that
+    # import to decide whether the USRP backend is available at all).
+    from .utils import check_channels, setup_pps, setup_ref
+
     usrp = uhd.usrp.MultiUSRP(f"serial={serial},num_recv_frames=1024")
 
     usrp.set_rx_subdev_spec(uhd.usrp.SubdevSpec(rx_subdev))
@@ -123,6 +128,7 @@ class USRPBackend(Backend):
         group_config: dict,
         response_queue: mp.Queue,
         data_output_queue: mp.Queue = None,
+        save_output_queue: mp.Queue = None,
         display_ds: int = 10,
         display_imaginary: bool = False,
         save_ds: int = 10,
@@ -134,6 +140,7 @@ class USRPBackend(Backend):
             group_id=group_id,
             response_queue=response_queue,
             data_output_queue=data_output_queue,
+            save_output_queue=save_output_queue,
         )
         self.samp_rate = samp_rate
         self.group_config = group_config or {}
@@ -160,6 +167,7 @@ class USRPBackend(Backend):
         self.global_rx_offsets = {}
         self.dpic_pairs = []
         self.mimo_sources = set()
+        self.stream_components = ["amplitude"]
         self.cal_ref_sources = []
         self.registry = None
         self.rx_device_order = []
@@ -185,6 +193,20 @@ class USRPBackend(Backend):
 
         self.populate_data_sources()
 
+    #: Rebuilt in the child rather than shipped to it; see _init_local_state.
+    _LOCAL_STATE_KEYS = ("_gain_lock",)
+
+    def _init_local_state(self):
+        super()._init_local_state()
+        # The gain lists are group-wide but written per channel, and a
+        # parallel balance has one thread per radio writing them at once. The
+        # lock covers the read-modify-write and the hardware apply that
+        # follows it, which re-sends the *whole* list. A lock cannot be
+        # pickled, so it is created on each side of the spawn rather than
+        # shipped: without this the whole handler failed to pickle and the
+        # group came up Unavailable.
+        self._gain_lock = threading.Lock()
+
     def get_display_frequency(self) -> float:
         """Rate (Hz) at which the pipeline emits display samples.
 
@@ -196,13 +218,23 @@ class USRPBackend(Backend):
         divisor = max(1, int(self.save_ds)) * max(1, int(self.display_ds))
         return float(self.samp_rate) / divisor
 
+    def get_save_freq(self) -> float:
+        """Saved rate: ProcessWorker averages ``save_ds`` raw samples per point.
+
+        The display path decimates this again by ``display_ds``; the recording
+        keeps the undecimated save stream.
+        """
+        return float(self.samp_rate) / max(1, int(self.save_ds))
+
     def populate_data_sources(self):
         channel_map = self.group_config.get("channel_map")
+        self.stream_components = components_from_config(self.group_config)
         self.mimo_sources, self.registry, self.dpic_pairs = resolve_channel_map(
             self.group_id,
             channel_map,
             self.hardware,
             disp_freq=self.get_display_frequency(),
+            components=self.stream_components,
         )
         self.data_sources = set(self.mimo_sources)
 
@@ -250,6 +282,8 @@ class USRPBackend(Backend):
         self.rx_device_order = list(self.hardware.keys())
 
     def _resolve_serial(self, device_name: str, hw_entry: dict) -> str:
+        from .utils import get_usrp_address
+
         return resolve_device_serial(
             device_name,
             hw_entry,
@@ -258,6 +292,8 @@ class USRPBackend(Backend):
         )
 
     def _initialize(self):
+        from .utils import discover_devices
+
         if not self.discovered_devices:
             self.discovered_devices = discover_devices(self.logger)
         else:
@@ -633,23 +669,24 @@ class USRPBackend(Backend):
         if entry is None or global_rx >= len(self.rx_gains_global):
             return
         dev_name, _local = entry
-        self.rx_gains_global[global_rx] = float(value)
-        apply_global_rx_values_to_hardware(
-            self.hardware, "rx_gain", list(self.rx_gains_global), self.group_config
-        )
-        self.rx_command_queue[dev_name].put(
-            {"param": "rx_gain", "value": list(self.rx_gains_global)}
-        )
+        with self._gain_lock:
+            self.rx_gains_global[global_rx] = float(value)
+            gains = list(self.rx_gains_global)
+            apply_global_rx_values_to_hardware(
+                self.hardware, "rx_gain", gains, self.group_config
+            )
+            self.rx_command_queue[dev_name].put({"param": "rx_gain", "value": gains})
 
     def _set_global_tx_gain(self, global_tx: int, value: float):
         """Apply one Tx channel's analog gain through its transmit worker."""
         if global_tx >= len(self.tx_gains_global):
             return
         dev_name, _local = self.global_tx_to_device[global_tx]
-        self.tx_gains_global[global_tx] = float(value)
-        apply_global_tx_values_to_hardware(
-            self.hardware, "tx_gain", list(self.tx_gains_global), self.group_config
-        )
+        with self._gain_lock:
+            self.tx_gains_global[global_tx] = float(value)
+            apply_global_tx_values_to_hardware(
+                self.hardware, "tx_gain", list(self.tx_gains_global), self.group_config
+            )
         self.transmit_workers[dev_name].set_global_tx_param(global_tx, "gain", value)
 
     def _build_dpic_channel(self, pair, dpic_cfg) -> DpicChannel:
@@ -672,6 +709,10 @@ class USRPBackend(Backend):
             inject_tx=pair.inject_tx,
             measure_tx=measure_tx,
             measure_rx=measure_rx,
+            # The radio the loop lives on, so ``balance_all`` can run one lane
+            # per radio at the same time. The inject Tx names it: that is the
+            # channel the search actually drives.
+            device=dev_name,
             set_phase=lambda v: worker.set_global_tx_param(pair.inject_tx, "phase", v),
             set_amplitude=lambda v: worker.set_global_tx_param(
                 pair.inject_tx, "amplitude", v
@@ -744,6 +785,17 @@ class USRPBackend(Backend):
         )
 
         channels = [self._build_dpic_channel(p, dpic_cfg) for p in self.dpic_pairs]
+        radios = sorted({ch.device for ch in channels if ch.device})
+        log_print(
+            self.logger,
+            "info",
+            f"[DPIC] Balancing {len(channels)} loop(s) across {len(radios)} radio(s)"
+            + (
+                f" in parallel: {', '.join(radios)}"
+                if balancer.parallel_devices and len(radios) > 1
+                else ""
+            ),
+        )
         results = balancer.balance_all(channels)
         outcome = balance_outcome(self.logger, results)
 

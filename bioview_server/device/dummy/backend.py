@@ -20,13 +20,17 @@ from bioview_common import (
     PausableWorker,
     log_print,
     put_drop_oldest,
+    put_or_drop,
 )
 from bioview_common.datatypes.configuration.hardware_params import (
     GLOBAL_TX_PARAMS,
     apply_global_tx_param_to_schemes,
     build_global_mapping,
 )
-from bioview_common.datatypes.configuration.usrp_channel_map import resolve_channel_map
+from bioview_common.datatypes.configuration.usrp_channel_map import (
+    components_from_config,
+    resolve_channel_map,
+)
 from bioview_common.signal_schemes import (
     DpicChannel,
     scheme_from_config,
@@ -51,6 +55,8 @@ class SineWaveWorker(PausableWorker):
         noise_std: float,
         chunk_duration: float,
         display_queue: mp.Queue,
+        save_queue: mp.Queue = None,
+        save_ds: int = 1,
         logger=None,
     ):
         super().__init__(logger=logger)
@@ -60,6 +66,9 @@ class SineWaveWorker(PausableWorker):
         self.amplitude = float(amplitude)
         self.noise_std = float(noise_std)
         self.display_queue = display_queue
+        self.save_queue = save_queue
+        self.save_ds = max(1, int(save_ds))
+        self._save_samples_emitted = 0
 
         self.chunk_size = max(1, int(round(self.samp_rate * float(chunk_duration))))
         self.chunk_duration = self.chunk_size / self.samp_rate
@@ -88,6 +97,33 @@ class SineWaveWorker(PausableWorker):
 
         self._sample_idx += self.chunk_size
 
+        # Save path carries the undecimated-by-disp_ds stream, decimated only
+        # by save_ds, and is tagged so the recorder can detect dropped chunks.
+        if self.save_queue is not None:
+            save_chunk = chunk
+            if self.save_ds > 1:
+                n_windows = save_chunk.shape[1] // self.save_ds
+                if n_windows:
+                    usable = n_windows * self.save_ds
+                    save_chunk = (
+                        save_chunk[:, :usable]
+                        .reshape(save_chunk.shape[0], n_windows, self.save_ds)
+                        .mean(axis=2)
+                    )
+                else:
+                    save_chunk = save_chunk[:, :0]
+            if save_chunk.shape[1]:
+                item = {
+                    "data": np.ascontiguousarray(save_chunk, dtype=np.float32),
+                    "sample_idx": self._save_samples_emitted,
+                    "t_wall": time.time(),
+                }
+                self._save_samples_emitted += save_chunk.shape[1]
+                if not put_or_drop(self.save_queue, item, timeout=0.5):
+                    log_print(
+                        self.logger, "error", "[DUMMY] Save queue full; dropping chunk"
+                    )
+
         if not put_drop_oldest(
             self.display_queue, np.ascontiguousarray(chunk, dtype=np.float32)
         ):
@@ -109,6 +145,7 @@ class DummyBackend(Backend):
         group_id: str,
         response_queue: mp.Queue,
         data_output_queue: mp.Queue = None,
+        save_output_queue: mp.Queue = None,
         group_config: dict | None = None,
         samp_rate: int = 500,
         num_channels: int = 4,
@@ -121,6 +158,7 @@ class DummyBackend(Backend):
             group_id=group_id,
             response_queue=response_queue,
             data_output_queue=data_output_queue,
+            save_output_queue=save_output_queue,
         )
         self.group_config = dict(group_config or {})
         self.rf_mode = bool(self.group_config.get("hardware"))
@@ -140,6 +178,7 @@ class DummyBackend(Backend):
 
         self.hardware = {}
         self.mimo_sources = set()
+        self.stream_components = ["amplitude"]
         self.cal_ref_sources = []
         self.dpic_pairs = []
         self._cal_enabled = False
@@ -159,6 +198,10 @@ class DummyBackend(Backend):
         self.save_imaginary = bool(self.group_config.get("save_imaginary", True))
 
         self.populate_data_sources()
+
+    def get_save_freq(self) -> float:
+        """Saved rate: acquisition rate decimated by ``save_ds`` only."""
+        return float(self.samp_rate) / max(1, int(self.save_ds))
 
     def get_display_frequency(self) -> float:
         """Rate (Hz) at which this device emits display samples.
@@ -187,11 +230,13 @@ class DummyBackend(Backend):
         self.hardware = dict(self.group_config.get("hardware") or {})
 
         channel_map = self.group_config.get("channel_map")
+        self.stream_components = components_from_config(self.group_config)
         self.mimo_sources, self.registry, self.dpic_pairs = resolve_channel_map(
             self.group_id,
             channel_map,
             self.hardware,
             disp_freq=self.get_display_frequency(),
+            components=self.stream_components,
         )
         self.data_sources = set(self.mimo_sources)
 
@@ -333,6 +378,8 @@ class DummyBackend(Backend):
                 noise_std=self.noise_std,
                 chunk_duration=self.chunk_duration,
                 display_queue=self.display_queue,
+                save_queue=self.save_queue,
+                save_ds=self.save_ds,
                 logger=self.logger,
             )
 

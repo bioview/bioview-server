@@ -18,7 +18,7 @@ from bioview_common import (
     log_print,
 )
 
-from bioview_server.common import DisplayWorker, SaveWorker
+from bioview_server.common import DisplayWorker, SaveForwarder
 
 
 # Opening a radio is the slow step: USB enumeration, FPGA/CODEC bring-up and
@@ -91,6 +91,7 @@ class Backend(mp.Process):
         group_id: str,
         response_queue: mp.Queue = None,
         data_output_queue: mp.Queue = None,
+        save_output_queue: mp.Queue = None,
     ):
         super().__init__()
         # Parameters
@@ -113,6 +114,9 @@ class Backend(mp.Process):
         self.progress_queue = mp.Queue(maxsize=BALANCE_PROGRESS_QUEUE_DEPTH)
 
         self.data_output_queue = data_output_queue
+        # Shared with every other backend and drained by the server's single
+        # BvrWriter; this device only ever pushes its own tagged records.
+        self.save_output_queue = save_output_queue
         # Never shared between backends: a reply carries no sender, so two
         # devices reading one queue steal each other's answers.
         self.response_queue = (
@@ -162,9 +166,24 @@ class Backend(mp.Process):
         "_balance_abort",
     )
 
+    @classmethod
+    def _local_state_keys(cls):
+        """Every ``_LOCAL_STATE_KEYS`` entry declared along the MRO.
+
+        Subclasses add their own locks in ``_init_local_state``; collecting the
+        keys here means a subclass declaring its own tuple extends the base
+        list rather than shadowing it.
+        """
+        keys = []
+        for klass in cls.__mro__:
+            for key in klass.__dict__.get("_LOCAL_STATE_KEYS", ()):
+                if key not in keys:
+                    keys.append(key)
+        return tuple(keys)
+
     def __getstate__(self):
         state = self.__dict__.copy()
-        for key in self._LOCAL_STATE_KEYS:
+        for key in type(self)._local_state_keys():
             state.pop(key, None)
         return state
 
@@ -177,25 +196,54 @@ class Backend(mp.Process):
 
     # Common setup
     def _setup_saving(self, save_config: dict = None):
+        """Wire this device's save stream to the session recorder.
+
+        The file itself is written by the server's single ``BvrWriter``: every
+        backend is its own process, so each forwards tagged records onto one
+        shared queue rather than opening a file of its own.
+        """
         self.enable_save = save_config.get("enable_save", False)
-        self.save_path = save_config.get("save_path", None)
 
         if not self.save_queue:
             self.save_queue = mp.Queue(maxsize=SAVE_QUEUE_DEPTH)
         else:
             drain(self.save_queue)
 
-        if self.enable_save and self.save_path:
-            # Stop the previous recorder before replacing it, or its thread stays
-            # alive holding an unflushed HDF5 file open.
+        if self.enable_save and self.save_output_queue is not None:
+            # Stop the previous forwarder before replacing it, or its thread
+            # stays alive on the same input queue.
             if self.save_worker is not None:
                 self.save_worker.stop()
-            self.save_worker = SaveWorker(
-                save_path=self.save_path,
-                data_queue=self.save_queue,
-                num_channels=len(self.get_data_sources()),
+            self.save_worker = SaveForwarder(
+                device_id=self.group_id,
+                data_input_queue=self.save_queue,
+                data_output_queue=self.save_output_queue,
                 logger=self.logger,
             )
+
+    def get_save_freq(self) -> float:
+        """Rate (Hz) of this device's save stream, one sample per row per tick.
+
+        Distinct from ``DataSource.disp_freq``, which describes the decimated
+        display stream. Backends whose save path is decimated relative to
+        acquisition override this.
+        """
+        return float(getattr(self, "samp_rate", 0.0) or 0.0)
+
+    def _save_rows(self):
+        """Rows this device's save records carry, in order."""
+        return self._display_sources()
+
+    def describe_for_recording(self) -> dict:
+        """This device's entry in the recording header's device table."""
+        rows = list(self._save_rows())
+        return {
+            "device_id": self.group_id,
+            "fs": self.get_save_freq(),
+            "n_rows": len(rows),
+            "dtype": "float32",
+            "sources": [src.to_dict() for src in rows],
+        }
 
     def stop_saving(self):
         if self.save_worker:

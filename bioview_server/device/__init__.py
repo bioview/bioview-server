@@ -53,6 +53,20 @@ except Exception as e:
     _backend_unavailable(DeviceType.BIOPAC.value, e)
 
 try:
+    from . import microphone
+
+    # Importing the package alone touches no PortAudio: utils resolves
+    # sounddevice lazily. Probe through to it so a missing sounddevice or an
+    # unloadable PortAudio fails here, with a reason, rather than inside a
+    # device subprocess at Connect.
+    microphone.check_available()
+
+    __all__.append("microphone")
+    AVAILABLE_BACKENDS[DeviceType.MICROPHONE.value] = microphone
+except Exception as e:
+    _backend_unavailable(DeviceType.MICROPHONE.value, e)
+
+try:
     # Virtual device: always available, no hardware or platform requirements.
     from . import dummy
 
@@ -62,6 +76,26 @@ except Exception as e:
     _backend_unavailable(DeviceType.DUMMY.value, e)
 
 
+def backend_report(include_virtual: bool = False) -> dict:
+    """Every backend and whether it loaded, as ``{type: {available, error}}``.
+
+    The server hands this to a client the moment it authenticates, so a UHD
+    that does not match its bindings or a backend whose driver is missing
+    reaches the operator as one explained failure -- in the Monitor as much as
+    in the Configurator -- instead of a line on a stdout nobody is reading.
+    """
+    report = {}
+    for device_type in AVAILABLE_BACKENDS:
+        if device_type == DeviceType.DUMMY.value and not include_virtual:
+            continue
+        report[device_type] = {"available": True, "error": ""}
+    for device_type, reason in UNAVAILABLE_BACKENDS.items():
+        if device_type == DeviceType.DUMMY.value and not include_virtual:
+            continue
+        report[device_type] = {"available": False, "error": str(reason)}
+    return report
+
+
 def get_device_handler(
     device_id,
     device_cfg,
@@ -69,6 +103,7 @@ def get_device_handler(
     data_output_queue: mp.Queue,
     logger=None,
     discovered_devices: dict = None,
+    save_output_queue: mp.Queue = None,
 ):
     device_type = device_cfg.get_param("device_type")
 
@@ -95,6 +130,7 @@ def get_device_handler(
                 group_config=group_cfg,
                 response_queue=response_queue,
                 data_output_queue=data_output_queue,
+                save_output_queue=save_output_queue,
                 display_ds=device_cfg.get_param("disp_ds", 10),
                 display_imaginary=device_cfg.get_param("display_imaginary", False),
                 save_ds=device_cfg.get_param("save_ds", 1),
@@ -108,6 +144,19 @@ def get_device_handler(
                 group_id=device_id,
                 response_queue=response_queue,
                 data_output_queue=data_output_queue,
+                save_output_queue=save_output_queue,
+                group_config=device_cfg.to_dict(),
+                discovered_devices=discovered_devices,
+            )
+
+        case DeviceType.MICROPHONE.value:
+            handler = AVAILABLE_BACKENDS.get(
+                DeviceType.MICROPHONE.value
+            ).MicrophoneBackend(
+                group_id=device_id,
+                response_queue=response_queue,
+                data_output_queue=data_output_queue,
+                save_output_queue=save_output_queue,
                 group_config=device_cfg.to_dict(),
                 discovered_devices=discovered_devices,
             )
@@ -117,6 +166,7 @@ def get_device_handler(
                 group_id=device_id,
                 response_queue=response_queue,
                 data_output_queue=data_output_queue,
+                save_output_queue=save_output_queue,
                 group_config=device_cfg.to_dict(),
             )
 
@@ -126,4 +176,9 @@ def get_device_handler(
     return handler
 
 
-__all__ = ["AVAILABLE_BACKENDS", "get_device_handler"]
+__all__ = [
+    "AVAILABLE_BACKENDS",
+    "UNAVAILABLE_BACKENDS",
+    "backend_report",
+    "get_device_handler",
+]

@@ -244,3 +244,77 @@ def test_demod_keeps_up_with_real_time():
         f"demod uses {budget:.0%} of real time per source; it must leave room "
         "for multiple sources plus the save and display paths"
     )
+
+
+def _dual_component_worker(save_ds=SAVE_DS):
+    """One Tx/Rx pair advertised as two rows: amplitude then phase."""
+    amp = DataSource(group_id="g", channel=0, label="Tx1Rx1")
+    amp.tx_idx = amp.rx_idx = 0
+    amp.component = "amplitude"
+    phase = DataSource(group_id="g", channel=1, label="Tx1Rx1_Phase")
+    phase.tx_idx = phase.rx_idx = 0
+    phase.component = "phase"
+    scheme = CwScheme(SAMP_RATE, [IF_HZ], [1.0], [30.0])
+    worker = ProcessWorker(
+        data_sources={amp, phase},
+        cal_ref_sources=[],
+        samp_rate=SAMP_RATE,
+        channel_ifs=[IF_HZ],
+        if_filter_bw=[5e3],
+        rx_queues={"d": None},
+        rx_device_order=["d"],
+        schemes_by_device={"d": scheme},
+        global_tx_to_device={0: ("d", 0)},
+        save_ds=save_ds,
+    )
+    return worker, amp, phase
+
+
+def test_component_rows_match_the_single_row_pipeline():
+    """Splitting a pair into two rows must not change either quantity.
+
+    The amplitude row has to equal what a single-component group recorded, and
+    the phase row has to equal the second component that group stacked behind
+    it -- otherwise enabling phase silently rewrites the amplitude channel.
+    """
+    n = 4 * SAVE_DS
+    signal = _test_signal(n)
+    buffer = signal.reshape(1, n)
+
+    ref_worker, _src, _scheme = _make_worker()
+    ref_worker.save_imaginary = True
+    ref_results = ref_worker._process_mimo_chunk(buffer)
+    ref_save, _ref_display = ref_worker._assemble_outputs(buffer, ref_results)
+    # One row per pair still stacks both components behind it, as before.
+    assert ref_save.shape == (1, n // SAVE_DS, 2)
+
+    worker, _amp, _phase = _dual_component_worker()
+    results = worker._process_mimo_chunk(buffer)
+    save_data, display_data = worker._assemble_outputs(buffer, results)
+
+    assert save_data.shape == (2, n // SAVE_DS)
+    np.testing.assert_allclose(save_data[0], ref_save[0, :, 0])
+    np.testing.assert_allclose(save_data[1], ref_save[0, :, 1])
+    np.testing.assert_allclose(display_data, save_data)
+
+
+def test_pair_is_demodulated_once_per_chunk():
+    """Two rows share one demodulator, so the phase accumulator advances once.
+
+    Running the demodulator per row would double the accumulated phase and
+    desynchronize the downconversion from the incoming samples.
+    """
+    n = 4 * SAVE_DS
+    buffer = _test_signal(n).reshape(1, n)
+
+    worker, amp, phase = _dual_component_worker()
+    assert len(worker._demod_sources) == 1
+    assert worker._per_source_components is True
+
+    worker._process_mimo_chunk(buffer)
+    ref_worker, ref_src, _scheme = _make_worker()
+    ref_worker._process_mimo_chunk(buffer)
+
+    assert amp.accumulated_sample_idx == n
+    assert phase.accumulated_sample_idx == 0  # never demodulated itself
+    assert amp.accumulated_phase == pytest.approx(ref_src.accumulated_phase)

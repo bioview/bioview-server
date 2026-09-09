@@ -12,6 +12,7 @@ import queue
 import signal
 import socket
 import time
+from pathlib import Path
 from threading import Lock, Thread, local
 
 from bioview_common import (
@@ -19,15 +20,18 @@ from bioview_common import (
     CONTROL_PORT,
     DATA_OUTPUT_QUEUE_DEPTH,
     DATA_PORT,
+    SAVE_OUTPUT_QUEUE_DEPTH,
     Command,
     DeviceError,
     DeviceStatus,
     DeviceType,
     Response,
     ValidationError,
+    drain,
     generate_challenge,
     get_app_info,
     get_local_addresses,
+    get_unique_path,
     is_local_request,
     log_print,
     parse_and_validate_command,
@@ -38,14 +42,24 @@ from bioview_common import (
     validate_token,
 )
 
+from bioview_server.common import BvrWriter
 from bioview_server.device import (
     AVAILABLE_BACKENDS,
     UNAVAILABLE_BACKENDS,
+    backend_report,
     get_device_handler,
 )
 
 
 SLEEP_DURATION = 0.001  # Confirm CPU load with varying this value
+
+#: How long the server waits for the recorder to drain the shared save queue,
+#: write the trailer and close the file.
+RECORDING_CLOSE_TIMEOUT_S = 15
+
+# How long a window's claim survives when it did not say how often it would
+# call back. Only reached by a client too old to advertise its heartbeat.
+WINDOW_CLAIM_LIFETIME = 30.0
 
 
 def _handler_init_succeeded(resp: dict) -> bool:
@@ -96,16 +110,40 @@ class Server:
         exit_when_idle: float = 0,
     ):
         self.info = get_app_info()
+        # Which backends loaded, and why the others did not. Sent with the
+        # server's identity so every client learns about a missing driver or a
+        # UHD mismatch at connect time, rather than the Configurator learning
+        # it from a device listing and the Monitor never learning it at all.
+        self.info["backends"] = backend_report()
         self.token = 42  # TODO: Load using secrets
 
         self.control_port = control_port
         self.data_port = data_port
 
+        # Advertised, not assumed: a client finds a server by its control port,
+        # but nothing tells it where the *data* port is, so it used to fall
+        # back to the compiled-in default and connect to nothing whenever the
+        # server had been given other ports.
+        self.info["control_port"] = control_port
+        self.info["data_port"] = data_port
+
         self.running = False
 
-        # Seconds with no client before the server retires itself; 0 = never.
+        # Seconds with neither a client nor a window before the server retires
+        # itself; 0 = never.
         self.exit_when_idle = exit_when_idle
         self._idle_since = time.monotonic()
+
+        # Windows currently claiming this server, keyed by the token each one
+        # sends with its heartbeat, mapped to when the claim expires.
+        #
+        # A window is a client of its server long before it authenticates --
+        # the Monitor builds its client only once its configuration dialog has
+        # been answered, and nobody is obliged to answer it -- so a session
+        # count alone cannot say whether this server is still wanted. The
+        # windows say so themselves, and stop saying so when they exit.
+        self._windows = {}
+        self._windows_lock = Lock()
 
         # Guarded: the accept loop adds, command threads remove, the data
         # thread iterates.
@@ -167,6 +205,13 @@ class Server:
 
         self.data_queue = mp.Queue(maxsize=DATA_OUTPUT_QUEUE_DEPTH)
 
+        # Every backend forwards its save-rate records here; one BvrWriter
+        # drains it into the session's single .bvr file. Bounded, but the
+        # forwarders block briefly rather than dropping, since a lost save
+        # chunk is a hole in the recording.
+        self.save_data_queue = mp.Queue(maxsize=SAVE_OUTPUT_QUEUE_DEPTH)
+        self.bvr_writer = None
+
         if not logger:
             self.logger = logging.getLogger(__name__)
             logging.basicConfig(
@@ -217,11 +262,21 @@ class Server:
 
                 cmd_type, payload = parse_and_validate_command(auth_data)
                 if cmd_type == Command.DISCOVER_SERVERS.name:
+                    # A probe carrying a window token is a claim, not just a
+                    # question, and a window that is leaving withdraws its
+                    # claim the same way. A probe without a token -- a subnet
+                    # scan, an older client -- is answered but claims nothing.
+                    self._update_window_claim(payload)
                     send_response(
                         sock=control_conn,
                         response=Response.SUCCESS,
-                        # Lets a closing window tell whether another still needs us.
-                        params={**self.info, "clients": len(self.sessions)},
+                        # Both counts let a closing window tell whether anyone
+                        # else still needs this server.
+                        params={
+                            **self.info,
+                            "clients": len(self.sessions),
+                            "windows": self._live_window_count(),
+                        },
                         logger=self.logger,
                     )
                     control_conn.close()
@@ -346,23 +401,96 @@ class Server:
         """True while at least one client is connected."""
         return bool(self._live_sessions())
 
+    def _update_window_claim(self, payload):
+        """Record, refresh or withdraw one window's claim on this server.
+
+        ``window`` is an opaque token identifying a window process; ``leaving``
+        withdraws it. The claim is given a lifetime of a few heartbeat
+        intervals, so a window that dies without a word is forgotten without
+        anyone having to notice that it died -- there is no pid to check and no
+        file to prune, and nothing to be confused by a reused pid.
+        """
+        if not isinstance(payload, dict):
+            return
+        token = payload.get("window")
+        if not token or not isinstance(token, str):
+            return
+
+        role = payload.get("role") or "window"
+
+        with self._windows_lock:
+            if payload.get("leaving"):
+                if self._windows.pop(token, None) is not None:
+                    log_print(
+                        self.logger,
+                        "debug",
+                        f"{role} window released this server "
+                        f"({len(self._windows)} window(s) still holding it)",
+                    )
+                return
+
+            try:
+                interval = float(payload.get("heartbeat") or 0)
+            except (TypeError, ValueError):
+                interval = 0
+            # The window says how often it will call, so changing that interval
+            # cannot silently outrun a lifetime hard-coded here. Three missed
+            # calls before a claim lapses.
+            lifetime = 3 * interval if interval > 0 else WINDOW_CLAIM_LIFETIME
+            first_seen = token not in self._windows
+            self._windows[token] = (time.monotonic() + lifetime, role)
+
+        if first_seen:
+            log_print(self.logger, "debug", f"{role} window claimed this server")
+
+    def _live_window_count(self) -> int:
+        """How many windows are currently claiming this server, lapsed ones dropped."""
+        now = time.monotonic()
+        with self._windows_lock:
+            lapsed = [t for t, (expiry, _) in self._windows.items() if expiry <= now]
+            for token in lapsed:
+                role = self._windows.pop(token)[1]
+                log_print(
+                    self.logger,
+                    "debug",
+                    f"{role} window stopped answering; its claim has lapsed",
+                )
+            return len(self._windows)
+
+    def _in_use(self) -> bool:
+        """True while anyone is connected, or any window says it still wants this."""
+        with self._sessions_lock:
+            if self.sessions:
+                return True
+        return self._live_window_count() > 0
+
     def _check_idle_exit(self):
-        """Shut down once no client has connected for ``exit_when_idle`` seconds.
+        """Shut down once nothing has wanted this server for ``exit_when_idle``.
 
         This is what lets the window that started the server not be the last
-        one standing, without leaving a server behind.
+        one standing, without leaving a server behind. "Wanted" deliberately
+        means more than "connected": a window counts from the moment it starts
+        up, so the countdown is never a deadline for it to connect by.
         """
-        if not self.exit_when_idle or self._idle_since is None:
+        if not self.exit_when_idle:
             return
-        if self.sessions:
+
+        if self._in_use():
+            self._idle_since = None
             return
+
+        if self._idle_since is None:
+            self._idle_since = time.monotonic()
+            return
+
         if time.monotonic() - self._idle_since < self.exit_when_idle:
             return
 
         log_print(
             self.logger,
             "info",
-            f"No clients for {self.exit_when_idle:g}s. Shutting down server...",
+            f"Nothing has needed this server for {self.exit_when_idle:g}s. "
+            "Shutting down...",
         )
         self.running = False
 
@@ -378,7 +506,6 @@ class Server:
         with self._sessions_lock:
             self.sessions.append(session)
             client_count = len(self.sessions)
-            self._idle_since = None
 
         session.thread = Thread(
             target=self._serve_client,
@@ -409,8 +536,6 @@ class Server:
             if session in self.sessions:
                 self.sessions.remove(session)
             remaining = len(self.sessions)
-            if not remaining and self._idle_since is None:
-                self._idle_since = time.monotonic()
 
         was_active = session.active
         session.close()
@@ -509,6 +634,8 @@ class Server:
                         self._update_running_parameter(payload)
                     case Command.RUN_DPIC_BALANCE.name:
                         self._run_dpic_balance(payload)
+                    case Command.MARK_EVENT.name:
+                        self._mark_event(payload)
 
             except ValidationError as e:
                 log_print(self.logger, "debug", f"Invalid command {cmd_type} sent: {e}")
@@ -851,6 +978,31 @@ class Server:
                     )
                 continue
 
+            if device_type == DeviceType.MICROPHONE.value:
+                # Like BIOPAC, hardware keys here are user-chosen labels rather
+                # than the names discovery reports: a host input is named by the
+                # operating system and a config is usually written before anyone
+                # has seen that name. One input is opened per group, so the group
+                # is available as soon as the machine has any input at all.
+                mic_discovered = discovered_by_backend.get(
+                    DeviceType.MICROPHONE.value, set()
+                )
+                if mic_discovered:
+                    self.device_group_states[device_id] = DeviceStatus.AVAILABLE.value
+                else:
+                    self.device_group_states[device_id] = DeviceStatus.UNAVAILABLE.value
+                    self.device_group_errors[device_id] = (
+                        "no audio input device was found. Check that a microphone "
+                        "is attached and enabled in the sound settings"
+                        if DeviceType.MICROPHONE.value in AVAILABLE_BACKENDS
+                        else "the microphone backend is not available on this "
+                        "server: "
+                        + UNAVAILABLE_BACKENDS.get(
+                            DeviceType.MICROPHONE.value, "unknown reason"
+                        )
+                    )
+                continue
+
             if device_id in discovered_names:
                 self.device_group_states[device_id] = DeviceStatus.AVAILABLE.value
                 continue
@@ -930,6 +1082,7 @@ class Server:
                     self.data_queue,
                     self.logger,
                     discovered_devices=self.discovered_devices_cache,
+                    save_output_queue=self.save_data_queue,
                 )
                 if not handler:
                     raise DeviceError(f"Unable to create handler for {device_id}")
@@ -1029,11 +1182,13 @@ class Server:
             )
             return
 
-        # Saving happens on the client, so server-side saving stays off. Runtime
+        # Saving happens here, not on the client: the save-rate stream never
+        # crosses the wire, only the decimated display stream does. Runtime
         # parameters are not replayed: UI edits already reach backends live.
         experiment_cfg = payload.get("Experiment", payload.get("experiment", {})) or {}
+        enable_save = self._open_recording(experiment_cfg, active_handlers)
         stream_cfg = {
-            "save_config": {"enable_save": False},
+            "save_config": {"enable_save": enable_save},
             "display_config": {
                 "display_sources": experiment_cfg.get("display_sources", []),
             },
@@ -1058,6 +1213,7 @@ class Server:
             for _device_id, handler in started:
                 with contextlib.suppress(Exception):
                     handler.stop_streaming()
+            self._close_recording()
 
             msg = "Failed to start streaming -- " + "; ".join(failures)
             log_print(self.logger, "error", msg)
@@ -1080,6 +1236,94 @@ class Server:
             params={"message": msg},
             logger=self.logger,
         )
+
+    def _open_recording(self, experiment_cfg, active_handlers) -> bool:
+        """Open this session's .bvr file. Returns whether saving is on.
+
+        The device table is fixed here, before any device starts, so that every
+        record's ``device_idx`` resolves against a header entry.
+        """
+        self._close_recording()
+
+        file_name = (experiment_cfg.get("file_name") or "").strip()
+        save_dir = experiment_cfg.get("save_dir") or ""
+        if not file_name:
+            log_print(self.logger, "debug", "No file name given; not recording")
+            return False
+
+        # save_dir is the client's path. When the client is on another machine
+        # it may not exist here, and the recording is written server-side.
+        directory = Path(save_dir) if save_dir else Path.cwd()
+        if not directory.is_dir():
+            fallback = Path.cwd()
+            log_print(
+                self.logger,
+                "warning",
+                f"Save directory {directory} does not exist on the server; "
+                f"recording to {fallback} instead",
+            )
+            directory = fallback
+
+        base = Path(file_name).stem or "bioview_recording"
+        label = (experiment_cfg.get("save_label") or "").strip()
+        if label:
+            base = f"{base}_{label}"
+
+        devices = []
+        for device_id, handler in active_handlers.items():
+            try:
+                devices.append(handler.describe_for_recording())
+            except Exception as e:
+                log_print(
+                    self.logger,
+                    "error",
+                    f"{device_id} could not describe itself for the recording ({e}); "
+                    "its data will not be saved",
+                )
+        if not devices:
+            return False
+
+        try:
+            save_path = get_unique_path(str(directory), f"{base}.bvr")
+            drain(self.save_data_queue)
+            self.bvr_writer = BvrWriter(
+                save_path=save_path,
+                data_queue=self.save_data_queue,
+                devices=devices,
+                device_config={
+                    device_id: cfg.to_dict()
+                    for device_id, cfg in (self.config.devices or {}).items()
+                }
+                if self.config is not None
+                else {},
+                logger=self.logger,
+            )
+            self.bvr_writer.open()
+            self.bvr_writer.start()
+            self.bvr_writer.resume()
+        except Exception as e:
+            log_print(self.logger, "error", f"Unable to start recording: {e}")
+            self.bvr_writer = None
+            return False
+        return True
+
+    def _close_recording(self):
+        """Stop the recorder and finalize the file, if one is open."""
+        writer, self.bvr_writer = self.bvr_writer, None
+        if writer is None:
+            return
+        try:
+            writer.stop()
+            writer.join(timeout=RECORDING_CLOSE_TIMEOUT_S)
+            if writer.is_alive():
+                log_print(
+                    self.logger,
+                    "error",
+                    "Recorder did not finish writing within "
+                    f"{RECORDING_CLOSE_TIMEOUT_S}s; the file may be incomplete",
+                )
+        except Exception as e:
+            log_print(self.logger, "error", f"Error closing recording: {e}")
 
     def _stop_streaming(self):
         active_handlers = self._active_device_handlers()
@@ -1107,6 +1351,10 @@ class Server:
             except Exception as e:
                 failures.append(f"{device_id}: {str(e) or type(e).__name__}")
 
+        # After the devices, so every record they queued is drained and written
+        # before the trailer is appended.
+        self._close_recording()
+
         if failures:
             msg = "Failed to stop streaming -- " + "; ".join(failures)
             log_print(self.logger, "error", msg)
@@ -1119,6 +1367,28 @@ class Server:
         log_print(self.logger, "info", msg)
         send_response(
             self.client_control_conn, Response.SUCCESS, params={"message": msg}
+        )
+
+    def _mark_event(self, payload):
+        """Record an annotation against the running recording."""
+        text = (payload or {}).get("text", "")
+        writer = self.bvr_writer
+        if writer is None:
+            send_response(
+                self.client_control_conn,
+                Response.ERROR,
+                params={"message": "No recording is active"},
+                logger=self.logger,
+            )
+            return
+
+        entry = writer.record_annotation(text)
+        log_print(self.logger, "info", f"Marked event: {text}")
+        send_response(
+            self.client_control_conn,
+            Response.SUCCESS,
+            params={"annotation": entry},
+            logger=self.logger,
         )
 
     def _update_running_parameter(self, payload):
@@ -1139,6 +1409,13 @@ class Server:
         if self.config:
             for param, value in config.items():
                 self.config.update_device_param(device_id, param, value)
+
+        # A parameter edited mid-run belongs in the recording's trailer.
+        writer = self.bvr_writer
+        if writer is not None:
+            for param, value in config.items():
+                with contextlib.suppress(Exception):
+                    writer.record_change(device_id, param, value)
 
         # device_id is the group_id.
         handler = self.device_group_handlers.get(device_id)

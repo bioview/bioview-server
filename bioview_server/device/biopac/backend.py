@@ -39,6 +39,7 @@ class BIOPACBackend(Backend):
         group_id: str,
         response_queue: mp.Queue,
         data_output_queue: mp.Queue = None,
+        save_output_queue: mp.Queue = None,
         group_config: dict | None = None,
         discovered_devices: dict | None = None,
     ):
@@ -46,6 +47,7 @@ class BIOPACBackend(Backend):
             group_id=group_id,
             response_queue=response_queue,
             data_output_queue=data_output_queue,
+            save_output_queue=save_output_queue,
         )
         self.group_config = dict(group_config or {})
         self.discovered_devices = discovered_devices or {}
@@ -127,6 +129,10 @@ class BIOPACBackend(Backend):
             )
             self.data_sources.add(source)
 
+    def get_save_freq(self) -> float:
+        """Saved rate: acquisition rate decimated by ``save_ds``."""
+        return float(self.samp_rate) / max(1, int(self.save_ds))
+
     def _initialize(self):
         self.mpdev_handler = load_mpdev_dll(self.mpdev_path)
         if self.mpdev_handler is None:
@@ -196,6 +202,7 @@ class BIOPACBackend(Backend):
             samp_rate=self.samp_rate,
             display_queue=self.display_queue,
             save_queue=self.save_queue,
+            save_ds=self.save_ds,
             chunk_size=chunk_size,
             use_stream=use_stream,
             logger=self.logger,

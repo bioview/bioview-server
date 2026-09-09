@@ -1,4 +1,3 @@
-import contextlib
 import queue
 import time
 from ctypes import byref, c_double, c_uint
@@ -34,6 +33,7 @@ class BiopacAcquisitionWorker(PausableWorker):
         samp_rate: int,
         display_queue: queue.Queue,
         save_queue: queue.Queue = None,
+        save_ds: int = 1,
         chunk_size: int = 50,
         use_stream: bool = None,
         logger=None,
@@ -44,6 +44,9 @@ class BiopacAcquisitionWorker(PausableWorker):
         self.samp_rate = max(1, int(samp_rate))
         self.display_queue = display_queue
         self.save_queue = save_queue
+        # Decimation of the save stream relative to acquisition, so the saved
+        # rate is samp_rate / save_ds like every other device.
+        self.save_ds = max(1, int(save_ds))
         self.chunk_size = max(1, int(chunk_size))
         self.channel_count = len(channels)
         self._period_s = 1.0 / self.samp_rate
@@ -67,6 +70,12 @@ class BiopacAcquisitionWorker(PausableWorker):
         self._chunk = []
         self._next_poll = None
         self._samples_seen = 0
+        # Cumulative count of samples written to the save stream; the recorder
+        # uses it to detect drops. Unlike _samples_seen it is never reset.
+        self._save_samples_emitted = 0
+        # Samples left over from the previous chunk, held so a save_ds window
+        # is never split across two chunks.
+        self._save_remainder = None
         self._rate_window_start = None
         self._last_lag_warning = 0.0
 
@@ -181,10 +190,48 @@ class BiopacAcquisitionWorker(PausableWorker):
             "polled one at a time -- consider a lower sample rate.",
         )
 
+    def _decimate_for_save(self, data: np.ndarray) -> np.ndarray:
+        """Average ``save_ds`` acquired samples into one saved sample.
+
+        Leftover samples are carried into the next chunk rather than dropped, so
+        the saved stream stays exactly ``samp_rate / save_ds`` over a run.
+        """
+        if self.save_ds <= 1:
+            # A copy, not the same buffer: the identical array is handed to the
+            # display queue next, and the two consumers must not alias.
+            return data.copy()
+        if self._save_remainder is not None and self._save_remainder.size:
+            data = np.hstack([self._save_remainder, data])
+        n_windows = data.shape[1] // self.save_ds
+        usable = n_windows * self.save_ds
+        self._save_remainder = data[:, usable:].copy()
+        if n_windows <= 0:
+            return np.empty((data.shape[0], 0), dtype=data.dtype)
+        return (
+            data[:, :usable].reshape(data.shape[0], n_windows, self.save_ds).mean(axis=2)
+        )
+
     def _emit(self, data: np.ndarray):
         if self.save_queue is not None:
-            with contextlib.suppress(queue.Full):
-                self.save_queue.put_nowait(data.copy())
+            save_data = self._decimate_for_save(data)
+            if save_data.shape[1]:
+                item = {
+                    "data": np.ascontiguousarray(save_data),
+                    "sample_idx": self._save_samples_emitted,
+                    "t_wall": time.time(),
+                }
+                self._save_samples_emitted += save_data.shape[1]
+                try:
+                    self.save_queue.put_nowait(item)
+                except queue.Full:
+                    # Never silent: a dropped save chunk is a hole in the
+                    # recording, and the counter above makes it visible in the
+                    # file's trailer as a gap.
+                    log_print(
+                        self.logger,
+                        "error",
+                        "[BIOPAC] Save queue full; dropping chunk",
+                    )
 
         if self.display_queue is not None:
             try:
@@ -198,3 +245,4 @@ class BiopacAcquisitionWorker(PausableWorker):
 
     def cleanup(self):
         self._chunk.clear()
+        self._save_remainder = None

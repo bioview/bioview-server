@@ -1,7 +1,16 @@
 import queue
 
 import numpy as np
-import uhd
+
+
+# Optional at import time so this module (and the backend that imports it)
+# loads on machines without the UHD driver -- uhd is only touched once a
+# radio is actually streaming. Backend availability is decided in
+# device/__init__, which imports usrp/utils.py and its hard uhd import.
+try:
+    import uhd
+except ImportError:  # pragma: no cover - no USRP driver installed
+    uhd = None
 from bioview_common import QUEUE_PUT_TIMEOUT_S, PausableWorker, log_print, put_or_drop
 
 
