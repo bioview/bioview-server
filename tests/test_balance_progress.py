@@ -78,14 +78,17 @@ class _FakeHandler:
 def _server_with(handler, monkeypatch):
     srv = Server(local_only=True, control_port=0, data_port=0)
     srv.device_group_handlers = {"grp": handler}
-    srv._dpic_state = {
-        "pending": True,
-        "ok": None,
-        "message": "",
-        "results": [],
-        "device_id": "grp",
-        "progress": None,
+    srv._dpic_states = {
+        "grp": {
+            "pending": True,
+            "ok": None,
+            "message": "",
+            "results": [],
+            "device_id": "grp",
+            "progress": None,
+        }
     }
+    srv._dpic_last_device = "grp"
     sent = {}
 
     def fake_send(sock, response, params=None, logger=None):
@@ -127,3 +130,16 @@ def test_a_handler_without_progress_support_is_not_an_error(monkeypatch):
     srv._handle_get_device_status()
 
     assert sent["response"] is Response.SUCCESS
+
+
+def test_each_group_gets_its_own_live_progress(monkeypatch):
+    """Two searches at once; neither group may show the other's values."""
+    srv, sent = _server_with(_FakeHandler({"stage": "coarse", "point": 1}), monkeypatch)
+    srv.device_group_handlers["grp2"] = _FakeHandler({"stage": "fine", "point": 9})
+    srv._dpic_states["grp2"] = dict(srv._dpic_states["grp"], device_id="grp2")
+
+    srv._handle_get_device_status()
+
+    balances = sent["params"]["dpic_balances"]
+    assert balances["grp"]["progress"] == {"stage": "coarse", "point": 1}
+    assert balances["grp2"]["progress"] == {"stage": "fine", "point": 9}

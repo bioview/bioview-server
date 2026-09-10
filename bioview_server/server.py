@@ -179,18 +179,16 @@ class Server:
         # ``pending`` on GET_DEVICE_STATUS for the outcome. Running it inline
         # blocked this session's whole command loop -- no Stop, no parameter
         # change, no status poll -- for the duration.
+        #
+        # State and threads are keyed by device group: each group is its own
+        # backend process driving its own radios, so one group's search has no
+        # reason to wait on another's. A single slot here made them queue.
         self._dpic_lock = Lock()
-        self._dpic_thread = None
-        self._dpic_state = {
-            "pending": False,
-            "ok": None,
-            "message": "",
-            "results": [],
-            "device_id": None,
-            # The balancer's live phase/amplitude/gain, so the client's poll
-            # can drive the settings panel while the search runs.
-            "progress": None,
-        }
+        self._dpic_threads = {}
+        self._dpic_states = {}
+        # The group whose balance started most recently, for the single-slot
+        # ``dpic_balance`` field older clients still read.
+        self._dpic_last_device = None
 
         self.data_socket = None
         self.control_socket = None
@@ -660,21 +658,53 @@ class Server:
     def _connecting_states_for_config(self, config):
         return {device_id: DeviceStatus.CONNECTING.value for device_id in config.devices}
 
-    def _handle_get_device_status(self):
+    IDLE_DPIC_STATE = {
+        "pending": False,
+        "ok": None,
+        "message": "",
+        "results": [],
+        "device_id": None,
+        # The balancer's live phase/amplitude/gain, so the client's poll can
+        # drive the settings panel while the search runs.
+        "progress": None,
+    }
+
+    def _drain_dpic_progress(self):
+        """Fold each group's newest progress entry into its balance state.
+
+        Drained on the way out rather than pushed: the client polls this while
+        a balance runs, and the newest entry is the only one that matters for
+        showing phase, amplitude and gain moving. Every group with a state is
+        drained, not just one -- balances run side by side, and a group whose
+        queue went unread would freeze on screen while its search moved.
+        """
         with self._dpic_lock:
-            dpic_state = dict(self._dpic_state)
-        # Drained on the way out rather than pushed: the client polls this
-        # while a balance runs, and the newest entry is the only one that
-        # matters for showing phase, amplitude and gain moving.
-        handler = self.device_group_handlers.get(dpic_state.get("device_id"))
-        if handler is not None and hasattr(handler, "drain_balance_progress"):
+            device_ids = list(self._dpic_states)
+        for device_id in device_ids:
+            handler = self.device_group_handlers.get(device_id)
+            if handler is None or not hasattr(handler, "drain_balance_progress"):
+                continue
             progress = handler.drain_balance_progress()
-            if progress is not None:
-                dpic_state["progress"] = progress
-                with self._dpic_lock:
-                    self._dpic_state["progress"] = progress
-            else:
-                dpic_state["progress"] = self._dpic_state.get("progress")
+            if progress is None:
+                continue  # A gap between measurements is not a reset.
+            with self._dpic_lock:
+                state = self._dpic_states.get(device_id)
+                if state is not None:
+                    state["progress"] = progress
+
+    def _dpic_status_payload(self):
+        """The per-group balance states, plus the one-group view for old clients."""
+        with self._dpic_lock:
+            states = {
+                device_id: dict(state) for device_id, state in self._dpic_states.items()
+            }
+            last = self._dpic_last_device
+        legacy = states.get(last) or dict(self.IDLE_DPIC_STATE)
+        return states, legacy
+
+    def _handle_get_device_status(self):
+        self._drain_dpic_progress()
+        dpic_states, dpic_state = self._dpic_status_payload()
         send_response(
             sock=self.client_control_conn,
             response=Response.SUCCESS,
@@ -683,8 +713,12 @@ class Server:
                 "device_status": self.device_group_states,
                 "device_errors": dict(self.device_group_errors),
                 "data_sources": [src.to_dict() for src in self.data_sources],
-                # The client polls this to follow a balance it started; the
-                # command itself only acknowledges the start.
+                # The client polls these to follow the balances it started; the
+                # command itself only acknowledges the start. The map is keyed
+                # by group so concurrent searches each get their own outcome;
+                # the singular field is the most recently started of them, kept
+                # for clients that predate the map.
+                "dpic_balances": dpic_states,
                 "dpic_balance": dpic_state,
             },
             logger=self.logger,
@@ -1488,18 +1522,21 @@ class Server:
             return
 
         with self._dpic_lock:
-            if self._dpic_state["pending"]:
+            # Only this group's own search blocks a new one. Another group is
+            # another backend process driving other radios; making it wait
+            # turned a four-group rig into four searches end to end.
+            existing = self._dpic_states.get(device_id)
+            if existing is not None and existing["pending"]:
                 send_response(
                     self.client_control_conn,
                     Response.ERROR,
                     params={
-                        "message": "A DPIC balance is already running on "
-                        f"{self._dpic_state['device_id']}"
+                        "message": f"A DPIC balance is already running on {device_id}"
                     },
                     logger=self.logger,
                 )
                 return
-            self._dpic_state = {
+            self._dpic_states[device_id] = {
                 "pending": True,
                 "ok": None,
                 "message": f"DPIC balance running on {device_id}",
@@ -1507,6 +1544,7 @@ class Server:
                 "device_id": device_id,
                 "progress": None,
             }
+            self._dpic_last_device = device_id
 
         send_response(
             self.client_control_conn,
@@ -1519,12 +1557,15 @@ class Server:
             logger=self.logger,
         )
 
-        self._dpic_thread = Thread(
+        thread = Thread(
             target=self._dpic_balance_work,
             args=(device_id, handler),
+            name=f"dpic-balance-{device_id}",
             daemon=True,
         )
-        self._dpic_thread.start()
+        with self._dpic_lock:
+            self._dpic_threads[device_id] = thread
+        thread.start()
 
     def _dpic_balance_work(self, device_id, handler):
         """Drive one balance to completion and record its outcome for polling."""
@@ -1550,13 +1591,16 @@ class Server:
             f"[DPIC] {device_id}: {message}",
         )
         with self._dpic_lock:
-            self._dpic_state = {
+            previous = self._dpic_states.get(device_id) or {}
+            self._dpic_states[device_id] = {
                 "pending": False,
                 "ok": ok,
                 "message": message,
                 "results": results,
                 "device_id": device_id,
-                "progress": self._dpic_state.get("progress"),
+                # This group's own last progress, so the panel keeps showing
+                # where its search ended rather than another group's values.
+                "progress": previous.get("progress"),
             }
 
     def stop(self):
