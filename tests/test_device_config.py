@@ -26,10 +26,10 @@ def test_every_backend_declares_an_editable_schema():
 
 
 def test_backend_without_editable_properties_refuses_edits():
-    dummy = AVAILABLE_BACKENDS.get("dummy")
-    assert dummy is not None
-    assert {} == dummy.EDITABLE_PROPERTIES
-    ok, message = dummy.set_device_config({"name": "DummyVirtual"}, {"x": 1})
+    fake = AVAILABLE_BACKENDS.get("fake")
+    assert fake is not None
+    assert {} == fake.EDITABLE_PROPERTIES
+    ok, message = fake.set_device_config({"name": "FakeDevice"}, {"x": 1})
     assert not ok
     assert message
 

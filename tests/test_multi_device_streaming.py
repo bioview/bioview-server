@@ -12,7 +12,8 @@ Each backend now has its own queue and every reply is matched by request id.
 import multiprocessing as mp
 
 import pytest
-from bioview_common import Command, DummyConfiguration, IPCCommand, Response
+from bioview_common import Command, IPCCommand, Response
+from fakes import FakeConfiguration
 
 from bioview_server.datatypes import Backend
 
@@ -20,10 +21,10 @@ from bioview_server.datatypes import Backend
 NUM_CHANNELS = 2
 
 
-def _dummy(samp_rate: int) -> dict:
-    return DummyConfiguration.from_dict(
+def _fake(samp_rate: int) -> dict:
+    return FakeConfiguration.from_dict(
         {
-            "type": "DUMMY",
+            "type": "FAKE",
             "samp_rate": samp_rate,
             "num_channels": NUM_CHANNELS,
             "signal_freq": 1.0,
@@ -34,7 +35,7 @@ def _dummy(samp_rate: int) -> dict:
     ).to_dict()
 
 
-TWO_GROUPS = {"DeviceA": _dummy(500), "DeviceB": _dummy(1000)}
+TWO_GROUPS = {"DeviceA": _fake(500), "DeviceB": _fake(1000)}
 
 
 # --------------------------------------------------------------------------

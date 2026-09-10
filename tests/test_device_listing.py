@@ -1,8 +1,13 @@
 """What the Configurator is shown when it enumerates attached hardware.
 
-Two things went wrong here in the field: a BIOPAC unit that was physically
-connected never appeared (the backend had silently failed to load, and nothing
-said so), and simulated devices were listed alongside the real ones.
+A BIOPAC unit that was physically connected once never appeared, because the
+backend had silently failed to load and nothing said so. The listing therefore
+reports the backends that did not load, and why, alongside the devices that did.
+
+Simulated devices were the other half of that story: they used to be listed
+beside real hardware. The server no longer ships one, so the only virtual device
+in existence is the test double this suite registers (see ``tests/fakes``) and
+the Configurator cannot be shown something that is not installed.
 """
 
 from bioview_common import DEVICE_OP_COMMAND_TIMEOUT, Command, Response
@@ -18,18 +23,10 @@ def _list(client, **params):
     return payload
 
 
-def test_virtual_devices_are_hidden_from_the_configurator(client):
+def test_every_registered_backend_is_listed(client):
     payload = _list(client)
-    assert not [d for d in payload["devices"] if d.get("device_type") == "dummy"], (
-        "the Configurator lists attached hardware; a simulated device among the "
-        "real ones is misleading"
-    )
-    assert "dummy" not in payload["backends"]
-
-
-def test_virtual_devices_can_still_be_asked_for(client):
-    payload = _list(client, include_virtual=True)
-    assert any(d.get("device_type") == "dummy" for d in payload["devices"])
+    assert any(d.get("device_type") == "fake" for d in payload["devices"])
+    assert payload["backends"]["fake"]["available"] is True
 
 
 def test_a_backend_that_failed_to_load_is_reported_with_its_reason(client, monkeypatch):
@@ -56,15 +53,8 @@ def test_an_unavailable_backend_does_not_stop_the_others_being_listed(
 ):
     monkeypatch.setattr(server_mod, "UNAVAILABLE_BACKENDS", {"absent": "no driver"})
 
-    payload = _list(client, include_virtual=True)
-    assert any(d.get("device_type") == "dummy" for d in payload["devices"])
+    payload = _list(client)
+    assert any(d.get("device_type") == "fake" for d in payload["devices"])
     assert payload["backends"]["absent"]["available"] is False
     # Everything that did load is still listed alongside it.
     assert any(info.get("available") for info in payload["backends"].values())
-
-
-def test_an_unavailable_virtual_backend_is_not_reported_to_the_configurator(
-    client, monkeypatch
-):
-    monkeypatch.setattr(server_mod, "UNAVAILABLE_BACKENDS", {"dummy": "boom"})
-    assert "dummy" not in _list(client)["backends"]

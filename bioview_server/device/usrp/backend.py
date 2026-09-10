@@ -25,8 +25,7 @@ from bioview_common import (
 from bioview_common.datatypes.configuration.hardware_params import (
     GLOBAL_RX_PARAMS,
     GLOBAL_TX_PARAMS,
-    apply_global_rx_values_to_hardware,
-    apply_global_tx_values_to_hardware,
+    apply_global_values_to_hardware,
     build_global_mapping,
 )
 from bioview_common.datatypes.configuration.usrp_channel_map import (
@@ -672,8 +671,8 @@ class USRPBackend(Backend):
         with self._gain_lock:
             self.rx_gains_global[global_rx] = float(value)
             gains = list(self.rx_gains_global)
-            apply_global_rx_values_to_hardware(
-                self.hardware, "rx_gain", gains, self.group_config
+            apply_global_values_to_hardware(
+                self.hardware, "rx_gain", gains, self.group_config, kind="rx"
             )
             self.rx_command_queue[dev_name].put({"param": "rx_gain", "value": gains})
 
@@ -684,8 +683,12 @@ class USRPBackend(Backend):
         dev_name, _local = self.global_tx_to_device[global_tx]
         with self._gain_lock:
             self.tx_gains_global[global_tx] = float(value)
-            apply_global_tx_values_to_hardware(
-                self.hardware, "tx_gain", list(self.tx_gains_global), self.group_config
+            apply_global_values_to_hardware(
+                self.hardware,
+                "tx_gain",
+                list(self.tx_gains_global),
+                self.group_config,
+                kind="tx",
             )
         self.transmit_workers[dev_name].set_global_tx_param(global_tx, "gain", value)
 
@@ -922,13 +925,13 @@ class USRPBackend(Backend):
                 self.tx_gains_global = [float(v) for v in value]
 
             if param in GLOBAL_TX_PARAMS and self.hardware:
-                apply_global_tx_values_to_hardware(
-                    self.hardware, param, value, self.group_config
+                apply_global_values_to_hardware(
+                    self.hardware, param, value, self.group_config, kind="tx"
                 )
                 self.group_config["hardware"] = self.hardware
             elif param in GLOBAL_RX_PARAMS and self.hardware:
-                apply_global_rx_values_to_hardware(
-                    self.hardware, param, value, self.group_config
+                apply_global_values_to_hardware(
+                    self.hardware, param, value, self.group_config, kind="rx"
                 )
                 self.group_config["hardware"] = self.hardware
             elif param == "hardware":

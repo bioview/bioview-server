@@ -1,6 +1,6 @@
 """Shared logging and serialisation for DPIC balance results.
 
-Both the USRP and dummy backends run the same balancer, so they report it the
+Every backend that balances runs the same balancer, so they all report it the
 same way. Every outcome -- including "it did not run" -- carries a reason: a
 balance that bails out must never reach the client as a success.
 """

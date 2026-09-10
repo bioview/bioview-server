@@ -5,7 +5,7 @@ nothing on the plots:
 
 * ``_start_streaming`` never started the shared DisplayWorker, so the
   acquisition worker filled the display queue and nothing drained it into the
-  client's output queue. USRP and dummy have always started it.
+  client's output queue. USRP has always started it.
 * Every sample is forwarded to the display, but the sources advertised the
   default 200 Hz display rate rather than the sample rate, so the plot window
   was sized for the wrong rate.

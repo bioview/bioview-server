@@ -21,9 +21,9 @@ REQUIRED_BACKEND_ATTRS = (
 )
 
 
-def test_dummy_backend_is_always_available():
+def test_fake_backend_is_registered():
     """Hardware-free streaming must work on any machine."""
-    assert "dummy" in AVAILABLE_BACKENDS
+    assert "fake" in AVAILABLE_BACKENDS
 
 
 @pytest.mark.parametrize("backend_type", sorted(AVAILABLE_BACKENDS))
@@ -40,7 +40,7 @@ def test_discovery_returns_a_sane_shape_with_or_without_hardware(backend_type):
     """Discovery must return a container, never raise, when nothing is attached."""
     backend = AVAILABLE_BACKENDS[backend_type]
     found = backend.discover_devices()
-    assert isinstance(found, (dict, list)), type(found)
+    assert isinstance(found, dict | list), type(found)
 
     entries = list(found.values()) if isinstance(found, dict) else found
     for entry in entries:
@@ -64,7 +64,6 @@ def test_server_lists_devices_without_a_loaded_configuration(client):
     """LIST_DEVICES is what the Configurator calls before any config exists."""
     resp_type, payload = client.command(
         Command.LIST_DEVICES,
-        {"include_virtual": True},
         timeout=DEVICE_OP_COMMAND_TIMEOUT,
     )
     assert resp_type == Response.DEVICE_LIST.name, payload
@@ -74,9 +73,9 @@ def test_server_lists_devices_without_a_loaded_configuration(client):
     assert isinstance(devices, list)
     assert isinstance(backends, dict)
 
-    # The virtual device is always available, so with virtual devices asked for
-    # the listing is never empty.
-    assert any(d.get("device_type") == "dummy" for d in devices), devices
+    # The fake backend is registered for this suite, so the listing is never
+    # empty even on a machine with nothing attached.
+    assert any(d.get("device_type") == "fake" for d in devices), devices
 
     for backend_type, info in backends.items():
         assert "editable_properties" in info, backend_type
@@ -86,7 +85,6 @@ def test_server_lists_devices_without_a_loaded_configuration(client):
 def test_listed_devices_carry_their_editability(client):
     _resp, payload = client.command(
         Command.LIST_DEVICES,
-        {"include_virtual": True},
         timeout=DEVICE_OP_COMMAND_TIMEOUT,
     )
     backends = payload["backends"]
@@ -108,7 +106,7 @@ def test_set_device_config_rejects_a_backend_without_editable_properties(client)
     resp_type, payload = client.command(
         Command.SET_DEVICE_CONFIG,
         {
-            "device_info": {"device_type": "dummy", "name": "DummyVirtual"},
+            "device_info": {"device_type": "fake", "name": "FakeDevice"},
             "config": {"device_name": "whatever"},
         },
     )
@@ -133,13 +131,12 @@ def test_one_failing_backend_does_not_hide_the_others(client, monkeypatch):
 
     resp_type, payload = client.command(
         Command.LIST_DEVICES,
-        {"include_virtual": True},
         timeout=DEVICE_OP_COMMAND_TIMEOUT,
     )
     assert resp_type == Response.DEVICE_LIST.name, payload
 
-    # The dummy backend still reports its device...
-    assert any(d.get("device_type") == "dummy" for d in payload["devices"])
+    # The fake backend still reports its device...
+    assert any(d.get("device_type") == "fake" for d in payload["devices"])
     # ...and the broken one is flagged rather than swallowed.
     assert payload["backends"]["exploding"]["available"] is False
     assert "driver on fire" in payload["backends"]["exploding"]["error"]

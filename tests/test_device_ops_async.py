@@ -1,9 +1,9 @@
 """Tests for async device discover/init and GET_DEVICE_STATUS polling."""
 
 from bioview_common import Command, Response
+from test_e2e_fake_streaming import FAKE_DEVICE_GROUPS
 
 from bioview_server.server import _handler_init_succeeded
-from test_e2e_dummy_streaming import DUMMY_DEVICE_GROUPS
 
 
 def test_handler_init_succeeded_rejects_false_result():
@@ -34,23 +34,23 @@ def test_initialize_returns_unavailable_when_backend_fails(monkeypatch, client):
     )
 
     resp_type, payload = client.device_command(
-        Command.INITIALIZE_DEVICES, {"device_groups": DUMMY_DEVICE_GROUPS}
+        Command.INITIALIZE_DEVICES, {"device_groups": FAKE_DEVICE_GROUPS}
     )
     assert resp_type == Response.SUCCESS.name, payload
-    assert payload["device_status"]["DummyDevice"] == "Unavailable"
+    assert payload["device_status"]["FakeDevice"] == "Unavailable"
 
 
 def test_initialize_returns_device_connecting_then_polls(client):
     resp_type, payload = client.command(
-        Command.INITIALIZE_DEVICES, {"device_groups": DUMMY_DEVICE_GROUPS}
+        Command.INITIALIZE_DEVICES, {"device_groups": FAKE_DEVICE_GROUPS}
     )
     assert resp_type == Response.DEVICE_CONNECTING.name, payload
     assert payload.get("pending") is True
-    assert payload["device_status"]["DummyDevice"] == "Connecting"
+    assert payload["device_status"]["FakeDevice"] == "Connecting"
 
     final_type, final_payload = client.wait_for_device_op(resp_type, payload)
     assert final_type == Response.SUCCESS.name, final_payload
-    assert final_payload["device_status"]["DummyDevice"] == "Connected"
+    assert final_payload["device_status"]["FakeDevice"] == "Connected"
     assert len(final_payload.get("data_sources", [])) > 0
 
 

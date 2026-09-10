@@ -12,8 +12,8 @@ import copy
 import multiprocessing as mp
 
 import pytest
+from fakes.backend import FakeBackend
 
-from bioview_server.device.dummy.backend import DummyBackend
 from bioview_server.device.usrp.backend import USRPBackend
 
 
@@ -34,8 +34,8 @@ GROUP_CONFIG = {
 }
 
 
-def _dummy():
-    return DummyBackend(
+def _fake():
+    return FakeBackend(
         group_id="grp",
         response_queue=mp.Queue(),
         data_output_queue=mp.Queue(),
@@ -54,7 +54,7 @@ def _usrp():
     )
 
 
-@pytest.mark.parametrize("make_backend", [_dummy, _usrp], ids=["dummy", "usrp"])
+@pytest.mark.parametrize("make_backend", [_fake, _usrp], ids=["fake", "usrp"])
 def test_inject_tx_is_moved_onto_the_measure_tx_if(make_backend):
     be = make_backend()
     assert be.channel_ifs == [100e3, 110e3]
@@ -69,7 +69,7 @@ def test_inject_tx_is_moved_onto_the_measure_tx_if(make_backend):
     assert be.registry.tx_if_freq == [100e3, 100e3]
 
 
-@pytest.mark.parametrize("make_backend", [_dummy, _usrp], ids=["dummy", "usrp"])
+@pytest.mark.parametrize("make_backend", [_fake, _usrp], ids=["fake", "usrp"])
 def test_matching_ifs_are_left_alone(make_backend):
     be = make_backend()
     be.channel_ifs[1] = 100e3

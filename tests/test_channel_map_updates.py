@@ -14,8 +14,8 @@ import multiprocessing as mp
 import queue
 
 import pytest
+from fakes.backend import FakeBackend
 
-from bioview_server.device.dummy.backend import DummyBackend
 from bioview_server.device.usrp.backend import USRPBackend
 
 
@@ -37,8 +37,8 @@ WITH_PAIR = {
 }
 
 
-def _dummy():
-    return DummyBackend(
+def _fake():
+    return FakeBackend(
         group_id="grp",
         response_queue=mp.Queue(),
         data_output_queue=mp.Queue(),
@@ -57,7 +57,7 @@ def _usrp():
     )
 
 
-@pytest.mark.parametrize("make_backend", [_dummy, _usrp], ids=["dummy", "usrp"])
+@pytest.mark.parametrize("make_backend", [_fake, _usrp], ids=["fake", "usrp"])
 def test_a_pair_added_in_the_ui_reaches_dpic_pairs(make_backend):
     be = make_backend()
     assert be.dpic_pairs == []
@@ -70,7 +70,7 @@ def test_a_pair_added_in_the_ui_reaches_dpic_pairs(make_backend):
     assert be.group_config["channel_map"]["dpic"]
 
 
-@pytest.mark.parametrize("make_backend", [_dummy, _usrp], ids=["dummy", "usrp"])
+@pytest.mark.parametrize("make_backend", [_fake, _usrp], ids=["fake", "usrp"])
 def test_the_measurement_grid_follows_the_new_map(make_backend):
     be = make_backend()
     assert sorted(s.label for s in be.mimo_sources) == [
@@ -87,7 +87,7 @@ def test_the_measurement_grid_follows_the_new_map(make_backend):
     assert sorted(s.label for s in be.mimo_sources) == ["Tx1Rx1"]
 
 
-@pytest.mark.parametrize("make_backend", [_dummy, _usrp], ids=["dummy", "usrp"])
+@pytest.mark.parametrize("make_backend", [_fake, _usrp], ids=["fake", "usrp"])
 def test_the_parent_side_mirror_sees_it_too(make_backend):
     """`get_data_sources()` and the balance dispatch are answered by the parent."""
     be = make_backend()

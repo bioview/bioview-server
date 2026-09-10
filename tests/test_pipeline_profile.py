@@ -1,10 +1,10 @@
-"""Real-time suitability of the processing pipeline, on dummy data.
+"""Real-time suitability of the processing pipeline, on synthetic data.
 
 Two things are checked, both against the wall-clock budget a chunk actually has:
 
 1. Per-stage cost. Each stage is timed separately and printed as a table so a
    regression shows up as a number rather than as "streaming feels laggy".
-2. Sustained behaviour. A dummy-RF stream is run long enough that any leak or
+2. Sustained behaviour. A fake-RF stream is run long enough that any leak or
    imbalance would show, then the drop counters are required to be zero.
 
 The budget matters more than the absolute numbers: a chunk of N samples at
@@ -183,12 +183,13 @@ def test_repeated_processing_does_not_grow_memory():
     assert growth_kb < 512, f"retained {growth_kb:.0f} KiB over 50 chunks"
 
 
-def test_sustained_dummy_rf_stream_drops_nothing(server, client, capsys):
-    """Run the dummy RF backend for a while; the drop counters must stay at zero."""
-    from bioview_common import Command, DummyConfiguration, Response
+def test_sustained_fake_rf_stream_drops_nothing(server, client, capsys):
+    """Run the fake RF backend for a while; the drop counters must stay at zero."""
+    from bioview_common import Command, Response
+    from fakes import FakeConfiguration
 
     group_cfg = {
-        "type": "DUMMY",
+        "type": "FAKE",
         "signal_scheme": "cw",
         "samp_rate": 200_000,
         "chunk_duration": 0.005,
@@ -205,7 +206,7 @@ def test_sustained_dummy_rf_stream_drops_nothing(server, client, capsys):
         "channel_map": {"layout": "full_nxn", "dpic": []},
         "rf_simulation": {"on_axis_gain": 0.4, "cross_coupling": 0.08},
     }
-    device_groups = {"ProfileGroup": DummyConfiguration.from_dict(group_cfg).to_dict()}
+    device_groups = {"ProfileGroup": FakeConfiguration.from_dict(group_cfg).to_dict()}
 
     resp_type, payload = client.device_command(
         Command.INITIALIZE_DEVICES, {"device_groups": device_groups}
@@ -231,11 +232,11 @@ def test_sustained_dummy_rf_stream_drops_nothing(server, client, capsys):
 
     client.command(Command.STOP_STREAMING)
 
-    # DummyRfWorker emits one buffer per chunk_duration * SAVE_BUFFER_SCALE,
+    # FakeRfWorker emits one buffer per chunk_duration * SAVE_BUFFER_SCALE,
     # mirroring the USRP receive worker's 20-packet buffering. Derive the
     # expected rate from the config rather than assuming one chunk per
     # chunk_duration.
-    from bioview_server.device.dummy.rf_worker import SAVE_BUFFER_SCALE
+    from fakes.rf_worker import SAVE_BUFFER_SCALE
 
     emit_period = group_cfg["chunk_duration"] * SAVE_BUFFER_SCALE
     expected = elapsed / emit_period

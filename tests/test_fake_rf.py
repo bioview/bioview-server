@@ -1,4 +1,4 @@
-"""Tests for dummy RF MIMO / DPIC simulation."""
+"""Tests for the fake backend's RF MIMO / DPIC simulation."""
 
 import time
 from pathlib import Path
@@ -10,14 +10,13 @@ from bioview_common.datatypes.configuration.usrp_channel_map import (
 )
 from bioview_common.signal_schemes.cw import CwScheme
 from bioview_common.signal_schemes.dpic import DpicBalancer, DpicChannel
-
-from bioview_server.device.dummy.rf_simulation import MimoChannelModel
+from fakes.rf_simulation import MimoChannelModel
 
 
 # Kept beside the tests: the server is checked out on its own in CI,
 # so a path above the repo root does not exist there.
 DATA_DIR = Path(__file__).resolve().parent / "data"
-DUMMY_DPIC_CFG = DATA_DIR / "dummy_dpic_2x2_mimo_cfg.json"
+FAKE_DPIC_CFG = DATA_DIR / "fake_dpic_2x2_mimo_cfg.json"
 
 
 def _build_rf_context():
@@ -241,5 +240,5 @@ def test_dpic_time_budget_keeps_the_best_point_seen():
     assert schemes["MyB210_7"].tx_amplitude[0] == result.best_amplitude
 
 
-def test_dummy_dpic_config_file_exists():
-    assert DUMMY_DPIC_CFG.is_file()
+def test_fake_dpic_config_file_exists():
+    assert FAKE_DPIC_CFG.is_file()

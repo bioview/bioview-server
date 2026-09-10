@@ -1,33 +1,32 @@
-"""Generate synthetic MIMO RX streams for dummy RF simulation."""
+"""Generate synthetic MIMO RX streams for the fake RF backend."""
 
 from __future__ import annotations
 
 import queue
 import time
-from typing import Dict, List
 
 import numpy as np
-
 from bioview_common import PausableWorker, log_print
 from bioview_common.signal_schemes.base import SignalScheme
 
 from .rf_simulation import MimoChannelModel
 
+
 SAVE_BUFFER_SCALE = 20
 
 
-class DummyRfWorker(PausableWorker):
+class FakeRfWorker(PausableWorker):
     """Produce per-device RX buffers from virtual TX schemes and a channel model."""
 
     def __init__(
         self,
         samp_rate: float,
-        hardware: Dict[str, dict],
-        rx_device_order: List[str],
-        rx_queues: Dict[str, queue.Queue],
-        schemes_by_device: Dict[str, SignalScheme],
-        global_tx_to_device: Dict[int, tuple],
-        global_tx_offsets: Dict[str, int],
+        hardware: dict[str, dict],
+        rx_device_order: list[str],
+        rx_queues: dict[str, queue.Queue],
+        schemes_by_device: dict[str, SignalScheme],
+        global_tx_to_device: dict[int, tuple],
+        global_tx_offsets: dict[str, int],
         channel_model: MimoChannelModel,
         chunk_duration: float,
         logger=None,
@@ -93,7 +92,7 @@ class DummyRfWorker(PausableWorker):
                 log_print(
                     self.logger,
                     "warning",
-                    f"[DUMMY RF] Rx queue full for {dev_name}; dropping chunk",
+                    f"[FAKE RF] Rx queue full for {dev_name}; dropping chunk",
                 )
 
         self._next_emit += self.chunk_duration

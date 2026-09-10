@@ -11,13 +11,13 @@ import multiprocessing as mp
 import pytest
 from bioview_common import Response
 from bioview_common.signal_schemes.dpic import DpicBalancer, DpicChannel
+from fakes.backend import FakeBackend
 
 from bioview_server.common import balance_outcome
-from bioview_server.device.dummy.backend import DummyBackend
 
 
 def _backend(group_config=None):
-    return DummyBackend(
+    return FakeBackend(
         group_id="grp",
         response_queue=mp.Queue(),
         data_output_queue=mp.Queue(),

@@ -1,4 +1,4 @@
-"""Virtual MIMO channel model for dummy RF simulation."""
+"""Virtual MIMO channel model for the fake RF backend."""
 
 from __future__ import annotations
 

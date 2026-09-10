@@ -3,9 +3,10 @@
 These boot a real :class:`~bioview_server.server.Server` in a background thread on
 ephemeral ports and provide a thin, headless test client (raw sockets speaking
 the BioView protocol via bioview-common) so the full connect / authenticate /
-discover / initialize / stream path can be exercised against the always-available
-dummy device backend -- no PyQt and no hardware required.
+discover / initialize / stream path can be exercised against the fake backend in
+``tests/fakes`` -- no PyQt and no hardware required.
 """
+
 import contextlib
 import socket
 import struct
@@ -23,8 +24,21 @@ from bioview_common import (
     parse_and_validate_response,
     send_command,
 )
+from fakes import install as install_fake_device
 
 from bioview_server.server import Server
+
+
+@pytest.fixture(autouse=True)
+def _fake_device():
+    """Register the fake backend for every test in this suite.
+
+    The server ships no hardware-free device, so without this there is nothing
+    an end-to-end test could stream from. Registration is process-global and
+    idempotent; a spawned backend subprocess inherits sys.path and imports the
+    package by name, the same way it imports a real backend.
+    """
+    install_fake_device()
 
 
 def _free_port() -> int:

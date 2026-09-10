@@ -18,18 +18,17 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-
-from bioview_server.device.dummy.backend import DummyBackend
+from fakes.backend import FakeBackend
 
 
 # Kept beside the tests: the server is checked out on its own in CI,
 # so a path above the repo root does not exist there.
 DATA_DIR = Path(__file__).resolve().parent / "data"
-RF_CFG_PATH = DATA_DIR / "dummy_dpic_2x2_mimo_cfg.json"
+RF_CFG_PATH = DATA_DIR / "fake_dpic_2x2_mimo_cfg.json"
 
 
 def _rf_group_config(**overrides):
-    cfg = json.loads(RF_CFG_PATH.read_text(encoding="utf-8"))["Dummy_DPIC_2x2"]
+    cfg = json.loads(RF_CFG_PATH.read_text(encoding="utf-8"))["Fake_DPIC_2x2"]
     cfg["dpic_balance"] = dict(cfg["dpic_balance"], auto_on_start=False)
     cfg["calibration"] = dict(cfg["calibration"], **overrides.pop("calibration", {}))
     cfg.update(overrides)
@@ -39,7 +38,7 @@ def _rf_group_config(**overrides):
 @pytest.fixture
 def rf_backend():
     response_queue = mp.Queue()
-    backend = DummyBackend(
+    backend = FakeBackend(
         group_id="G", response_queue=response_queue, group_config=_rf_group_config()
     )
     backend.logger = logging.getLogger(__name__)

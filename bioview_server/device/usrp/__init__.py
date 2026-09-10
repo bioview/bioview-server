@@ -1,7 +1,7 @@
 """USRP backend package.
 
-Heavy dependencies (UHD) are loaded lazily so other backends (e.g. dummy RF
-simulation) can import ``process`` without requiring USRP drivers.
+Heavy dependencies (UHD) are loaded lazily, so ``process`` -- the demodulation
+pipeline every RF path shares -- can be imported without USRP drivers present.
 """
 
 from bioview_common import log_print

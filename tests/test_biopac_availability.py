@@ -40,7 +40,7 @@ def _states(monkeypatch, backends, config=BIOPAC_CFG):
 
 
 def test_an_attached_unit_is_available_though_its_name_differs_from_the_config(
-    monkeypatch
+    monkeypatch,
 ):
     backends = {
         "biopac": FakeBackend(
@@ -66,13 +66,13 @@ def test_another_backends_devices_do_not_pass_for_biopac_hardware(monkeypatch):
     like it had a BIOPAC unit attached."""
     backends = {
         "biopac": FakeBackend({}),
-        "dummy": FakeBackend({"DummyVirtual": {"name": "DummyVirtual"}}),
+        "fake": FakeBackend({"FakeDevice": {"name": "FakeDevice"}}),
     }
     assert _states(monkeypatch, backends)["BIOPAC"] == DeviceStatus.UNAVAILABLE.value
 
 
 def test_a_backend_that_raises_leaves_biopac_unavailable_rather_than_crashing(
-    monkeypatch
+    monkeypatch,
 ):
     class Exploding:
         @staticmethod

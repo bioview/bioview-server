@@ -2,7 +2,7 @@
 import multiprocessing as mp
 import sys
 
-from bioview_common import SUPPORTED_DEVICES, DeviceType, log_print
+from bioview_common import DeviceType, log_print
 from bioview_common.utils.logs import suppress_stdout
 
 
@@ -66,17 +66,8 @@ try:
 except Exception as e:
     _backend_unavailable(DeviceType.MICROPHONE.value, e)
 
-try:
-    # Virtual device: always available, no hardware or platform requirements.
-    from . import dummy
 
-    __all__.append("dummy")
-    AVAILABLE_BACKENDS[DeviceType.DUMMY.value] = dummy
-except Exception as e:
-    _backend_unavailable(DeviceType.DUMMY.value, e)
-
-
-def backend_report(include_virtual: bool = False) -> dict:
+def backend_report() -> dict:
     """Every backend and whether it loaded, as ``{type: {available, error}}``.
 
     The server hands this to a client the moment it authenticates, so a UHD
@@ -84,16 +75,66 @@ def backend_report(include_virtual: bool = False) -> dict:
     reaches the operator as one explained failure -- in the Monitor as much as
     in the Configurator -- instead of a line on a stdout nobody is reading.
     """
-    report = {}
-    for device_type in AVAILABLE_BACKENDS:
-        if device_type == DeviceType.DUMMY.value and not include_virtual:
-            continue
-        report[device_type] = {"available": True, "error": ""}
+    report = {
+        device_type: {"available": True, "error": ""}
+        for device_type in AVAILABLE_BACKENDS
+    }
     for device_type, reason in UNAVAILABLE_BACKENDS.items():
-        if device_type == DeviceType.DUMMY.value and not include_virtual:
-            continue
         report[device_type] = {"available": False, "error": str(reason)}
     return report
+
+
+def _usrp_handler(backend, device_id, device_cfg, queues, discovered_devices):
+    """The USRP group is the one backend whose constructor takes more than the
+    group config: it is built per radio, so the hardware block is split out."""
+    group_cfg = device_cfg.to_dict()
+    hardware = group_cfg.get("hardware")
+    devices = (
+        {name: dict(hw) for name, hw in hardware.items()}
+        if hardware
+        else {device_id: group_cfg}
+    )
+
+    return backend.USRPBackend(
+        group_id=device_id,
+        samp_rate=device_cfg.get_param("samp_rate"),
+        devices=devices,
+        group_config=group_cfg,
+        display_ds=device_cfg.get_param("disp_ds", 10),
+        display_imaginary=device_cfg.get_param("display_imaginary", False),
+        save_ds=device_cfg.get_param("save_ds", 1),
+        save_iq=device_cfg.get_param("save_iq", False),
+        save_imaginary=device_cfg.get_param("save_imaginary", True),
+        discovered_devices=discovered_devices,
+        **queues,
+    )
+
+
+def _group_config_handler(attribute):
+    """Factory for a backend built from nothing but its group config.
+
+    BIOPAC and the microphone are constructed identically; naming the class
+    keeps that one shape rather than repeating the call per device type.
+    """
+
+    def build(backend, device_id, device_cfg, queues, discovered_devices):
+        return getattr(backend, attribute)(
+            group_id=device_id,
+            group_config=device_cfg.to_dict(),
+            discovered_devices=discovered_devices,
+            **queues,
+        )
+
+    return build
+
+
+#: device_type -> callable building that backend's handler. Registering here is
+#: what makes a loaded backend usable; the test suite adds its own the same way.
+HANDLER_FACTORIES = {
+    DeviceType.USRP.value: _usrp_handler,
+    DeviceType.BIOPAC.value: _group_config_handler("BIOPACBackend"),
+    DeviceType.MICROPHONE.value: _group_config_handler("MicrophoneBackend"),
+}
 
 
 def get_device_handler(
@@ -107,73 +148,22 @@ def get_device_handler(
 ):
     device_type = device_cfg.get_param("device_type")
 
-    if device_type not in SUPPORTED_DEVICES:
+    build = HANDLER_FACTORIES.get(device_type)
+    if build is None:
         log_print(logger, "error", f"Unsupported device type: {device_type}")
         return None
-    elif device_type not in AVAILABLE_BACKENDS:
+
+    backend = AVAILABLE_BACKENDS.get(device_type)
+    if backend is None:
         log_print(logger, "warning", f"Backend not available for {device_type}")
         return None
 
-    match device_type:
-        case DeviceType.USRP.value:
-            group_cfg = device_cfg.to_dict()
-            hardware = group_cfg.get("hardware")
-            if hardware:
-                devices = {name: dict(hw) for name, hw in hardware.items()}
-            else:
-                devices = {device_id: group_cfg}
-
-            handler = AVAILABLE_BACKENDS.get(DeviceType.USRP.value).USRPBackend(
-                group_id=device_id,
-                samp_rate=device_cfg.get_param("samp_rate"),
-                devices=devices,
-                group_config=group_cfg,
-                response_queue=response_queue,
-                data_output_queue=data_output_queue,
-                save_output_queue=save_output_queue,
-                display_ds=device_cfg.get_param("disp_ds", 10),
-                display_imaginary=device_cfg.get_param("display_imaginary", False),
-                save_ds=device_cfg.get_param("save_ds", 1),
-                save_iq=device_cfg.get_param("save_iq", False),
-                save_imaginary=device_cfg.get_param("save_imaginary", True),
-                discovered_devices=discovered_devices,
-            )
-
-        case DeviceType.BIOPAC.value:
-            handler = AVAILABLE_BACKENDS.get(DeviceType.BIOPAC.value).BIOPACBackend(
-                group_id=device_id,
-                response_queue=response_queue,
-                data_output_queue=data_output_queue,
-                save_output_queue=save_output_queue,
-                group_config=device_cfg.to_dict(),
-                discovered_devices=discovered_devices,
-            )
-
-        case DeviceType.MICROPHONE.value:
-            handler = AVAILABLE_BACKENDS.get(
-                DeviceType.MICROPHONE.value
-            ).MicrophoneBackend(
-                group_id=device_id,
-                response_queue=response_queue,
-                data_output_queue=data_output_queue,
-                save_output_queue=save_output_queue,
-                group_config=device_cfg.to_dict(),
-                discovered_devices=discovered_devices,
-            )
-
-        case DeviceType.DUMMY.value:
-            handler = AVAILABLE_BACKENDS.get(DeviceType.DUMMY.value).DummyBackend(
-                group_id=device_id,
-                response_queue=response_queue,
-                data_output_queue=data_output_queue,
-                save_output_queue=save_output_queue,
-                group_config=device_cfg.to_dict(),
-            )
-
-        case _:
-            handler = None
-
-    return handler
+    queues = {
+        "response_queue": response_queue,
+        "data_output_queue": data_output_queue,
+        "save_output_queue": save_output_queue,
+    }
+    return build(backend, device_id, device_cfg, queues, discovered_devices)
 
 
 __all__ = [
@@ -181,4 +171,5 @@ __all__ = [
     "UNAVAILABLE_BACKENDS",
     "backend_report",
     "get_device_handler",
+    "HANDLER_FACTORIES",
 ]

@@ -78,11 +78,11 @@ def test_display_ds_of_one_is_a_passthrough():
     assert worker._decimate_display(payload) is payload
 
 
-def test_dummy_rf_backend_advertises_the_post_decimation_rate():
+def test_fake_rf_backend_advertises_the_post_decimation_rate():
     """Every source a backend advertises carries the rate it really emits."""
     import multiprocessing as mp
 
-    from bioview_server.device.dummy.backend import DummyBackend
+    from fakes.backend import FakeBackend
 
     group_config = {
         "samp_rate": 1e6,
@@ -98,7 +98,7 @@ def test_dummy_rf_backend_advertises_the_post_decimation_rate():
         "channel_map": {"layout": "full_nxn", "dpic": []},
         "calibration": {"enabled": False, "record_reference": True},
     }
-    backend = DummyBackend(
+    backend = FakeBackend(
         group_id="Sim",
         group_config=group_config,
         response_queue=mp.Queue(),
@@ -114,13 +114,13 @@ def test_dummy_rf_backend_advertises_the_post_decimation_rate():
         assert DataSource.from_dict(source.to_dict()).get_disp_freq() == expected
 
 
-def test_dummy_non_rf_backend_advertises_the_sample_rate():
+def test_fake_non_rf_backend_advertises_the_sample_rate():
     """The sine path forwards every sample, so disp_freq is the sample rate."""
     import multiprocessing as mp
 
-    from bioview_server.device.dummy.backend import DummyBackend
+    from fakes.backend import FakeBackend
 
-    backend = DummyBackend(
+    backend = FakeBackend(
         group_id="Sim",
         group_config={"samp_rate": 500, "num_channels": 2},
         response_queue=mp.Queue(),

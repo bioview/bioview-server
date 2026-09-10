@@ -2,8 +2,9 @@
 
 The case that matters is two devices at *different* save rates in one session:
 each emits its own chunks of its own width, and the file has to keep them
-separable. Uses the always-available dummy backend, so no hardware is needed.
+separable. Uses the fake backend, so no hardware is needed.
 """
+
 import json
 import struct
 import time
@@ -15,17 +16,17 @@ from bioview_common import (
     BVR_TRAILER_MAGIC,
     RECORD_HEADER_SIZE,
     Command,
-    DummyConfiguration,
     Response,
     unpack_record,
 )
+from fakes import FakeConfiguration
 
 
-def _dummy_group(name, samp_rate, num_channels, save_ds, signal_freq=1.0):
+def _fake_group(name, samp_rate, num_channels, save_ds, signal_freq=1.0):
     return {
-        name: DummyConfiguration.from_dict(
+        name: FakeConfiguration.from_dict(
             {
-                "type": "DUMMY",
+                "type": "FAKE",
                 "samp_rate": samp_rate,
                 "num_channels": num_channels,
                 "signal_freq": signal_freq,
@@ -108,18 +109,18 @@ def _record(client, tmp_path, groups, seconds=1.5, label=None):
 
 
 def test_records_a_single_device(client, tmp_path):
-    groups = _dummy_group("DummyA", samp_rate=500, num_channels=4, save_ds=1)
+    groups = _fake_group("FakeA", samp_rate=500, num_channels=4, save_ds=1)
     path = _record(client, tmp_path, groups)
 
     header, records, trailer = read_bvr(path)
     assert header["format"] == "bioview-raw-v3"
     assert header["t0_unix"] > 0
     assert len(header["devices"]) == 1
-    assert header["devices"][0]["device_id"] == "DummyA"
+    assert header["devices"][0]["device_id"] == "FakeA"
     assert header["devices"][0]["n_rows"] == 4
     assert header["devices"][0]["fs"] == pytest.approx(500.0)
 
-    blocks = records["DummyA"]
+    blocks = records["FakeA"]
     assert blocks, "no records written"
     assert all(b.shape[0] == 4 for _idx, _t, b in blocks)
     assert trailer is not None and trailer["devices"][0]["samples"] > 0
@@ -128,8 +129,8 @@ def test_records_a_single_device(client, tmp_path):
 def test_two_devices_at_different_rates_stay_separable(client, tmp_path):
     """The case the old single-matrix format could not represent."""
     groups = {
-        **_dummy_group("FastDev", samp_rate=1000, num_channels=2, save_ds=1),
-        **_dummy_group("SlowDev", samp_rate=1000, num_channels=3, save_ds=10),
+        **_fake_group("FastDev", samp_rate=1000, num_channels=2, save_ds=1),
+        **_fake_group("SlowDev", samp_rate=1000, num_channels=3, save_ds=10),
     }
     path = _record(client, tmp_path, groups, seconds=2.0)
 
@@ -169,14 +170,14 @@ def test_two_devices_at_different_rates_stay_separable(client, tmp_path):
 
 def test_saved_rate_follows_save_ds_not_disp_ds(client, tmp_path):
     """The recording keeps the save stream; disp_ds must not decimate it."""
-    groups = _dummy_group("DummyA", samp_rate=1000, num_channels=2, save_ds=4)
-    groups["DummyA"]["disp_ds"] = 10
+    groups = _fake_group("FakeA", samp_rate=1000, num_channels=2, save_ds=4)
+    groups["FakeA"]["disp_ds"] = 10
 
     path = _record(client, tmp_path, groups, seconds=2.0)
     header, records, trailer = read_bvr(path)
 
     assert header["devices"][0]["fs"] == pytest.approx(250.0)
-    samples = sum(b.shape[1] for _i, _t, b in records["DummyA"])
+    samples = sum(b.shape[1] for _i, _t, b in records["FakeA"])
     elapsed_s = trailer["t_end_offset_us"] / 1e6
     achieved = samples / elapsed_s
     # Must land near samp_rate/save_ds (250 Hz), nowhere near
@@ -186,13 +187,13 @@ def test_saved_rate_follows_save_ds_not_disp_ds(client, tmp_path):
 
 def test_signal_content_is_intact(client, tmp_path):
     """A known sine must survive the round trip undistorted."""
-    groups = _dummy_group(
-        "DummyA", samp_rate=500, num_channels=2, save_ds=1, signal_freq=5.0
+    groups = _fake_group(
+        "FakeA", samp_rate=500, num_channels=2, save_ds=1, signal_freq=5.0
     )
     path = _record(client, tmp_path, groups, seconds=2.0)
 
     _header, records, _trailer = read_bvr(path)
-    joined = np.hstack([b for _i, _t, b in records["DummyA"]])
+    joined = np.hstack([b for _i, _t, b in records["FakeA"]])
     assert joined.shape[0] == 2
 
     row = joined[0].astype(np.float64)
@@ -203,7 +204,7 @@ def test_signal_content_is_intact(client, tmp_path):
 
 
 def test_annotations_and_offsets_are_relative(client, tmp_path):
-    groups = _dummy_group("DummyA", samp_rate=500, num_channels=2, save_ds=1)
+    groups = _fake_group("FakeA", samp_rate=500, num_channels=2, save_ds=1)
     path = _record(client, tmp_path, groups, label="RunA")
 
     header, _records, trailer = read_bvr(path)
@@ -216,7 +217,7 @@ def test_annotations_and_offsets_are_relative(client, tmp_path):
 
 
 def test_no_recording_without_a_file_name(client, tmp_path):
-    groups = _dummy_group("DummyA", samp_rate=500, num_channels=2, save_ds=1)
+    groups = _fake_group("FakeA", samp_rate=500, num_channels=2, save_ds=1)
     resp_type, _ = client.device_command(
         Command.INITIALIZE_DEVICES, {"device_groups": groups}
     )

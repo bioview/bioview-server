@@ -1,22 +1,25 @@
-"""End-to-end server tests using the always-available dummy device backend.
+"""End-to-end server tests driven by the fake backend in tests/fakes.
 
 Covered core functionality:
   * server-client connection + authentication handshake (via the `client` fixture)
   * device discovery and initialization
-  * streaming a dummy device end-to-end (exercises the full multiprocessing-queue
+  * streaming a fake device end-to-end (exercises the full multiprocessing-queue
     chain: generator -> display_queue -> DisplayWorker -> data_queue -> TCP)
 """
-from bioview_common import Command, DummyConfiguration, Response
+
+from bioview_common import Command, Response
+from fakes import FakeConfiguration
+
 
 NUM_CHANNELS = 4
 
 # Mirror exactly what the client sends: device configs are serialized config
 # objects (which include the internal ``device_type`` the server routes on), not
 # just the raw JSON the user authors.
-DUMMY_DEVICE_GROUPS = {
-    "DummyDevice": DummyConfiguration.from_dict(
+FAKE_DEVICE_GROUPS = {
+    "FakeDevice": FakeConfiguration.from_dict(
         {
-            "type": "DUMMY",
+            "type": "FAKE",
             "samp_rate": 500,
             "num_channels": NUM_CHANNELS,
             "signal_freq": 1.0,
@@ -35,41 +38,42 @@ def test_connection_and_auth(client):
     assert client.data_sock is not None
 
 
-def test_discover_dummy_device(client):
+def test_discover_fake_device(client):
     resp_type, payload = client.device_command(
-        Command.DISCOVER_DEVICES, {"device_groups": DUMMY_DEVICE_GROUPS}
+        Command.DISCOVER_DEVICES, {"device_groups": FAKE_DEVICE_GROUPS}
     )
     assert resp_type == Response.SUCCESS.name, payload
     assert "device_status" in payload
-    assert "DummyDevice" in payload["device_status"]
-    assert payload["device_status"]["DummyDevice"] == "Available"
+    assert "FakeDevice" in payload["device_status"]
+    assert payload["device_status"]["FakeDevice"] == "Available"
 
 
-def test_initialize_dummy_device(client):
+def test_initialize_fake_device(client):
     resp_type, payload = client.device_command(
-        Command.INITIALIZE_DEVICES, {"device_groups": DUMMY_DEVICE_GROUPS}
+        Command.INITIALIZE_DEVICES, {"device_groups": FAKE_DEVICE_GROUPS}
     )
-    # Dummy initialization always succeeds.
+    # Fake initialization always succeeds.
     assert resp_type == Response.SUCCESS.name, payload
-    assert payload["device_status"]["DummyDevice"]
-    # The server advertises one data source per dummy channel.
+    assert payload["device_status"]["FakeDevice"]
+    # The server advertises one data source per fake channel.
     sources = payload.get("data_sources", [])
     assert len(sources) == NUM_CHANNELS
 
 
-def test_stream_dummy_device_end_to_end(client):
+def test_stream_fake_device_end_to_end(client):
     resp_type, _ = client.device_command(
-        Command.INITIALIZE_DEVICES, {"device_groups": DUMMY_DEVICE_GROUPS}
+        Command.INITIALIZE_DEVICES, {"device_groups": FAKE_DEVICE_GROUPS}
     )
     assert resp_type == Response.SUCCESS.name
 
     resp_type, payload = client.command(
-        Command.START_STREAMING, {"Experiment": {"type": "EXPERIMENT"}, **DUMMY_DEVICE_GROUPS}
+        Command.START_STREAMING,
+        {"Experiment": {"type": "EXPERIMENT"}, **FAKE_DEVICE_GROUPS},
     )
     assert resp_type == Response.SUCCESS.name, payload
 
     # Read a couple of chunks off the data socket; each is a (num_channels, N)
-    # float array produced by the dummy generator and forwarded through the
+    # float array produced by the fake generator and forwarded through the
     # server's multiprocessing data queue.
     data, sources = client.recv_data_chunk(timeout=5.0)
     assert data.shape[0] == NUM_CHANNELS

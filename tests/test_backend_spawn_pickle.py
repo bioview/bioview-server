@@ -14,8 +14,8 @@ import copy
 import multiprocessing as mp
 
 import pytest
+from fakes.backend import FakeBackend
 
-from bioview_server.device.dummy.backend import DummyBackend
 from bioview_server.device.usrp.backend import USRPBackend
 
 
@@ -32,8 +32,8 @@ USRP_CONFIG = {
 }
 
 
-def _dummy():
-    return DummyBackend(
+def _fake():
+    return FakeBackend(
         group_id="grp",
         response_queue=mp.Queue(),
         data_output_queue=mp.Queue(),
@@ -52,8 +52,8 @@ def _usrp():
     )
 
 
-MAKERS = [_dummy, _usrp]
-IDS = ["dummy", "usrp"]
+MAKERS = [_fake, _usrp]
+IDS = ["fake", "usrp"]
 
 
 @pytest.mark.parametrize("make_backend", MAKERS, ids=IDS)

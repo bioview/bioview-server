@@ -71,9 +71,7 @@ def _handler_init_succeeded(resp: dict) -> bool:
         return False
     if resp_type not in (Response.SUCCESS, Response.SUCCESS.name):
         return False
-    if resp.get("result") is False:
-        return False
-    return True
+    return resp.get("result") is not False
 
 
 class ClientSession:
@@ -243,7 +241,7 @@ class Server:
                     log_print(
                         self.logger, "debug", f"Control connection initiated from {addr}"
                     )
-                except socket.timeout:
+                except TimeoutError:
                     # No one connected yet; loop back and re-check self.running.
                     continue
                 except OSError:
@@ -337,7 +335,7 @@ class Server:
                 try:
                     data_conn, _ = self.data_socket.accept()
                     log_print(self.logger, "debug", "Data connection accepted.")
-                except socket.timeout:
+                except TimeoutError:
                     log_print(
                         self.logger,
                         "error",
@@ -597,7 +595,7 @@ class Server:
                 self.client_control_conn.settimeout(1.0)
                 try:
                     data = recv_message(self.client_control_conn, self.logger)
-                except socket.timeout:
+                except TimeoutError:
                     continue  # ensure timeouts do not kill this thread
                 except (OSError, ConnectionResetError) as e:
                     log_print(self.logger, "error", f"Connection reset by host: {e}")
@@ -694,11 +692,11 @@ class Server:
 
     # Configurator support
 
-    def _enumerate_devices(self, include_virtual=False):
+    def _enumerate_devices(self):
         """Every attached device across all loaded backends, config-free.
 
         A backend that raises is reported as unavailable rather than failing the
-        whole listing. Virtual devices are excluded unless explicitly asked for.
+        whole listing.
         """
         devices = []
         backends = {
@@ -708,12 +706,9 @@ class Server:
                 "error": reason,
             }
             for backend_type, reason in UNAVAILABLE_BACKENDS.items()
-            if include_virtual or backend_type != DeviceType.DUMMY.value
         }
 
         for backend_type, backend in AVAILABLE_BACKENDS.items():
-            if backend_type == DeviceType.DUMMY.value and not include_virtual:
-                continue
             schema = getattr(backend, "EDITABLE_PROPERTIES", {}) or {}
             entry = {"editable_properties": schema, "available": True}
             try:
@@ -745,9 +740,8 @@ class Server:
         return devices, backends
 
     def _handle_list_devices(self, payload=None):
-        include_virtual = bool((payload or {}).get("include_virtual", False))
         try:
-            devices, backends = self._enumerate_devices(include_virtual)
+            devices, backends = self._enumerate_devices()
         except Exception as e:
             log_print(self.logger, "error", f"Device listing failed: {e}")
             send_response(
@@ -953,9 +947,6 @@ class Server:
 
         for device_id, device_cfg in self.config.devices.items():
             device_type = device_cfg.get_param("device_type")
-            if device_type == DeviceType.DUMMY.value:
-                self.device_group_states[device_id] = DeviceStatus.AVAILABLE.value
-                continue
 
             if device_type == DeviceType.BIOPAC.value:
                 # Hardware keys are user-chosen labels, not the device names

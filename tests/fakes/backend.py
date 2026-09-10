@@ -1,10 +1,13 @@
-"""
-Virtual "dummy" device backend.
+"""A fake device backend, for tests only.
 
-Legacy mode synthesizes phase-shifted sine waves for pipeline testing.
-RF simulation mode reuses the USRP signal-scheme / ProcessWorker path with a
-virtual MIMO channel model so calibration and DPIC balance can be exercised
-without hardware.
+This is a test double, not a shipped device: nothing under ``bioview_server``
+imports it, and it reaches the server only through the registration in this
+package's ``__init__``. It exists so the connect -> stream -> display -> save
+path can be exercised on a machine with no hardware attached.
+
+Sine mode synthesizes phase-shifted sine waves. RF mode reuses the USRP
+signal-scheme / ProcessWorker path against a virtual MIMO channel model, so
+calibration and DPIC balance are covered too.
 """
 
 from __future__ import annotations
@@ -40,7 +43,7 @@ from bioview_server.common import balance_outcome, build_balancer
 from bioview_server.datatypes import Backend
 
 from .rf_simulation import MimoChannelModel
-from .rf_worker import DummyRfWorker
+from .rf_worker import FakeRfWorker
 
 
 class SineWaveWorker(PausableWorker):
@@ -121,14 +124,14 @@ class SineWaveWorker(PausableWorker):
                 self._save_samples_emitted += save_chunk.shape[1]
                 if not put_or_drop(self.save_queue, item, timeout=0.5):
                     log_print(
-                        self.logger, "error", "[DUMMY] Save queue full; dropping chunk"
+                        self.logger, "error", "[FAKE] Save queue full; dropping chunk"
                     )
 
         if not put_drop_oldest(
             self.display_queue, np.ascontiguousarray(chunk, dtype=np.float32)
         ):
             log_print(
-                self.logger, "warning", "[DUMMY] Display queue full; dropping chunk"
+                self.logger, "warning", "[FAKE] Display queue full; dropping chunk"
             )
 
         self._next_emit += self.chunk_duration
@@ -139,7 +142,7 @@ class SineWaveWorker(PausableWorker):
             self._next_emit = time.monotonic()
 
 
-class DummyBackend(Backend):
+class FakeBackend(Backend):
     def __init__(
         self,
         group_id: str,
@@ -333,7 +336,7 @@ class DummyBackend(Backend):
         log_print(
             self.logger,
             "debug",
-            f"[DUMMY] Initialized {self.group_id} "
+            f"[FAKE] Initialized {self.group_id} "
             f"({'RF MIMO' if self.rf_mode else f'{self.num_channels} ch sine'})",
         )
         self.status = DeviceStatus.CONNECTED
@@ -392,7 +395,7 @@ class DummyBackend(Backend):
 
     def _start_rf_streaming(self):
         if self.rf_worker is None:
-            self.rf_worker = DummyRfWorker(
+            self.rf_worker = FakeRfWorker(
                 samp_rate=self.samp_rate,
                 hardware=self.hardware,
                 rx_device_order=self.rx_device_order,
@@ -613,7 +616,7 @@ class DummyBackend(Backend):
             log_print(
                 self.logger,
                 "error",
-                "[DUMMY] Channel map changed while streaming; it takes "
+                "[FAKE] Channel map changed while streaming; it takes "
                 "effect on the next Start.",
             )
             return False
@@ -647,7 +650,7 @@ class DummyBackend(Backend):
         log_print(
             self.logger,
             "info",
-            f"[DUMMY] Channel map reloaded: {len(self.mimo_sources)} "
+            f"[FAKE] Channel map reloaded: {len(self.mimo_sources)} "
             f"measurement source(s), {len(self.dpic_pairs)} DPIC pair(s)",
         )
         return True

@@ -2,7 +2,7 @@
 
 For every backend that reports devices: discover, initialize, stream briefly,
 stop, disconnect -- asserting the process survives each step and leaves nothing
-behind. The point is not signal quality (that is the dummy-backend suite's job)
+behind. The point is not signal quality (that is the fake-backend suite's job)
 but that the lifecycle is crash-free and terminates cleanly on real hardware.
 
 Run with:  pytest tests/hardware --hardware
@@ -135,11 +135,11 @@ def test_full_lifecycle_on_attached_devices(backend_type):
 
 
 def test_server_lists_attached_hardware(client):
-    """The Configurator's listing must show real devices, not just the dummy."""
+    """The Configurator's listing must show real devices, not just the fake."""
     resp_type, payload = client.command(Command.LIST_DEVICES)
     assert resp_type == Response.DEVICE_LIST.name, payload
 
-    real = [d for d in payload["devices"] if d.get("device_type") != "dummy"]
+    real = [d for d in payload["devices"] if d.get("device_type") != "fake"]
     if not real:
         pytest.skip("no non-virtual devices attached")
 
