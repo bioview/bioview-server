@@ -3,10 +3,6 @@ import types
 import pytest
 
 
-# The BIOPAC backend is Windows-only, but the module imports everywhere now
-# (`wmi` is guarded), so these tests -- which stub WMI out entirely -- run on
-# every platform. importorskip stays as the backstop for a genuinely broken
-# import rather than as an expected skip.
 utils = pytest.importorskip(
     "bioview_server.device.biopac.utils",
     reason="BIOPAC backend module failed to import",
@@ -25,7 +21,6 @@ class DummyDevice:
 
 
 def test_discover_devices_filters_by_vid_and_name(monkeypatch):
-    # Create dummy devices with different VID/Manufacturer
     d1 = DummyDevice("USB\\VID_097E&PID_0001", "BIOPAC Device", "BIOPAC Corp")
     d2 = DummyDevice("USB\\VID_1234&PID_5678", "Other Device", "Other Co")
     d3 = DummyDevice("USB\\VID_097E&PID_ABCD", "Unknown", "SomeVendor")
@@ -81,7 +76,6 @@ def test_discover_devices_handles_missing_pythoncom(monkeypatch):
             return [d1]
 
     monkeypatch.setattr(utils, "wmi", types.SimpleNamespace(WMI=lambda: DummyWMI()))
-    # pywin32 absent: discovery must still run rather than fail outright
     monkeypatch.setattr(utils, "_com_module", lambda: None)
 
     found = utils.discover_devices()

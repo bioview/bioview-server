@@ -1,10 +1,4 @@
-"""Backend contract, and graceful behaviour when hardware is absent.
-
-This is the half of the hardware story that runs everywhere, including CI with
-no radios plugged in. It asserts that a missing driver or a missing device is
-reported, not crashed on: every backend module answers the same questions, and
-the server can enumerate and stream with whatever happens to be present.
-"""
+"""Backend contract, and graceful behaviour when hardware is absent."""
 
 import types
 
@@ -14,7 +8,6 @@ from bioview_common import DEVICE_OP_COMMAND_TIMEOUT, Command, Response
 from bioview_server.device import AVAILABLE_BACKENDS
 
 
-#: Every entry in AVAILABLE_BACKENDS must provide these.
 REQUIRED_BACKEND_ATTRS = (
     "discover_devices",
     "set_device_config",
@@ -49,14 +42,8 @@ def test_discovery_returns_a_sane_shape_with_or_without_hardware(backend_type):
 
 
 def test_registered_backends_have_their_driver_present():
-    """A backend is only listed if it can actually be used.
-
-    ``usrp/__init__`` resolves its heavy attributes lazily, so importing it
-    succeeds with no UHD installed. Registration must therefore prove the driver
-    is really there, or the server advertises a backend that fails on first use.
-    """
+    """A backend is only listed if it can actually be used."""
     for backend_type, backend in AVAILABLE_BACKENDS.items():
-        # Touching the lazy attribute is what would raise on a missing driver.
         assert callable(backend.discover_devices), backend_type
 
 
@@ -73,8 +60,6 @@ def test_server_lists_devices_without_a_loaded_configuration(client):
     assert isinstance(devices, list)
     assert isinstance(backends, dict)
 
-    # The fake backend is registered for this suite, so the listing is never
-    # empty even on a machine with nothing attached.
     assert any(d.get("device_type") == "fake" for d in devices), devices
 
     for backend_type, info in backends.items():
@@ -135,8 +120,6 @@ def test_one_failing_backend_does_not_hide_the_others(client, monkeypatch):
     )
     assert resp_type == Response.DEVICE_LIST.name, payload
 
-    # The fake backend still reports its device...
     assert any(d.get("device_type") == "fake" for d in payload["devices"])
-    # ...and the broken one is flagged rather than swallowed.
     assert payload["backends"]["exploding"]["available"] is False
     assert "driver on fire" in payload["backends"]["exploding"]["error"]

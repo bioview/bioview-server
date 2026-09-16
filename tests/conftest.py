@@ -1,11 +1,4 @@
-"""Shared fixtures for the BioView server end-to-end tests.
-
-These boot a real :class:`~bioview_server.server.Server` in a background thread on
-ephemeral ports and provide a thin, headless test client (raw sockets speaking
-the BioView protocol via bioview-common) so the full connect / authenticate /
-discover / initialize / stream path can be exercised against the fake backend in
-``tests/fakes`` -- no PyQt and no hardware required.
-"""
+"""Shared fixtures for the BioView server end-to-end tests."""
 
 import contextlib
 import socket
@@ -31,13 +24,7 @@ from bioview_server.server import Server
 
 @pytest.fixture(autouse=True)
 def _fake_device():
-    """Register the fake backend for every test in this suite.
-
-    The server ships no hardware-free device, so without this there is nothing
-    an end-to-end test could stream from. Registration is process-global and
-    idempotent; a spawned backend subprocess inherits sys.path and imports the
-    package by name, the same way it imports a real backend.
-    """
+    """Register the fake backend for every test in this suite."""
     install_fake_device()
 
 
@@ -50,8 +37,7 @@ def _free_port() -> int:
 
 
 class RawTestClient:
-    """Minimal headless client: opens the control + data sockets, authenticates,
-    and exposes command / data-chunk helpers used by the tests."""
+    """Minimal headless client: opens the control + data sockets, authenticates,"""
 
     def __init__(self, control_port: int, data_port: int):
         self.control_port = control_port
@@ -78,19 +64,13 @@ class RawTestClient:
         resp_type, _ = parse_and_validate_response(raw)
         assert resp_type == Response.AUTHENTICATION_SUCCESS.name, resp_type
 
-        # The server accepts the data connection immediately after auth succeeds.
         self.data_sock = socket.create_connection(
             ("127.0.0.1", self.data_port), timeout=timeout
         )
         self.data_sock.settimeout(timeout)
 
     def command(self, command: Command, params=None, timeout=None):
-        """Send one command and read its reply.
-
-        ``timeout`` widens the socket timeout for this exchange, the way the
-        real client does for commands whose work happens on the server: a
-        device enumeration walks every backend and easily outlasts the default.
-        """
+        """Send one command and read its reply."""
         previous = None
         if timeout is not None:
             previous = self.control_sock.gettimeout()
@@ -129,8 +109,7 @@ class RawTestClient:
         return self.wait_for_device_op(resp_type, payload, timeout=timeout)
 
     def recv_data_chunk(self, timeout: float = 5.0):
-        """Receive one streamed numpy chunk from the data socket and return
-        (data, sources)."""
+        """Receive one streamed numpy chunk from the data socket and return"""
         self.data_sock.settimeout(timeout)
         length_bytes = self._recv_exactly(self.data_sock, 4)
         (frame_len,) = struct.unpack("!I", length_bytes)
@@ -173,7 +152,6 @@ def server():
     thread = threading.Thread(target=srv.start, daemon=True)
     thread.start()
 
-    # Wait until the control port is accepting connections.
     deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline:
         try:
@@ -188,9 +166,6 @@ def server():
     srv._test_ports = (control_port, data_port)
     yield srv
 
-    # Tear down any device backend subprocesses spawned during the test. These
-    # are non-daemon mp.Process workers whose run loop only exits on SHUTDOWN, so
-    # they must be stopped explicitly or the interpreter hangs joining them.
     for handler in list(getattr(srv, "device_group_handlers", {}).values()):
         if handler is None:
             continue
@@ -206,11 +181,7 @@ def server():
 
 @pytest.fixture
 def idle_server():
-    """Factory for a server that retires itself after N idle seconds.
-
-    Returns (server, client, thread) so a test can connect, disconnect and then
-    watch the server shut itself down.
-    """
+    """Factory for a server that retires itself after N idle seconds."""
     started = []
 
     def _make(exit_when_idle):
@@ -247,11 +218,7 @@ def idle_server():
 
 @pytest.fixture
 def clients(server):
-    """Two authenticated clients connected to the same server at once.
-
-    The Monitor and the Configurator share one server, so serving several
-    clients concurrently is ordinary operation rather than an edge case.
-    """
+    """Two authenticated clients connected to the same server at once."""
     control_port, data_port = server._test_ports
     connected = []
     for _ in range(2):
@@ -274,20 +241,6 @@ def client(server):
     yield c
     c.close()
 
-
-# --------------------------------------------------------------------------
-# Opt-in hardware tests
-#
-# Anything under tests/hardware/ talks to physically attached devices and is
-# skipped unless --hardware is passed:
-#
-#     pytest tests/hardware --hardware
-#
-# The option and the skip live here rather than in tests/hardware/conftest.py:
-# pytest_addoption is only honoured in the rootdir conftest, and
-# pytest_collection_modifyitems is handed *every* collected item regardless of
-# which conftest defines it, so the hook has to filter by path itself.
-# --------------------------------------------------------------------------
 
 HARDWARE_DIR = "hardware"
 

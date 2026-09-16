@@ -2,8 +2,6 @@ from .backend import BIOPACBackend
 from .utils import discover_devices, load_mpdev_dll
 
 
-#: No Configurator-editable properties on this backend yet. The Configurator
-#: reads this to decide whether the Edit button is available for a device.
 EDITABLE_PROPERTIES = {}
 
 

@@ -1,13 +1,4 @@
-"""Streaming with more than one device group in the session.
-
-Backends used to share a single response queue. A reply carries no sender, so
-with two devices in one session each could consume the other's answer: the
-parent then waited out its timeout on a reply that had already been taken, and
-the bare ``queue.Empty`` surfaced to the user as "Failed to start streaming: "
-with nothing after the colon.
-
-Each backend now has its own queue and every reply is matched by request id.
-"""
+"""Streaming with more than one device group in the session."""
 
 import multiprocessing as mp
 
@@ -38,11 +29,6 @@ def _fake(samp_rate: int) -> dict:
 TWO_GROUPS = {"DeviceA": _fake(500), "DeviceB": _fake(1000)}
 
 
-# --------------------------------------------------------------------------
-# The IPC contract
-# --------------------------------------------------------------------------
-
-
 class _Backend(Backend):
     """A backend object driven from the parent side only (never started)."""
 
@@ -59,7 +45,6 @@ def test_a_reply_meant_for_another_request_is_not_consumed():
     """A late answer to a timed-out request must not be handed to the next one."""
     backend = _Backend("A")
 
-    # Stand-in for a reply to request 1 that arrived after request 1 gave up.
     backend.response_queue.put(
         {"type": Response.SUCCESS, "result": True, "request_id": 1}
     )
@@ -118,11 +103,6 @@ def test_the_child_echoes_the_request_id_back():
     assert backend.response_queue.get(timeout=5)["request_id"] == 77
 
 
-# --------------------------------------------------------------------------
-# End to end, through the real server
-# --------------------------------------------------------------------------
-
-
 def test_two_device_groups_stream_together(client):
     resp_type, payload = client.device_command(
         Command.INITIALIZE_DEVICES, {"device_groups": TWO_GROUPS}
@@ -136,7 +116,6 @@ def test_two_device_groups_stream_together(client):
     )
     assert resp_type == Response.SUCCESS.name, payload
 
-    # Both devices must actually reach the wire, not just one of them.
     seen = set()
     for _ in range(40):
         _, sources = client.recv_data_chunk(timeout=5.0)
@@ -167,19 +146,13 @@ def test_sources_from_two_devices_stay_distinguishable(client):
 
 
 def test_a_dead_child_is_reported_as_a_crash_not_a_timeout():
-    """A native crash inside a driver leaves no traceback and no reply.
-
-    Waiting out the full timeout and then blaming the device for being slow
-    ("did not answer START_STREAMING within 90s") sends the reader looking at
-    the wrong thing entirely.
-    """
+    """A native crash inside a driver leaves no traceback and no reply."""
 
     class _DeadChild(_Backend):
-        """A started process that has since exited. ``pid``, ``is_alive`` and
-        ``exitcode`` are read-only on ``mp.Process``, so they are overridden."""
+        """A started process that has since exited. ``pid``, ``is_alive`` and"""
 
         pid = 4242
-        exitcode = -1073741819  # 0xC0000005, a Windows access violation
+        exitcode = -1073741819
 
         def is_alive(self):
             return False

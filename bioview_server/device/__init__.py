@@ -1,4 +1,3 @@
-# Try to load all backends and provide
 import multiprocessing as mp
 import sys
 
@@ -10,8 +9,6 @@ __all__ = []
 
 AVAILABLE_BACKENDS = {}
 
-# Backends that failed to load, mapped to why. Reported to the Configurator
-# alongside the device list, since a GUI-spawned server has no visible stdout.
 UNAVAILABLE_BACKENDS = {}
 
 
@@ -23,11 +20,6 @@ def _backend_unavailable(device_type, error):
 
 try:
     from . import usrp
-
-    # usrp/__init__ resolves its heavy attributes lazily, so importing the
-    # package alone touches no UHD. Import through to utils, which is what
-    # actually loads the bindings: a broken or absent UHD then fails here, with
-    # a reason, instead of at first use inside a device subprocess.
     from .usrp.utils import discover_devices  # noqa: F401
 
     __all__.append("usrp")
@@ -36,13 +28,11 @@ except Exception as e:
     _backend_unavailable(DeviceType.USRP.value, e)
 
 try:
-    # Ensure platform is windows
     if sys.platform != "win32":
         raise OSError(f"Invalid platfrom {sys.platform}. Ensure you are using Windows")
 
     from . import biopac
 
-    # Ensure mpdev.dll exists
     with suppress_stdout():
         if biopac.load_mpdev_dll() is None:
             raise ValueError("mpdev.dll not found")
@@ -55,10 +45,6 @@ except Exception as e:
 try:
     from . import microphone
 
-    # Importing the package alone touches no PortAudio: utils resolves
-    # sounddevice lazily. Probe through to it so a missing sounddevice or an
-    # unloadable PortAudio fails here, with a reason, rather than inside a
-    # device subprocess at Connect.
     microphone.check_available()
 
     __all__.append("microphone")
@@ -68,13 +54,7 @@ except Exception as e:
 
 
 def backend_report() -> dict:
-    """Every backend and whether it loaded, as ``{type: {available, error}}``.
-
-    The server hands this to a client the moment it authenticates, so a UHD
-    that does not match its bindings or a backend whose driver is missing
-    reaches the operator as one explained failure -- in the Monitor as much as
-    in the Configurator -- instead of a line on a stdout nobody is reading.
-    """
+    """Every backend and whether it loaded, as ``{type: {available, error}}``."""
     report = {
         device_type: {"available": True, "error": ""}
         for device_type in AVAILABLE_BACKENDS
@@ -85,8 +65,7 @@ def backend_report() -> dict:
 
 
 def _usrp_handler(backend, device_id, device_cfg, queues, discovered_devices):
-    """The USRP group is the one backend whose constructor takes more than the
-    group config: it is built per radio, so the hardware block is split out."""
+    """The USRP group is the one backend whose constructor takes more than the"""
     group_cfg = device_cfg.to_dict()
     hardware = group_cfg.get("hardware")
     devices = (
@@ -111,11 +90,7 @@ def _usrp_handler(backend, device_id, device_cfg, queues, discovered_devices):
 
 
 def _group_config_handler(attribute):
-    """Factory for a backend built from nothing but its group config.
-
-    BIOPAC and the microphone are constructed identically; naming the class
-    keeps that one shape rather than repeating the call per device type.
-    """
+    """Factory for a backend built from nothing but its group config."""
 
     def build(backend, device_id, device_cfg, queues, discovered_devices):
         return getattr(backend, attribute)(
@@ -128,8 +103,6 @@ def _group_config_handler(attribute):
     return build
 
 
-#: device_type -> callable building that backend's handler. Registering here is
-#: what makes a loaded backend usable; the test suite adds its own the same way.
 HANDLER_FACTORIES = {
     DeviceType.USRP.value: _usrp_handler,
     DeviceType.BIOPAC.value: _group_config_handler("BIOPACBackend"),

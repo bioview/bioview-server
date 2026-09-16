@@ -13,8 +13,6 @@ from bioview_common.signal_schemes.dpic import DpicBalancer, DpicChannel
 from fakes.rf_simulation import MimoChannelModel
 
 
-# Kept beside the tests: the server is checked out on its own in CI,
-# so a path above the repo root does not exist there.
 DATA_DIR = Path(__file__).resolve().parent / "data"
 FAKE_DPIC_CFG = DATA_DIR / "fake_dpic_2x2_mimo_cfg.json"
 
@@ -26,9 +24,6 @@ def _build_rf_context():
             "rx_channels": [0, 1],
             "if_freq": [100e3, 110e3],
         },
-        # Inject Tx must share the measure Tx's IF (100 kHz) -- an injection on
-        # a different IF is removed by the receive band-pass and can never null
-        # the direct path.
         "MyB210_7": {
             "tx_channels": [0],
             "rx_channels": [0, 1],
@@ -150,11 +145,7 @@ def test_dpic_balancer_finds_minimum_on_channel_model():
 
 
 def test_dpic_balancer_restores_settings_when_metric_unavailable():
-    """A silent measurement path must not leave the injection switched off.
-
-    The original search seeded its incumbent with +inf and amplitude 0, so a
-    run where every read returned None ended with the injection amplitude at 0.
-    """
+    """A silent measurement path must not leave the injection switched off."""
     _model, schemes, _map, dpic_pairs = _build_rf_context()
     schemes["MyB210_7"].tx_phase_deg[0] = 137.0
     schemes["MyB210_7"].tx_amplitude[0] = 0.6
@@ -192,7 +183,6 @@ def test_dpic_grid_is_cheaper_than_a_flat_sweep():
 
     assert result.converged
     assert result.method == "grid"
-    # A flat 0.2 deg sweep alone would be 1800 points.
     assert len(calls) == 241
     assert abs(result.best_phase_deg - (np.rad2deg(2.1) + 180.0) % 360.0) < 0.3
 
@@ -200,7 +190,6 @@ def test_dpic_grid_is_cheaper_than_a_flat_sweep():
 def test_dpic_grid_resolves_a_minimum_off_the_coarse_lattice():
     """The fine pass must cover +/- a full coarse step, either side of the winner."""
     _model, schemes, _map, dpic_pairs = _build_rf_context()
-    # 3 deg off the 6 deg coarse lattice, so the coarse winner is on one side.
     target_phase, target_amp = 123.0, 0.427
 
     def read_metric():
@@ -224,7 +213,6 @@ def test_dpic_time_budget_keeps_the_best_point_seen():
     schemes["MyB210_7"].tx_phase_deg[0] = 137.0
     schemes["MyB210_7"].tx_amplitude[0] = 0.6
 
-    # Budget expires partway through the first coarse sweep.
     balancer = DpicBalancer(time_budget_s=0.05)
     result = balancer.balance(
         _channel(

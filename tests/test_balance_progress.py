@@ -1,10 +1,4 @@
-"""Balance progress has to cross the process boundary to reach the UI.
-
-The search runs in the device's own child process, so the values it is driving
-are invisible to the server -- and therefore to the client -- unless they are
-published back. They ride the same `GET_DEVICE_STATUS` poll the client already
-runs while a balance is in flight.
-"""
+"""Balance progress has to cross the process boundary to reach the UI."""
 
 import multiprocessing as mp
 import time
@@ -20,13 +14,7 @@ def _backend():
 
 
 def _drained(be, timeout=5.0):
-    """Drain until something arrives.
-
-    ``mp.Queue.put`` hands off to a feeder thread, so a value is not readable
-    the instant it is written. The drain itself stays non-blocking on purpose
-    -- it runs on the server's command thread -- and in a real balance there is
-    always another measurement along; only this test has to wait for the first.
-    """
+    """Drain until something arrives."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         value = be.drain_balance_progress()
@@ -116,7 +104,7 @@ def test_the_last_progress_is_repeated_when_nothing_new_arrived(monkeypatch):
     srv, sent = _server_with(_FakeHandler(progress), monkeypatch)
 
     srv._handle_get_device_status()
-    srv._handle_get_device_status()  # the handler has nothing new to give
+    srv._handle_get_device_status()
 
     assert sent["params"]["dpic_balance"]["progress"] == progress
 

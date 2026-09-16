@@ -1,12 +1,4 @@
-"""A --local server must accept a client from its own machine.
-
-The client dials the address the server advertised in its discovery info, which
-is a NIC address rather than loopback. On a network that hands out public
-addresses (many campus and corporate networks do) that address is in no private
-range, and a locality check based on private ranges alone closes the connection
-before the challenge is sent -- the client then reports "Server did not provide
-authentication token".
-"""
+"""A --local server must accept a client from its own machine."""
 import pytest
 from bioview_common import get_local_addresses
 

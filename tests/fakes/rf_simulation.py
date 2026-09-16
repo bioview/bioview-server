@@ -8,11 +8,7 @@ from bioview_common.signal_schemes.base import SignalScheme
 
 
 class MimoChannelModel:
-    """Synthesize complex RX buffers from global TX waveforms.
-
-    DPIC pairs add a controllable leakage term at the measure-Tx IF on the
-    target Rx so grid search can find a minimum.
-    """
+    """Synthesize complex RX buffers from global TX waveforms."""
 
     def __init__(
         self,
@@ -62,8 +58,6 @@ class MimoChannelModel:
             s_meas = tx_waveforms[measure_tx]
             rx[measure_rx] += self.direct_leak * s_meas
 
-            # The inject Tx's own samples: using the measure Tx's would hide
-            # that a different IF cannot cancel once band-passed.
             if inject_tx >= tx_waveforms.shape[0]:
                 continue
             rx[measure_rx] += (self.dpic_coupling * tx_waveforms[inject_tx]).astype(

@@ -1,12 +1,4 @@
-"""Signal-path check against an attached USRP.
-
-The lifecycle smoke test proves the process survives Start/Stop. This proves the
-radio is actually doing something: that the transmitted IF tone comes back on
-the receive chain, and that switching the calibration overlay on at runtime
-changes the received magnitude the way it should.
-
-Run with:  pytest tests/hardware --hardware
-"""
+"""Signal-path check against an attached USRP."""
 
 import contextlib
 import multiprocessing as mp
@@ -133,12 +125,7 @@ def _row_for(sources, label):
 
 
 def test_transmitted_tone_is_received(streaming_usrp):
-    """Tx0's IF tone must appear on Rx0 well above the noise floor.
-
-    A near-zero magnitude here means the Tx/Rx pair is not actually coupled:
-    check antennas/cabling, the Tx and Rx gains, and that both are tuned to the
-    same carrier before looking any further up the stack.
-    """
+    """Tx0's IF tone must appear on Rx0 well above the noise floor."""
     _handler, data_queue = streaming_usrp
     data, sources = _collect(data_queue, COLLECT_SECONDS)
 
@@ -159,7 +146,7 @@ def test_calibration_overlay_modulates_the_received_magnitude(streaming_usrp):
 
     handler.queue_param_update(**{"calibration.enabled": True})
     time.sleep(1.0)
-    _drained, _ = _collect(data_queue, 1.0)  # discard the transition
+    _drained, _ = _collect(data_queue, 1.0)
 
     modulated, sources = _collect(data_queue, COLLECT_SECONDS)
     assert modulated.size, "no data after enabling calibration"

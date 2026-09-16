@@ -1,13 +1,4 @@
-"""Calibration overlay: runtime enable survives Start, and reaches the display.
-
-These cover the two failures that made an enabled calibration signal invisible
-in the receive path:
-
-1. ``_start_streaming`` replayed the config's start-up ``calibration.enabled``
-   value, undoing a runtime enable on every Start.
-2. The ``CalRef_*`` source was advertised to the client but excluded from the
-   display payload, so its plot could never receive a row.
-"""
+"""Calibration overlay: runtime enable survives Start, and reaches the display."""
 
 import json
 import logging
@@ -21,8 +12,6 @@ import pytest
 from fakes.backend import FakeBackend
 
 
-# Kept beside the tests: the server is checked out on its own in CI,
-# so a path above the repo root does not exist there.
 DATA_DIR = Path(__file__).resolve().parent / "data"
 RF_CFG_PATH = DATA_DIR / "fake_dpic_2x2_mimo_cfg.json"
 
@@ -47,14 +36,10 @@ def rf_backend():
 
     backend._stop_streaming()
     backend._disconnect()
-    # Let the stopped workers fall out of their queue reads before the queues go
-    # away, or they raise on a closed handle.
     for worker in (backend.display_worker, backend.save_worker):
         if worker is not None and worker.is_alive():
             worker.join(timeout=2)
 
-    # mp.Queue feeder threads join at interpreter exit; without this the test
-    # session hangs after the last test in this module.
     for q in (response_queue, backend.data_output_queue, backend.display_queue):
         if q is None:
             continue
@@ -63,7 +48,6 @@ def rf_backend():
 
 
 def test_runtime_calibration_enable_survives_start(rf_backend):
-    # The user ticks "Calibration signal" before pressing Start.
     cal = dict(rf_backend.group_config["calibration"], enabled=True)
     rf_backend._queue_param_update({"calibration": cal})
     assert rf_backend._cal_enabled
@@ -81,11 +65,7 @@ def test_calibration_reference_is_on_the_display_path(rf_backend):
     advertised = {s.label for s in rf_backend.get_data_sources()}
 
     assert "CalRef_Tx1" in advertised
-    # Every advertised source must have a row in the emitted chunk, or its plot
-    # stays blank forever.
     assert advertised == {s.label for s in display_sources}
-    # Row i of the payload is display_sources[i], and ProcessWorker indexes its
-    # output arrays by source.channel -- so the list has to be channel-ordered.
     channels = [s.channel for s in display_sources]
     assert channels == sorted(channels)
     assert channels == list(range(len(channels)))
@@ -112,9 +92,7 @@ def test_enabled_calibration_reaches_the_receive_chunk(rf_backend):
     assert chunks, "no display chunks were produced"
     stream = np.hstack(chunks)
 
-    # The reference envelope is a real gated burst, so it must vary.
     assert np.ptp(stream[cal_row]) > 0.1
-    # And the AM overlay must be visible on the demodulated Tx1 magnitude.
     assert np.ptp(stream[tx1rx1_row]) > 0.01
 
 
@@ -128,12 +106,7 @@ def test_calibration_stays_off_when_never_enabled(rf_backend):
 
 
 def test_chunk_row_count_matches_the_advertised_source_count(rf_backend):
-    """The client reshapes .bvr samples by ``header["num_sources"]``.
-
-    That header is built from the advertised source list, so a payload with
-    fewer rows than sources does not just blank a plot -- it makes every
-    recording reshape wrong and scrambles the whole file.
-    """
+    """The client reshapes .bvr samples by ``header["num_sources"]``."""
     rf_backend._setup_display({})
     rf_backend._start_streaming()
 

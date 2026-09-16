@@ -36,12 +36,7 @@ def test_backend_without_editable_properties_refuses_edits():
 
 @pytest.fixture
 def alias_cache(tmp_path, monkeypatch):
-    """Redirect the name/serial caches into a temp dir.
-
-    Patching ``naming`` rather than ``utils`` is the point of the split: device
-    naming is filesystem work and must be usable, and testable, with no UHD
-    installed.
-    """
+    """Redirect the name/serial caches into a temp dir."""
     import bioview_server.device.usrp.naming as naming
 
     def fake_cache_file(name):
@@ -76,7 +71,6 @@ def test_usrp_rename_also_updates_the_serial_lookup(alias_cache):
         {"name": "MyB210", "serial": "31ABCDE", "device_type": "usrp"},
         {"device_name": "LeftArmRadio"},
     )
-    # resolve_device_serial consults this, so the new name must resolve.
     assert get_usrp_address("LeftArmRadio") == "31ABCDE"
 
 

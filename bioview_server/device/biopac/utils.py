@@ -8,13 +8,9 @@ from ctypes import byref, c_double, c_int
 from pathlib import Path
 
 
-# BIOPAC is a Windows-only backend and wmi is a Windows-only package, but
-# the module still has to import elsewhere so its non-WMI helpers stay
-# testable. device/__init__ refuses to load this backend off Windows, so
-# nothing reaches the WMI calls below with wmi set to None.
 try:
     import wmi
-except ImportError:  # pragma: no cover - not running on Windows
+except ImportError:  # pragma: no cover
     wmi = None
 from bioview_common import get_cache_file, log_print
 
@@ -25,14 +21,10 @@ from .constants import (
 )
 
 
-# Hypervisor-enforced code integrity, in Win32_DeviceGuard's service lists.
 _HVCI_SERVICE_ID = 2
 
-# Bounded: this WMI call has been seen to hang indefinitely, and it only
-# ever runs to explain a failure.
 _HVCI_QUERY_TIMEOUT = 3.0
 
-# Memory Integrity cannot change without a reboot, so one answer holds.
 _hvci_state = None
 
 
@@ -62,11 +54,7 @@ def _query_memory_integrity():
 
 
 def memory_integrity_state():
-    """Whether Windows Memory Integrity is running, and whether it is configured.
-
-    Returns ``(running, configured)``; they differ across a pending reboot,
-    which is exactly the case where the driver is still refused.
-    """
+    """Whether Windows Memory Integrity is running, and whether it is configured."""
     global _hvci_state
     if _hvci_state is not None:
         return _hvci_state
@@ -89,8 +77,6 @@ def memory_integrity_state():
         _hvci_state = result["state"]
         return _hvci_state
 
-    # Query hung or failed: fall back to the registry's configured value
-    # and do not claim to know the running state.
     configured = _memory_integrity_configured_in_registry()
     _hvci_state = (configured, configured)
     return _hvci_state
@@ -116,11 +102,7 @@ def _memory_integrity_configured_in_registry() -> bool:
 
 
 def driver_failure_hint() -> str:
-    """What this machine's configuration adds to a driver that would not start.
-
-    Only the observation: the remedy lives in the shared issue catalogue, which
-    matches on this text.
-    """
+    """What this machine's configuration adds to a driver that would not start."""
     running, configured = memory_integrity_state()
     if not running:
         return ""
@@ -128,7 +110,6 @@ def driver_failure_hint() -> str:
     if configured:
         return " Memory Integrity is enabled on this machine."
 
-    # Off but live until the next boot: the remedy is a restart.
     return (
         " Memory Integrity is switched off but still running until this "
         "machine is restarted."
@@ -136,14 +117,7 @@ def driver_failure_hint() -> str:
 
 
 def _usb_serial_from_device_id(device_id):
-    r"""The unit's own serial number from a Windows instance path, if it has one.
-
-    A path looks like ``USB\VID_097E&PID_0036\<instance>``. That last segment
-    is the serial the device reports -- but only when it reports one at all;
-    otherwise Windows synthesises an id from the port path, which always
-    contains '&'. An MP36 supplies no USB serial, so this is None for it rather
-    than a meaningless port path shown to the user as a serial number.
-    """
+    """The unit's own serial number from a Windows instance path, if it has one."""
     if not device_id:
         return None
     tail = str(device_id).rsplit("\\", 1)[-1].strip()
@@ -165,11 +139,7 @@ def _model_from_name(*candidates):
 
 
 def _com_module():
-    """The pythoncom module, or None when pywin32 is unavailable.
-
-    Imported plainly, not via importlib: PyInstaller cannot follow a dynamic
-    import and the frozen build would ship without it.
-    """
+    """The pythoncom module, or None when pywin32 is unavailable."""
     try:
         import pythoncom
     except Exception:
@@ -197,22 +167,19 @@ def _discovery_key(device_info: dict, index: int) -> str:
 
 
 def _discover_devices_list():
-    # Discover BIOPAC devices connected over USB.
     discovered_devices = []
     coinit = False
     pythoncom = None
     try:
-        # COM must be initialised per thread for WMI to work.
         pythoncom = _com_module()
         if pythoncom is not None:
             try:
-                pythoncom.CoInitializeEx(0x2)  # COINIT_MULTITHREADED
+                pythoncom.CoInitializeEx(0x2)
                 coinit = True
             except Exception:
                 pythoncom = None
 
         c = wmi.WMI()
-        # Query USB devices from WMI
         for device in c.Win32_PnPEntity():
             if device.DeviceID and "USB" in device.DeviceID:
                 vid = pid = None
@@ -234,12 +201,10 @@ def _discover_devices_list():
                     "present": device.Present,
                     "vid": vid,
                     "pid": pid,
-                    # Identifying details for the Configurator's device list.
                     "serial": _usb_serial_from_device_id(device.DeviceID),
                     "model": _model_from_name(name, device.Description),
                 }
 
-                # Normalise VID for numeric comparison
                 vid_int = None
                 if vid is not None:
                     try:
@@ -247,7 +212,6 @@ def _discover_devices_list():
                     except Exception:
                         vid_int = None
 
-                # Validate and add to list
                 if (
                     vid_int == BIOPAC_VENDOR_ID
                     or "biopac" in (device_info["manufacturer"] or "").lower()
@@ -258,8 +222,6 @@ def _discover_devices_list():
         logging.getLogger(__name__).error("Unable to discover BIOPAC devices: %s", e)
 
     finally:
-        # No return in this block: it would swallow an in-flight exception
-        # and turn a COM failure into "no devices attached".
         if coinit and pythoncom is not None:
             with contextlib.suppress(Exception):
                 pythoncom.CoUninitialize()
@@ -340,7 +302,6 @@ def load_mpdev_dll(custom_loc: str = None):
     return None
 
 
-# Wrappers for BIOPAC operations
 def connect_biopac_device(
     mpdev_handler,
     device_code: int = 103,
@@ -352,20 +313,16 @@ def connect_biopac_device(
         c_int(device_code), c_int(connection_code), port_bytes
     )
     if BIOPAC_CONNECTION_CODES.get(result_code, None) != "MPSUCCESS":
-        # Machine-level context is added by the server: the queries involved
-        # have been seen to hang inside a backend subprocess.
         raise Exception(f"BIOPAC connection failed: {describe_biopac_code(result_code)}")
 
 
 def configure_biopac_device(mpdev_handler, channels, sample_rate):
-    # Set channels
     result_code = mpdev_handler.setAcqChannels(byref(channels))
     if BIOPAC_CONNECTION_CODES.get(result_code, None) != "MPSUCCESS":
         raise Exception(
             f"BIOPAC channel configuration failed: {describe_biopac_code(result_code)}"
         )
 
-    # Set sample rate
     result_code = mpdev_handler.setSampleRate(c_double(1000.0 / sample_rate))
     if BIOPAC_CONNECTION_CODES.get(result_code, None) != "MPSUCCESS":
         raise Exception(
@@ -375,12 +332,7 @@ def configure_biopac_device(mpdev_handler, channels, sample_rate):
 
 
 def start_acq_daemon(mpdev_handler) -> bool:
-    """Start mpdev's acquisition daemon, which backs ``receiveMPData``.
-
-    Must be called before ``startAcquisition``. Returns True when the daemon is
-    running, False when this DLL has no ``startMPAcqDaemon``, and raises when
-    the call is made and fails. See bioview-docs/reference/biopac.md.
-    """
+    """Start mpdev's acquisition daemon, which backs ``receiveMPData``."""
     start = getattr(mpdev_handler, "startMPAcqDaemon", None)
     if start is None:
         return False
@@ -402,8 +354,6 @@ def daemon_last_error(mpdev_handler, logger=None):
     try:
         return last_error()
     except Exception as e:
-        # Called while diagnosing another failure, so this must not raise --
-        # but it must not vanish either, or the diagnosis loses its detail.
         log_print(logger, "debug", f"getMPDaemonLastError failed: {e}")
         return None
 
@@ -431,12 +381,7 @@ def disconnect_biopac_device(mpdev_handler):
 
 
 def get_mpdev_path(logger=None):
-    """Cached mpdev.dll path, or None when there is not one to use.
-
-    Absent is the normal first-run case. Present-but-unreadable is a fault and
-    is reported: it used to print to a stdout a GUI-spawned server has nobody
-    reading, so the DLL was silently re-searched for on every start.
-    """
+    """Cached mpdev.dll path, or None when there is not one to use."""
     cache_file = get_cache_file("mpdev_path")
     try:
         with open(cache_file) as fobj:

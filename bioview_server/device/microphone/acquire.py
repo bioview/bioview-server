@@ -6,39 +6,17 @@ import numpy as np
 from bioview_common import PausableWorker, log_print
 
 
-# How often an overflow burst may be reported. PortAudio raises the flag once
-# per affected callback, so an underpowered machine would otherwise fill the log.
 _OVERFLOW_WARN_INTERVAL_S = 5.0
 
-#: Chunks held between PortAudio's callback thread and this worker. Deep enough
-#: to ride out a scheduling hiccup on the consumer side, shallow enough that a
-#: consumer which has stopped draining cannot grow it without limit.
 CAPTURE_QUEUE_DEPTH = 64
 
-#: How long an input may deliver nothing but digital silence before it is
-#: reported. An input that opens and streams zeros is indistinguishable on the
-#: plot from one that is simply quiet, and it is the single most common way a
-#: session is recorded useless: a muted input, a jack in the wrong socket, or a
-#: capture device Windows has set to zero gain.
 _SILENCE_WARN_AFTER_S = 5.0
 
-#: Below this peak amplitude a chunk counts as digital silence. Real inputs
-#: carry a noise floor well above it; only a muted or disconnected one sits
-#: this close to exact zero.
 _SILENCE_FLOOR = 1e-6
 
 
 class MicrophoneAcquisitionWorker(PausableWorker):
-    """Drain PortAudio's capture callback and emit ``(channels, samples)`` chunks.
-
-    Capture is a callback rather than blocking reads: PortAudio's blocking API
-    is not implemented on every Windows host API (WDM-KS refuses it outright),
-    and the callback path is the one that works everywhere. The callback itself
-    runs on PortAudio's high-priority thread, so it does nothing but copy the
-    frames into a bounded queue -- all conversion, gain and queue work happens
-    here, where a slow consumer costs a dropped chunk rather than stalling the
-    audio device.
-    """
+    """Drain PortAudio's capture callback and emit ``(channels, samples)`` chunks."""
 
     def __init__(
         self,
@@ -61,26 +39,18 @@ class MicrophoneAcquisitionWorker(PausableWorker):
         self.dropped_captures = 0
         self._last_overflow_warning = 0.0
 
-        # Silence tracking; see _SILENCE_WARN_AFTER_S. Reset by cleanup() so a
-        # Stop/Start cycle gets a fresh verdict rather than inheriting the
-        # previous run's.
         self._silent_since = None
         self._silence_reported = False
-
-    # ------------------------------------------------- PortAudio callback
 
     def callback(self, indata, frames, time_info, status):
         """Handed to ``sd.InputStream``. Runs on PortAudio's own thread."""
         if status and status.input_overflow:
             self.overflows += 1
 
-        # PortAudio reuses the buffer behind ``indata``, so this must copy.
         try:
             self.capture_queue.put_nowait(np.array(indata, dtype=np.float32))
         except queue.Full:
             self.dropped_captures += 1
-
-    # ------------------------------------------------------------- worker
 
     def work(self):
         try:
@@ -94,8 +64,6 @@ class MicrophoneAcquisitionWorker(PausableWorker):
         if frames is None or len(frames) == 0:
             return
 
-        # PortAudio hands back (frames, channels); the pipeline wants
-        # (channels, samples), contiguous.
         data = np.ascontiguousarray(np.asarray(frames, dtype=np.float64).T)
         if data.ndim == 1:
             data = data.reshape(1, -1)
@@ -109,14 +77,7 @@ class MicrophoneAcquisitionWorker(PausableWorker):
         self._emit(data)
 
     def _check_silence(self, data: np.ndarray):
-        """Report an input that is delivering nothing but zeros.
-
-        The stream is open and chunks are arriving on time, so nothing in the
-        pipeline is wrong -- which is exactly why this is worth saying out loud.
-        A muted or unconnected input plots a flat line, and a flat line is what
-        a working-but-quiet input looks like too. Reported once per streaming
-        run, and withdrawn as soon as any signal shows up.
-        """
+        """Report an input that is delivering nothing but zeros."""
         if float(np.abs(data).max()) > _SILENCE_FLOOR:
             if self._silence_reported:
                 log_print(
@@ -147,12 +108,7 @@ class MicrophoneAcquisitionWorker(PausableWorker):
         )
 
     def _report_loss(self):
-        """Log dropped input frames, rate-limited.
-
-        Either counter means audio was lost before it reached the pipeline: the
-        recording is short by that much and no longer sample-aligned with the
-        rest of the session. That is a warning, not a debug note.
-        """
+        """Log dropped input frames, rate-limited."""
         now = time.monotonic()
         if now - self._last_overflow_warning < _OVERFLOW_WARN_INTERVAL_S:
             return
@@ -187,4 +143,3 @@ class MicrophoneAcquisitionWorker(PausableWorker):
         with contextlib.suppress(Exception):
             while True:
                 self.capture_queue.get_nowait()
-        # get_nowait raises Empty, which the suppress above absorbs.

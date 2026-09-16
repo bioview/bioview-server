@@ -1,11 +1,4 @@
-"""How the BIOPAC worker reads samples out of mpdev.
-
-The distinction that matters here is between the two mpdev transfer styles:
-``receiveMPData`` (fed by the acquisition daemon) hands back a paced, ordered
-stream, while ``getMostRecentSample`` is a per-sample poll that the caller has
-to pace itself. Choosing the wrong one does not lose data outright -- it makes
-the plot scroll slower than real time, which is much harder to spot.
-"""
+"""How the BIOPAC worker reads samples out of mpdev."""
 
 import ctypes
 import multiprocessing as mp
@@ -43,11 +36,9 @@ class FakeStreamingMpdev:
 
         if self.fail:
             received.value = 0
-            return 5  # MPNOTCON
+            return 5
 
         out = ctypes.cast(buff, ctypes.POINTER(ctypes.c_double))
-        # Interleaved: channel c of sample s carries s * 100 + c, so a
-        # de-interleaving bug shows up as an obviously wrong row.
         for i in range(n):
             sample, channel = divmod(i, self.n_channels)
             out[i] = (self.sample_index + sample) * 100 + channel
@@ -55,7 +46,7 @@ class FakeStreamingMpdev:
         received.value = n
         return MPSUCCESS
 
-    def getMostRecentSample(self, buff):  # pragma: no cover - must not be used
+    def getMostRecentSample(self, buff):  # pragma: no cover
         raise AssertionError("polled a device that supports the daemon")
 
 
@@ -100,8 +91,6 @@ def test_the_stream_read_is_used_when_the_daemon_is_available(display_queue):
     _run(worker, 0.5)
 
     assert dev.requests, "receiveMPData was never called"
-    # 100 samples x 2 channels: mpdev counts values, not samples. Asking for 100
-    # would deliver half a chunk per read and halve the effective sample rate.
     assert set(dev.requests) == {200}
 
 
@@ -136,7 +125,6 @@ def test_a_chunk_is_not_a_view_of_the_ctypes_buffer(display_queue):
 
     first = display_queue.get_nowait()
     second = display_queue.get_nowait()
-    # If the arrays aliased the reused ctypes buffer they would be identical.
     assert not np.array_equal(first, second)
     np.testing.assert_array_equal(first[0], np.arange(8) * 100)
 
@@ -151,8 +139,6 @@ def test_use_stream_false_forces_polling_even_if_the_dll_could_stream(display_qu
         chunk_size=5,
         use_stream=False,
     )
-    # getMostRecentSample raises on this fake, so the worker logging an error
-    # rather than crashing is the expected shape of "it tried to poll".
     _run(worker, 0.2)
     assert dev.requests == []
 
@@ -185,7 +171,6 @@ def test_a_failing_stream_read_does_not_spin_or_emit(display_queue):
     _run(worker, 0.3)
 
     assert display_queue.empty()
-    # A tight retry loop would run into the thousands over 0.3 s.
     assert len(dev.requests) < 60
 
 
@@ -204,20 +189,12 @@ def test_the_save_queue_gets_its_own_copy(display_queue):
 
     displayed = display_queue.get_nowait()
     saved = save_queue.get_nowait()
-    # The save path carries a tagged record; the samples inside must match the
-    # displayed chunk without sharing its buffer.
     np.testing.assert_array_equal(displayed, saved["data"])
     assert displayed is not saved["data"]
     assert not np.shares_memory(displayed, saved["data"])
     assert saved["sample_idx"] == 0
     assert saved["t_wall"] > 0
 
-
-# --- Backend wiring -------------------------------------------------------
-#
-# mpdev requires startMPAcqDaemon() *before* startAcquisition(), and forbids
-# mixing the daemon with getMostRecentSample in one acquisition. So the choice
-# of transfer style belongs to the backend, not the worker.
 
 GROUP_CFG = {
     "device_name": "BIOPAC",
@@ -251,8 +228,6 @@ def backend(monkeypatch):
     be = BIOPACBackend(
         group_id="BIOPAC", response_queue=mp.Queue(), group_config=dict(GROUP_CFG)
     )
-    # run() installs the logger in the child process; these tests drive the
-    # object directly.
     be.logger = None
     return be
 
@@ -300,7 +275,6 @@ def test_a_daemon_that_will_not_start_falls_back_to_polling(backend, monkeypatch
     _spy_worker(monkeypatch, made)
     backend.mpdev_handler = object()
 
-    # Streaming still starts -- polling is degraded, not broken.
     assert backend._start_streaming() is True
     assert made[0].kwargs["use_stream"] is False
 
@@ -315,9 +289,7 @@ def test_chunk_size_is_capped_so_the_plot_cannot_lag_by_a_second(backend, monkey
     made = []
     _spy_worker(monkeypatch, made)
     backend.mpdev_handler = object()
-    # disp_ds = 1 would otherwise ask for a full second of samples per read,
-    # which the stream read blocks for.
     backend.disp_ds = 1
 
     backend._start_streaming()
-    assert made[0].kwargs["chunk_size"] == 100  # 100 ms at 1 kHz
+    assert made[0].kwargs["chunk_size"] == 100

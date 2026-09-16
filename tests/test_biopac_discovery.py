@@ -9,22 +9,16 @@ wmi = pytest.importorskip("wmi", reason="BIOPAC discovery needs the Windows wmi 
 if sys.platform != "win32":
     pytest.skip("BIOPAC is Windows-only", allow_module_level=True)
 
-# Imported after the skips above: on a non-Windows machine importing the
-# discovery module at all would fail on `import wmi`.
 from bioview_server.device.biopac import utils as biopac_utils  # noqa: E402
 from bioview_server.device.biopac.constants import BIOPAC_VENDOR_ID  # noqa: E402
 
 
 def test_the_vendor_id_matches_what_windows_reports_for_biopac_hardware():
-    # BIOPAC Systems' USB vendor id, as it appears in a Windows DeviceID
-    # (USB\VID_097E&PID_....). Discovery keys off this, so a wrong value here
-    # means attached hardware is never recognised.
     assert BIOPAC_VENDOR_ID == 0x097E
 
 
 def test_discovery_reports_a_failure_instead_of_swallowing_it(monkeypatch, caplog):
-    """A `return` inside the `finally` block used to discard the exception, so a
-    genuine WMI or COM failure was indistinguishable from "nothing attached"."""
+    """A `return` inside the `finally` block used to discard the exception, so a"""
 
     def explode():
         raise RuntimeError("WMI is unhappy")
@@ -60,8 +54,6 @@ class TestIdentifyingDetails:
     """The Configurator needs something real to show under a device's name."""
 
     def test_a_synthesised_windows_instance_id_is_not_a_serial_number(self):
-        # An MP36 supplies no USB serial, so Windows makes an id up from the
-        # port path. Showing that to the user as "S/N" would be a fiction.
         assert (
             biopac_utils._usb_serial_from_device_id(
                 r"USB\VID_097E&PID_0036\5&2887CE2C&0&1"

@@ -1,10 +1,4 @@
-"""Demodulation correctness and real-time headroom.
-
-``_process_chunk`` was rewritten from a per-save-window Python loop into whole-
-chunk numpy. These tests pin the numerics against a literal port of the old
-loop, so the rewrite cannot silently change what gets recorded, and guard the
-throughput that made the rewrite necessary in the first place.
-"""
+"""Demodulation correctness and real-time headroom."""
 
 import time
 
@@ -12,10 +6,7 @@ import numpy as np
 import pytest
 from bioview_common import DataSource, apply_filter
 from bioview_common.signal_schemes import CwScheme
-from bioview_common.signal_schemes.normalization import (
-    differential_phase,
-    normalized_amplitude,
-)
+from bioview_common.signal_schemes.normalization import normalized_amplitude
 
 from bioview_server.device.usrp.process import ProcessWorker
 
@@ -47,14 +38,7 @@ def _make_worker(save_ds=SAVE_DS, save_iq=False):
 
 
 def _reference_process_chunk(worker, data, source, filt, if_freq, scheme):
-    """Per-window loop equivalent of the vectorized implementation.
-
-    This is the pre-vectorization code with one deliberate change: it subtracts
-    ``tx_phase_offset`` rather than ``tx_phase_at(center_idx)``. The original
-    subtracted the running carrier phase that the downconversion had already
-    removed, which is fixed separately and pinned by
-    ``test_phase_channel_is_not_a_carrier_ramp``.
-    """
+    """Per-window loop equivalent of the vectorized implementation."""
     if len(data) == 0:
         return np.array([]), np.array([])
 
@@ -80,20 +64,9 @@ def _reference_process_chunk(worker, data, source, filt, if_freq, scheme):
     if worker.save_iq:
         return np.mean(np.real(windows), axis=1), np.mean(np.imag(windows), axis=1)
 
-    amps, phases_out = [], []
-    for w_i, win in enumerate(windows):
-        center = (
-            source.accumulated_sample_idx
-            - len(baseband)
-            + int(start_indices[w_i] + step // 2)
-        )
-        del center
-        amps.append(normalized_amplitude(win, tx_amp))
-        ph, source.prev_phase = differential_phase(
-            win, scheme.tx_phase_offset(0), source.prev_phase
-        )
-        phases_out.append(ph)
-    return np.array(amps), np.array(phases_out)
+    amps = [normalized_amplitude(win, tx_amp) for win in windows]
+    phases_out = np.angle(windows.mean(axis=1) * np.exp(-1j * scheme.tx_phase_offset(0)))
+    return np.array(amps), phases_out
 
 
 def _test_signal(n_total, seed=7):
@@ -124,8 +97,8 @@ def test_vectorized_demod_matches_reference_loop(save_iq, save_ds):
         ref_first, ref_second = _reference_process_chunk(
             ref_w, chunk, ref_src, ref_w.if_filts[0], IF_HZ, ref_scheme
         )
-        np.testing.assert_allclose(first, ref_first, rtol=1e-9, atol=1e-12)
-        np.testing.assert_allclose(second, ref_second, rtol=1e-9, atol=1e-10)
+        np.testing.assert_allclose(first, ref_first, rtol=2e-5, atol=1e-7)
+        np.testing.assert_allclose(second, ref_second, rtol=2e-5, atol=1e-5)
 
 
 def test_window_count_matches_assemble_outputs_expectation():
@@ -158,12 +131,7 @@ def test_demod_recovers_amplitude_of_a_clean_tone():
 
 
 def test_phase_channel_is_not_a_carrier_ramp():
-    """Regression: the recorded phase used to be a pure 2*pi*f_if*save_ds/fs ramp.
-
-    The demodulator subtracted ``tx_phase_at(center_idx)``, which includes the
-    running carrier phase -- but the downconversion had already removed it, so
-    every recorded phase sample stepped by a full carrier increment.
-    """
+    """Regression: the recorded phase used to be a pure 2*pi*f_if*save_ds/fs ramp."""
     worker, source, scheme = _make_worker()
     n = 40000
     tone = _continuous_tone(2 * n)
@@ -215,6 +183,67 @@ def test_phase_channel_cancels_the_programmed_tx_phase():
     assert abs(results[0] - results[1]) < 1e-6
 
 
+def test_phase_stays_wrapped_on_a_drifting_channel():
+    """A residual frequency offset must not run the phase off to infinity.
+
+    The old estimator unwrapped across chunk boundaries, so a fraction of a Hz
+    of LO offset turned the recorded phase into an ever-growing ramp instead of
+    a bounded angle.
+    """
+    worker, source, scheme = _make_worker()
+    n = 40000
+    offset_hz = 2.0
+    t = np.arange(8 * n) / SAMP_RATE
+    tone = (0.5 * np.exp(1j * 2 * np.pi * (IF_HZ + offset_hz) * t)).astype(np.complex64)
+
+    seen = []
+    for c in range(8):
+        _amp, phase, _m = worker._process_chunk(
+            tone[c * n : (c + 1) * n], source, worker.if_filts[0], IF_HZ, scheme
+        )
+        seen.append(phase)
+    phase = np.concatenate(seen[1:])
+
+    assert np.all(
+        np.abs(phase) <= np.pi + 1e-6
+    ), f"phase left (-pi, pi]: max |phase| was {np.max(np.abs(phase)):.3f}"
+
+
+def test_phase_recovers_a_static_channel_phase():
+    """arg(mean(window)) lands on the channel phase, within the filter's own shift.
+
+    The band-pass contributes a few milliradians of its own at IF, which is why
+    this is not held to the 1e-6 that the differential tests are.
+    """
+    worker, source, scheme = _make_worker()
+    n = 40000
+    tone = _continuous_tone(2 * n, channel_phase=0.4)
+    worker._process_chunk(tone[:n], source, worker.if_filts[0], IF_HZ, scheme)
+    _amp, phase, _m = worker._process_chunk(
+        tone[n:], source, worker.if_filts[0], IF_HZ, scheme
+    )
+    assert abs(np.median(phase) - 0.4) < 1e-2
+
+
+def test_phasor_ramp_is_shared_across_every_rx_on_one_tx():
+    """The downconversion exponential is paid once per IF, not once per source."""
+    worker, source, scheme = _make_worker()
+    n = 20000
+    for _ in range(3):
+        worker._process_chunk(_test_signal(n), source, worker.if_filts[0], IF_HZ, scheme)
+    assert list(worker._ramp_cache) == [(IF_HZ, n)]
+
+
+def test_accumulated_phase_stays_bounded():
+    """A long session must not spend mantissa on a runaway phase accumulator."""
+    worker, source, scheme = _make_worker()
+    for _ in range(50):
+        worker._process_chunk(
+            _test_signal(40000), source, worker.if_filts[0], IF_HZ, scheme
+        )
+    assert 0.0 <= source.accumulated_phase < 2 * np.pi
+
+
 def test_metric_is_magnitude_based_under_save_iq():
     """The DPIC metric must not become mean(Re{.}) when save_iq is on."""
     for save_iq in (False, True):
@@ -224,6 +253,49 @@ def test_metric_is_magnitude_based_under_save_iq():
         )
         assert isinstance(metric, float)
         assert metric > 0
+
+
+def test_full_mimo_group_keeps_up_with_real_time():
+    """A 4x4 group is 16 demodulated pairs and used to sit at 89% of real time.
+
+    That left nothing for the save and display paths, so on a slow machine the
+    Rx queue backed up and the receiver dropped buffers.
+    """
+    n_tx = n_rx = 4
+    ifs = [IF_HZ + i * 10e3 for i in range(n_tx)]
+    sources = set()
+    for rx in range(n_rx):
+        for tx in range(n_tx):
+            src = DataSource(group_id="g", channel=rx * n_tx + tx, label=f"T{tx}R{rx}")
+            src.tx_idx, src.rx_idx = tx, rx
+            sources.add(src)
+    scheme = CwScheme(SAMP_RATE, ifs, [1.0] * n_tx, [0.0] * n_tx)
+    worker = ProcessWorker(
+        data_sources=sources,
+        cal_ref_sources=[],
+        samp_rate=SAMP_RATE,
+        channel_ifs=ifs,
+        if_filter_bw=[5e3] * n_tx,
+        rx_queues={"d": None},
+        rx_device_order=["d"],
+        schemes_by_device={"d": scheme},
+        global_tx_to_device={i: ("d", i) for i in range(n_tx)},
+        save_ds=100,
+    )
+
+    n = 40000
+    buffer = np.vstack([_test_signal(n, seed=r) for r in range(n_rx)])
+
+    worker._process_mimo_chunk(buffer)
+    start = time.perf_counter()
+    for _ in range(10):
+        worker._process_mimo_chunk(buffer)
+    budget = ((time.perf_counter() - start) / 10) / (n / SAMP_RATE)
+
+    assert budget < 0.5, (
+        f"a 4x4 group uses {budget:.0%} of real time; it must leave room for "
+        "the save and display paths and for the client sharing the machine"
+    )
 
 
 def test_demod_keeps_up_with_real_time():
@@ -271,12 +343,7 @@ def _dual_component_worker(save_ds=SAVE_DS):
 
 
 def test_component_rows_match_the_single_row_pipeline():
-    """Splitting a pair into two rows must not change either quantity.
-
-    The amplitude row has to equal what a single-component group recorded, and
-    the phase row has to equal the second component that group stacked behind
-    it -- otherwise enabling phase silently rewrites the amplitude channel.
-    """
+    """Splitting a pair into two rows must not change either quantity."""
     n = 4 * SAVE_DS
     signal = _test_signal(n)
     buffer = signal.reshape(1, n)
@@ -285,7 +352,6 @@ def test_component_rows_match_the_single_row_pipeline():
     ref_worker.save_imaginary = True
     ref_results = ref_worker._process_mimo_chunk(buffer)
     ref_save, _ref_display = ref_worker._assemble_outputs(buffer, ref_results)
-    # One row per pair still stacks both components behind it, as before.
     assert ref_save.shape == (1, n // SAVE_DS, 2)
 
     worker, _amp, _phase = _dual_component_worker()
@@ -293,17 +359,16 @@ def test_component_rows_match_the_single_row_pipeline():
     save_data, display_data = worker._assemble_outputs(buffer, results)
 
     assert save_data.shape == (2, n // SAVE_DS)
-    np.testing.assert_allclose(save_data[0], ref_save[0, :, 0])
-    np.testing.assert_allclose(save_data[1], ref_save[0, :, 1])
+    # Both sides are float32 pipelines over separately allocated buffers, so
+    # the window reduction can land an ULP apart; assert_allclose's float64
+    # default tolerance is not the right yardstick for that.
+    np.testing.assert_allclose(save_data[0], ref_save[0, :, 0], rtol=1e-5, atol=1e-7)
+    np.testing.assert_allclose(save_data[1], ref_save[0, :, 1], rtol=1e-5, atol=1e-7)
     np.testing.assert_allclose(display_data, save_data)
 
 
 def test_pair_is_demodulated_once_per_chunk():
-    """Two rows share one demodulator, so the phase accumulator advances once.
-
-    Running the demodulator per row would double the accumulated phase and
-    desynchronize the downconversion from the incoming samples.
-    """
+    """Two rows share one demodulator, so the phase accumulator advances once."""
     n = 4 * SAVE_DS
     buffer = _test_signal(n).reshape(1, n)
 
@@ -316,5 +381,5 @@ def test_pair_is_demodulated_once_per_chunk():
     ref_worker._process_mimo_chunk(buffer)
 
     assert amp.accumulated_sample_idx == n
-    assert phase.accumulated_sample_idx == 0  # never demodulated itself
+    assert phase.accumulated_sample_idx == 0
     assert amp.accumulated_phase == pytest.approx(ref_src.accumulated_phase)

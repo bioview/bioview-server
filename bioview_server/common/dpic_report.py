@@ -1,9 +1,4 @@
-"""Shared logging and serialisation for DPIC balance results.
-
-Every backend that balances runs the same balancer, so they all report it the
-same way. Every outcome -- including "it did not run" -- carries a reason: a
-balance that bails out must never reach the client as a success.
-"""
+"""Shared logging and serialisation for DPIC balance results."""
 
 from __future__ import annotations
 
@@ -11,9 +6,6 @@ from bioview_common import log_print
 from bioview_common.signal_schemes.dpic import DpicBalancer
 
 
-#: ``dpic_balance`` config key -> ``DpicBalancer`` field. Every knob the VI
-#: exposes is here, so a rig can be re-timed from the config file without a
-#: code change; the defaults are the VI's own numbers.
 BALANCER_KEYS = (
     "coarse_phase_step_deg",
     "coarse_amp_step",
@@ -35,12 +27,7 @@ BALANCER_KEYS = (
 
 
 def build_balancer(dpic_cfg: dict | None, **hooks) -> DpicBalancer:
-    """Build a balancer from a group's ``dpic_balance`` block.
-
-    Both RF backends run the same search, so they configure it the same way;
-    a key the config omits keeps the balancer's own default rather than a
-    default repeated at each call site and free to drift.
-    """
+    """Build a balancer from a group's ``dpic_balance`` block."""
     dpic_cfg = dpic_cfg or {}
     settings = {
         key: dpic_cfg[key] for key in BALANCER_KEYS if dpic_cfg.get(key) is not None
@@ -49,12 +36,7 @@ def build_balancer(dpic_cfg: dict | None, **hooks) -> DpicBalancer:
 
 
 def balance_outcome(logger, results) -> dict:
-    """Log each pair's result and summarise the run.
-
-    Returns ``{"ok": bool, "message": str, "results": [...]}``. ``ok`` is False
-    unless every pair converged, so a partial balance is reported as a failure
-    with the pairs that failed named in the message.
-    """
+    """Log each pair's result and summarise the run."""
     failures = []
 
     for r in results:

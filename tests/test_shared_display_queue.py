@@ -1,10 +1,4 @@
-"""The output queue is shared by every backend in a session.
-
-``Server`` creates one ``data_queue`` and hands the same object to every device
-handler, and one server thread drains it. A backend that drained that queue on
-its own Start therefore threw away whatever the *other* devices had already
-queued -- data loss that only appears once two devices stream together.
-"""
+"""The output queue is shared by every backend in a session."""
 
 import multiprocessing as mp
 import queue as _queue
@@ -17,7 +11,6 @@ from bioview_server.datatypes import Backend
 class _Backend(Backend):
     """Driven from the parent side only (never started)."""
 
-    # Set by run() in the child; these objects are never started.
     logger = None
 
     def populate_data_sources(self):
@@ -40,11 +33,9 @@ def test_one_device_starting_does_not_discard_another_devices_chunks():
     biopac = _Backend("BIOPAC", data_output_queue=shared)
     usrp = _Backend("USRP", data_output_queue=shared)
 
-    # BIOPAC is already streaming and has queued chunks for the server thread.
     for i in range(3):
         shared.put({"data": i, "sources": []})
 
-    # USRP now starts. This must not touch BIOPAC's queued data.
     usrp._setup_display({})
 
     assert [item["data"] for item in _drain_all(shared)] == [0, 1, 2]

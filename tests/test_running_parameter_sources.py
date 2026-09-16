@@ -1,10 +1,4 @@
-"""A live parameter change republishes the server's data sources.
-
-The set of streams a device produces is not fixed: a BIOPAC channel mask decides
-it. Rebuilding the list (rather than merging into it) is what lets a channel
-disappear, and returning it with the reply is what lets the client's plot-source
-selector follow along without waiting for a reconnect.
-"""
+"""A live parameter change republishes the server's data sources."""
 
 from bioview_common import DataSource, Response
 

@@ -9,22 +9,14 @@ from .constants import describe_biopac_code
 from .utils import daemon_last_error
 
 
-#: mpdev's MPSUCCESS. Every mpdev entry point returns one of these codes.
 MPSUCCESS = 1
 
-# How far behind real time the polling fallback may drift before saying so;
-# the plot's x-axis assumes the nominal rate.
 _LAG_WARN_RATIO = 0.9
 _LAG_WARN_INTERVAL_S = 5.0
 
 
 class BiopacAcquisitionWorker(PausableWorker):
-    """Read samples from mpdev and emit (num_channels, num_samples) chunks.
-
-    Uses the buffered ``receiveMPData`` stream read where available, and falls
-    back to per-sample ``getMostRecentSample`` polling otherwise. See
-    bioview-docs/reference/biopac.md for the trade-off between them.
-    """
+    """Read samples from mpdev and emit (num_channels, num_samples) chunks."""
 
     def __init__(
         self,
@@ -44,20 +36,14 @@ class BiopacAcquisitionWorker(PausableWorker):
         self.samp_rate = max(1, int(samp_rate))
         self.display_queue = display_queue
         self.save_queue = save_queue
-        # Decimation of the save stream relative to acquisition, so the saved
-        # rate is samp_rate / save_ds like every other device.
         self.save_ds = max(1, int(save_ds))
         self.chunk_size = max(1, int(chunk_size))
         self.channel_count = len(channels)
         self._period_s = 1.0 / self.samp_rate
 
-        # Bulk read: receiveMPData returns nothing without the acquisition
-        # daemon, so the caller sets this flag.
         self._receive = getattr(mpdev_handler, "receiveMPData", None)
         if use_stream is False:
             self._receive = None
-        # mpdev counts values, not samples, and interleaves channels. The
-        # extra room guards a DLL that reads the count as samples-per-channel.
         self._values_per_chunk = self.chunk_size * self.channel_count
         self._stream_buffer = (
             (c_double * (self._values_per_chunk * self.channel_count))()
@@ -65,16 +51,11 @@ class BiopacAcquisitionWorker(PausableWorker):
             else None
         )
 
-        # Per-sample poll state (fallback path only).
         self._buffer = (c_double * (self.channel_count + 1))()
         self._chunk = []
         self._next_poll = None
         self._samples_seen = 0
-        # Cumulative count of samples written to the save stream; the recorder
-        # uses it to detect drops. Unlike _samples_seen it is never reset.
         self._save_samples_emitted = 0
-        # Samples left over from the previous chunk, held so a save_ds window
-        # is never split across two chunks.
         self._save_remainder = None
         self._rate_window_start = None
         self._last_lag_warning = 0.0
@@ -106,8 +87,6 @@ class BiopacAcquisitionWorker(PausableWorker):
         samples = values // self.channel_count
         if samples <= 0:
             if retval != MPSUCCESS:
-                # Acquisition stopped, or the unit has nothing for us. Back off
-                # briefly so a persistent failure cannot spin this thread.
                 self._report_stream_failure(retval)
                 time.sleep(0.01)
             return
@@ -115,8 +94,6 @@ class BiopacAcquisitionWorker(PausableWorker):
         flat = np.frombuffer(
             self._stream_buffer, dtype=np.float64, count=samples * self.channel_count
         )
-        # np.array copies unconditionally, which is required: the source is
-        # the ctypes buffer the next call overwrites.
         rows = flat.reshape(samples, self.channel_count).T
         self._emit(np.array(rows, dtype=np.float64, order="C"))
 
@@ -136,8 +113,6 @@ class BiopacAcquisitionWorker(PausableWorker):
 
         self._chunk.append([self._buffer[i] for i in range(self.channel_count)])
         self._next_poll += self._period_s
-        # A loop that has fallen behind would otherwise chase a deadline that is
-        # already in the past for as long as it stays behind, polling flat out.
         if self._next_poll < now:
             self._next_poll = now + self._period_s
 
@@ -191,14 +166,8 @@ class BiopacAcquisitionWorker(PausableWorker):
         )
 
     def _decimate_for_save(self, data: np.ndarray) -> np.ndarray:
-        """Average ``save_ds`` acquired samples into one saved sample.
-
-        Leftover samples are carried into the next chunk rather than dropped, so
-        the saved stream stays exactly ``samp_rate / save_ds`` over a run.
-        """
+        """Average ``save_ds`` acquired samples into one saved sample."""
         if self.save_ds <= 1:
-            # A copy, not the same buffer: the identical array is handed to the
-            # display queue next, and the two consumers must not alias.
             return data.copy()
         if self._save_remainder is not None and self._save_remainder.size:
             data = np.hstack([self._save_remainder, data])
@@ -224,9 +193,6 @@ class BiopacAcquisitionWorker(PausableWorker):
                 try:
                     self.save_queue.put_nowait(item)
                 except queue.Full:
-                    # Never silent: a dropped save chunk is a hole in the
-                    # recording, and the counter above makes it visible in the
-                    # file's trailer as a gap.
                     log_print(
                         self.logger,
                         "error",

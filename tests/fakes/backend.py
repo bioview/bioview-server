@@ -1,14 +1,4 @@
-"""A fake device backend, for tests only.
-
-This is a test double, not a shipped device: nothing under ``bioview_server``
-imports it, and it reaches the server only through the registration in this
-package's ``__init__``. It exists so the connect -> stream -> display -> save
-path can be exercised on a machine with no hardware attached.
-
-Sine mode synthesizes phase-shifted sine waves. RF mode reuses the USRP
-signal-scheme / ProcessWorker path against a virtual MIMO channel model, so
-calibration and DPIC balance are covered too.
-"""
+"""A fake device backend, for tests only."""
 
 from __future__ import annotations
 
@@ -100,8 +90,6 @@ class SineWaveWorker(PausableWorker):
 
         self._sample_idx += self.chunk_size
 
-        # Save path carries the undecimated-by-disp_ds stream, decimated only
-        # by save_ds, and is tagged so the recorder can detect dropped chunks.
         if self.save_queue is not None:
             save_chunk = chunk
             if self.save_ds > 1:
@@ -207,12 +195,7 @@ class FakeBackend(Backend):
         return float(self.samp_rate) / max(1, int(self.save_ds))
 
     def get_display_frequency(self) -> float:
-        """Rate (Hz) at which this device emits display samples.
-
-        The non-RF sine path forwards every sample, so it is the sample rate.
-        The RF path runs the USRP ProcessWorker, which averages ``save_ds``
-        samples per point and then drops by ``display_ds``.
-        """
+        """Rate (Hz) at which this device emits display samples."""
         if not self.rf_mode:
             return float(self.samp_rate)
         divisor = max(1, int(self.save_ds)) * max(1, int(self.display_ds))
@@ -349,7 +332,6 @@ class FakeBackend(Backend):
             self.process_worker.save_iq = self.save_iq
             self.process_worker.save_ds = self.save_ds
             self.process_worker.save_queue = self.save_queue
-            # save_ds also sets the display rate; keep disp_freq in step.
             disp_freq = self.get_display_frequency()
             for source in list(self.mimo_sources) + list(self.cal_ref_sources):
                 source.disp_freq = disp_freq
@@ -420,8 +402,6 @@ class FakeBackend(Backend):
 
         time.sleep(0.35)
 
-        # The current calibration state, not the config's start-up value: the
-        # overlay is toggled at runtime and would be reset on every Start.
         self._set_calibration_enabled(self._cal_enabled)
 
         if self.save_worker:
@@ -455,9 +435,6 @@ class FakeBackend(Backend):
     def _post_start_streaming(self):
         dpic_cfg = self.group_config.get("dpic_balance", {})
         if dpic_cfg.get("auto_on_start") and self.dpic_pairs:
-            # On its own thread, like a requested balance: this runs after the
-            # START_STREAMING reply but still on the command loop, so calling
-            # the search inline here left Stop unservable for its duration.
             self._start_balance_thread()
 
     def _set_calibration_enabled(self, enabled: bool):
@@ -498,11 +475,7 @@ class FakeBackend(Backend):
             self.process_worker.set_channel_if(global_tx, freq)
 
     def _coerce_dpic_inject_frequencies(self):
-        """Put every inject Tx on its measure Tx's IF before balancing.
-
-        Same rule as the USRP backend: the Rx band-passes around the measure
-        Tx's IF, so an injection anywhere else cannot cancel the direct path.
-        """
+        """Put every inject Tx on its measure Tx's IF before balancing."""
         num_tx = len(self.channel_ifs)
         for pair in self.dpic_pairs:
             if pair.inject_tx >= num_tx or pair.measure_tx >= num_tx:
@@ -606,12 +579,7 @@ class FakeBackend(Backend):
         return sorted(sources, key=lambda s: s.channel)
 
     def _reload_channel_map(self, channel_map):
-        """Rebuild everything the channel map decides, in place.
-
-        Same path as the USRP backend: DPIC pairs are specified in the channel
-        map, which is edited in the settings panel, so an edit that stops here
-        is an edit the balance never sees.
-        """
+        """Rebuild everything the channel map decides, in place."""
         if self._streaming.is_set():
             log_print(
                 self.logger,
@@ -623,9 +591,6 @@ class FakeBackend(Backend):
 
         self.group_config["channel_map"] = channel_map
 
-        # The rf worker and the channel model hold these scheme objects, so
-        # they must survive the rebuild; schemes depend on `hardware`, which a
-        # channel-map edit never touches.
         preserved_schemes = dict(self.schemes_by_device)
         cal_enabled = self._cal_enabled
 

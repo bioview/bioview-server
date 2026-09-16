@@ -1,9 +1,4 @@
-"""The server must say *why* a device is unusable, not just that it is.
-
-A GUI-spawned server has its output detached, so anything explained only in the
-server's own log never reaches the user. Failure reasons therefore travel back
-with the device status.
-"""
+"""The server must say *why* a device is unusable, not just that it is."""
 import pytest
 from bioview_common import Command, Configuration, DeviceStatus, Response
 
@@ -32,7 +27,7 @@ class TestBiopacErrorCodes:
         class FakeDll:
             @staticmethod
             def connectMPDev(*_args):
-                return 2  # MPDRVERR
+                return 2
 
         with pytest.raises(Exception) as excinfo:
             utils.connect_biopac_device(FakeDll())
@@ -125,10 +120,7 @@ class TestMemoryIntegrityDetection:
     """Recognising the case where Windows itself is blocking the driver."""
 
     def test_the_server_attributes_a_driver_error_to_memory_integrity(self, monkeypatch):
-        """The backend subprocess reports what the device said; only the server
-        can see how the machine is configured, and it is the safe place to look
-        -- the query has been seen to hang inside a subprocess and stall the
-        initialization it was meant to explain."""
+        """The backend subprocess reports what the device said; only the server"""
         from bioview_server.device.biopac import utils
 
         monkeypatch.setattr(utils, "memory_integrity_state", lambda: (True, True))
@@ -139,7 +131,6 @@ class TestMemoryIntegrityDetection:
         )
         assert "Memory Integrity" in enriched
 
-        # and the shared catalogue turns that into advice for the user
         from bioview_common import explain
 
         assert explain(enriched).id == "driver-blocked-by-memory-integrity"
@@ -150,8 +141,7 @@ class TestMemoryIntegrityDetection:
         assert srv._explain_device_failure(message) == message
 
     def test_the_connect_call_itself_stays_free_of_machine_queries(self, monkeypatch):
-        """connect_biopac_device runs in the backend subprocess, so it must not
-        reach for anything that can block."""
+        """connect_biopac_device runs in the backend subprocess, so it must not"""
         from bioview_server.device.biopac import utils
 
         def _must_not_be_called():
@@ -162,7 +152,7 @@ class TestMemoryIntegrityDetection:
         class FakeDll:
             @staticmethod
             def connectMPDev(*_args):
-                return 2  # MPDRVERR
+                return 2
 
         with pytest.raises(Exception) as excinfo:
             utils.connect_biopac_device(FakeDll())
@@ -171,8 +161,7 @@ class TestMemoryIntegrityDetection:
     def test_a_pending_reboot_is_called_out_rather_than_looking_solved(
         self, monkeypatch
     ):
-        """Switched off but still running is the state that confuses people most:
-        the toggle says off while the driver is still being refused."""
+        """Switched off but still running is the state that confuses people most:"""
         from bioview_server.device.biopac import utils
 
         monkeypatch.setattr(utils, "memory_integrity_state", lambda: (True, False))
@@ -193,7 +182,7 @@ class TestMemoryIntegrityDetection:
 
         from bioview_server.device.biopac import utils
 
-        utils._hvci_state = None  # bypass the cache to time a real query
+        utils._hvci_state = None
         started = time.monotonic()
         running, configured = utils.memory_integrity_state()
         elapsed = time.monotonic() - started

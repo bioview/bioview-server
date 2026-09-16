@@ -1,15 +1,4 @@
-"""``check_input_settings`` does not predict whether a stream will open.
-
-Measured on a Realtek machine whose only inputs enumerate under WDM-KS:
-
-    FrontMic    1ch @ 44100   check:OK   open:NO  (Invalid device)
-    Stereo Mix  1ch @ 44100   check:NO   open:OK
-
-It is wrong in both directions, so the rate negotiated from it was a rate the
-device would refuse, and the input chosen from it was an input that could never
-be opened. The probe now opens the stream, which is the only question anyone
-was ever asking.
-"""
+"""``check_input_settings`` does not predict whether a stream will open."""
 
 import pytest
 
@@ -35,7 +24,7 @@ def _patch_open(monkeypatch, opens):
 
     class _FakeSd:
         @staticmethod
-        def InputStream(**kwargs):  # noqa: N802 - mirrors sounddevice's name
+        def InputStream(**kwargs):  # noqa: N802
             created.append(kwargs)
             if not opens(kwargs["device"], kwargs["channels"], kwargs["samplerate"]):
                 raise RuntimeError("Error opening InputStream: Invalid device")
@@ -58,15 +47,13 @@ def test_the_probe_opens_rather_than_asking(monkeypatch):
 
     assert supports_input(10, 1, 44100) is True
     assert supports_input(10, 1, 16000) is False
-    # It really went through Pa_OpenStream, with the settings it was asked about.
     assert created[0]["device"] == 10
     assert created[0]["channels"] == 1
     assert created[0]["samplerate"] == 44100.0
 
 
 def test_the_probe_closes_what_it_opened(monkeypatch):
-    """A probe that leaked the stream would hold the device against the open
-    that actually matters."""
+    """A probe that leaked the stream would hold the device against the open"""
     opened = []
 
     class _FakeSd:
@@ -100,9 +87,7 @@ def test_negotiation_now_follows_what_opens(monkeypatch):
     """The Stereo Mix case: check said no at 44.1 kHz, the device says yes."""
     _patch_open(monkeypatch, lambda d, c, r: r in (44100.0, 48000.0))
 
-    # 16 kHz is refused, the device's native rate is tried first and taken.
     assert negotiate_samplerate(9, 1, 16000) == 44100.0
-    # A rate that opens is kept as asked.
     assert negotiate_samplerate(9, 1, 48000) == 48000.0
 
 

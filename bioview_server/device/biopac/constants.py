@@ -1,4 +1,3 @@
-# Known BIOPAC USB Vendor IDs and Product IDs
 BIOPAC_VENDOR_ID = 0x097E
 
 BIOPAC_CONNECTION_CODES = {
@@ -24,8 +23,6 @@ BIOPAC_CONNECTION_CODES = {
 }
 
 
-#: What an mpdev result code means in practice, for the ones a user can act on.
-#: A bare "Error Code: 2" in the log says nothing; the cause and the fix do.
 BIOPAC_CODE_EXPLANATIONS = {
     "MPDRVERR": (
         "the MP device driver did not respond -- the unit is plugged in but "

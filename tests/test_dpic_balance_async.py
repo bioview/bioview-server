@@ -1,14 +1,4 @@
-"""A balance must not block anything that has to keep running while it does.
-
-The search drives real hardware for a minute or more. It used to run inline on
-the backend's command loop, which was itself being waited on by the server's
-command thread, which held the client's control socket -- so a Balance click
-froze the whole window, Stop could not be delivered, and the reply the client
-had given up on was read as the answer to whatever it sent next.
-
-These pin the three places that were serialized: the child's command loop, the
-parent's reply routing, and the abort path.
-"""
+"""A balance must not block anything that has to keep running while it does."""
 
 import multiprocessing as mp
 import threading
@@ -32,7 +22,6 @@ class _SlowBalanceBackend(Backend):
 
     def _run_dpic_balance(self):
         self.started.set()
-        # Either the test lets it finish, or STOP_STREAMING aborts it.
         while not self.release.is_set() and not self.balance_aborted():
             time.sleep(0.01)
         return {
@@ -46,12 +35,7 @@ class _SlowBalanceBackend(Backend):
 
 
 def _drain_reply(backend, request_id, seen, timeout=5.0):
-    """Read one request's reply, keeping any others in ``seen`` for later.
-
-    Replies do not arrive in the order the commands were sent -- an aborted
-    balance answers before the Stop that aborted it -- so this must not throw
-    the other one away.
-    """
+    """Read one request's reply, keeping any others in ``seen`` for later."""
     if request_id in seen:
         return seen.pop(request_id)
     deadline = time.monotonic() + timeout
@@ -71,8 +55,6 @@ def test_stop_streaming_is_answered_while_a_balance_runs():
     )
     assert be.started.wait(timeout=5)
 
-    # The command loop is free: STOP_STREAMING is handled and answered while
-    # the balance is still in flight. Inline, this call could not even start.
     be._handle_command(
         {"command": IPCCommand.STOP_STREAMING, "args": {}, "request_id": 2}
     )
@@ -80,8 +62,6 @@ def test_stop_streaming_is_answered_while_a_balance_runs():
     stop_reply = _drain_reply(be, 2, seen)
     assert stop_reply["type"] == Response.SUCCESS
 
-    # ...and the Stop aborted the balance rather than leaving it to run out
-    # its time budget against a radio that is no longer transmitting.
     balance_reply = _drain_reply(be, 1, seen)
     assert balance_reply["type"] == Response.ERROR
     assert balance_reply["message"] == "aborted"
@@ -107,13 +87,7 @@ def test_a_second_balance_is_refused_while_one_is_running():
 
 
 def test_a_reply_read_by_the_wrong_waiter_is_not_lost():
-    """Two threads wait on one response queue; neither may eat the other's reply.
-
-    ``_request`` used to drop any reply whose id did not match, so a balance
-    thread that happened to read the Stop reply timed the Stop out. The child
-    is not started here: the replies are written straight onto the queue, in
-    the reverse of the order they were asked for.
-    """
+    """Two threads wait on one response queue; neither may eat the other's reply."""
     be = Backend(group_id="grp", response_queue=mp.Queue())
     results = {}
 
@@ -162,8 +136,6 @@ def test_balancer_stops_at_the_next_point_when_aborted():
     )
     balancer = DpicBalancer(should_abort=lambda: aborted["value"])
 
-    # Aborting before the search means no sweep point is ever applied, and the
-    # pre-search settings are restored rather than left at an arbitrary point.
     aborted["value"] = True
     result = balancer.balance(channel)
     assert result.converged is False

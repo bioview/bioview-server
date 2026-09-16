@@ -7,8 +7,6 @@ from bioview_common import Command, Response
 from fakes import FakeConfiguration
 
 
-# Kept beside the tests: the server is checked out on its own in CI,
-# so a path above the repo root does not exist there.
 DATA_DIR = Path(__file__).resolve().parent / "data"
 RF_CFG_PATH = DATA_DIR / "fake_dpic_2x2_mimo_cfg.json"
 

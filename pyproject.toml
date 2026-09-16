@@ -11,26 +11,9 @@ requires-python = ">=3.12, <3.14"
 dependencies = [
     "pygame (>=2.6.1,<3.0.0)",
     "h5py (>=3.14.0,<4.0.0)",
-    # Imported directly by the device backends and the recorder; previously only
-    # a dev dependency, so a real install got whatever numpy scipy dragged in.
-    #
-    # Capped below 2 because the UHD Python bindings (uhd 4.10.0.0, the newest
-    # release) are built against the NumPy 1.x ABI and declare "numpy>=1.11,<2.0"
-    # themselves. Under NumPy 2 the transmit and receive workers deadlock on
-    # pybind11's lazy NumPy C-API import, with the GIL held, and the USRP never
-    # answers START_STREAMING. The pin is the fix; there is no runtime guard.
     "numpy (>=1.26,<2)",
-    # scipy 1.18 requires numpy>=2.0.0; 1.17.x is the newest series compatible
-    # with the cap above.
     "scipy (>=1.16.1,<1.18)",
-    # BIOPAC discovery enumerates USB devices through WMI. It was an opt-in
-    # extra, so a normal install left the whole BIOPAC backend unavailable and
-    # attached hardware simply never showed up.
     "wmi (>=1.5.1) ; platform_system == 'Windows'",
-    # PortAudio bindings for the microphone backend. A regular dependency
-    # rather than an extra: the backend registry probes it at import and
-    # reports "not available" if it is missing, which looks to a user like
-    # broken hardware rather than an install choice.
     "sounddevice (>=0.4.6,<0.6)"
 ]
 
@@ -41,8 +24,6 @@ bioview-server = "bioview_server.server:main"
 uhd = [
     "uhd ; platform_system == 'Windows'"
 ]
-# Kept so existing "[biopac]" installs and scripts keep working; wmi is a
-# regular dependency on Windows now, so this extra adds nothing.
 biopac = [
     "wmi ; platform_system == 'Windows'"
 ]
@@ -53,12 +34,8 @@ build-backend = "poetry.core.masonry.api"
 
 [tool.poetry.group.dev.dependencies]
 pre-commit = "^4.2.0"
-# Floors, not carets: the carets here capped ruff at <0.13 and pytest at <9
-# while the environment ran 0.16 and 9.x, so the declarations described nothing.
 ruff = ">=0.12.8"
 pytest = ">=8.4.1"
-# numpy is a runtime dependency now (see [project] dependencies); it is not
-# repeated here, so the <2 cap cannot be contradicted from the dev group.
 
 [tool.pytest.ini_options]
 minversion = "6.0"
@@ -80,42 +57,31 @@ extend-exclude = [
 ]
 
 [tool.ruff.lint]
-# Enable pycodestyle (`E`) and Pyflakes (`F`) codes by default
-# Plus isort (`I`) for import sorting
 select = ["E", "W", "F", "I", "UP", "B", "SIM", "C90"]
 ignore = [
-    "E203",  # whitespace before ':'
-    "C901" # TODO: Remove after validating everything works
+    "E203",
+    "C901"
 ]
 
-# Allow fix for all enabled rules (when `--fix`) is provided
 fixable = ["ALL"]
 unfixable = []
 
-# Allow unused variables when underscore-prefixed
 dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
 
 [tool.ruff.lint.per-file-ignores]
-# UHD reads UHD_LOG_LEVEL from the environment when it is imported, so the
-# os.environ assignment has to sit above `import uhd` -- and therefore above
-# every import that follows it.
 "bioview_server/device/usrp/backend.py" = ["E402"]
 
 [tool.ruff.lint.mccabe]
 max-complexity = 10
 
 [tool.ruff.lint.isort]
-known-first-party = ["your_package"]  # Replace with your actual package name
+known-first-party = ["your_package"]
 force-single-line = false
 force-sort-within-sections = false
 lines-after-imports = 2
 
 [tool.ruff.format]
-# Like Black, use double quotes for strings
 quote-style = "double"
-# Like Black, indent with spaces, rather than tabs
 indent-style = "space"
-# Like Black, respect magic trailing commas
 skip-magic-trailing-comma = false
-# Like Black, automatically detect the appropriate line ending
 line-ending = "auto"

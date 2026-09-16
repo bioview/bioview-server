@@ -1,13 +1,4 @@
-"""A channel-map edit must reach the backend that acts on it.
-
-DPIC pairs are *specified* in the channel map, and the channel map is edited in
-the settings panel -- so `UPDATE_RUNNING_PARAMETER` with `channel_map` is the
-path a pair actually arrives by. It used to fall through `_queue_param_update`
-untouched: the value never reached `group_config`, `populate_data_sources()`
-was never re-run, and `dpic_pairs` kept whatever the config file had at connect
-time. Adding a loop in the UI and pressing Balance reported "No DPIC pairs are
-configured for this device group".
-"""
+"""A channel-map edit must reach the backend that acts on it."""
 
 import copy
 import multiprocessing as mp
@@ -82,8 +73,6 @@ def test_the_measurement_grid_follows_the_new_map(make_backend):
 
     be._queue_param_update({"channel_map": copy.deepcopy(WITH_PAIR)})
 
-    # Tx2 now radiates the cancellation tone and its Rx has nothing to receive,
-    # so both halves of that channel are retired from the grid.
     assert sorted(s.label for s in be.mimo_sources) == ["Tx1Rx1"]
 
 
@@ -93,7 +82,6 @@ def test_the_parent_side_mirror_sees_it_too(make_backend):
     be = make_backend()
     be._apply_param_update_local({"channel_map": copy.deepcopy(WITH_PAIR)})
     assert len(be.dpic_pairs) == 1
-    # The cal-ref row rides along; the measurement grid is what the map changed.
     assert sorted(s.label for s in be.get_data_sources()) == ["CalRef_Tx1", "Tx1Rx1"]
 
 
@@ -138,7 +126,6 @@ def test_the_processing_worker_adopts_the_new_rows():
     be._queue_param_update({"channel_map": copy.deepcopy(WITH_PAIR)})
 
     assert sorted(s.label for s in be.process_worker.mimo_sources) == ["Tx1Rx1"]
-    # Metrics are keyed by (tx, rx) meanings that just changed.
     assert be.process_worker.latest_metrics == {}
 
 
@@ -156,18 +143,11 @@ def test_unrelated_parameters_still_reach_the_worker_queues():
     while not be.tx_command_queue["A"].empty():
         forwarded.append(be.tx_command_queue["A"].get_nowait())
     assert {"param": "calibration.enabled", "value": True} in forwarded
-    # ...and the map itself is not forwarded: nothing down there reads it.
     assert all(item["param"] != "channel_map" for item in forwarded)
 
 
 def test_a_map_edit_republishes_the_servers_data_sources(monkeypatch):
-    """The plot-source selector follows the map without a reconnect.
-
-    The reply to UPDATE_RUNNING_PARAMETER carries the new source list, which is
-    what drives `data_sources_changed` -> `populate_plot_grid_sources` on the
-    client. That only works if the *parent* handler rebuilt its sources, since
-    `get_data_sources()` is answered out of the parent process.
-    """
+    """The plot-source selector follows the map without a reconnect."""
     from bioview_common import Response
 
     from bioview_server.server import Server

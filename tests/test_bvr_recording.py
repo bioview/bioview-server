@@ -1,9 +1,4 @@
-"""End-to-end tests for the server-side ``bioview-raw-v3`` recorder.
-
-The case that matters is two devices at *different* save rates in one session:
-each emits its own chunks of its own width, and the file has to keep them
-separable. Uses the fake backend, so no hardware is needed.
-"""
+"""End-to-end tests for the server-side ``bioview-raw-v3`` recorder."""
 
 import json
 import struct
@@ -41,11 +36,7 @@ def _fake_group(name, samp_rate, num_channels, save_ds, signal_freq=1.0):
 
 
 def read_bvr(path):
-    """Parse a v3 file into (header, per-device records, trailer).
-
-    Records come back as ``{device_id: [(sample_idx, t_offset_us, block), ...]}``
-    in file order.
-    """
+    """Parse a v3 file into (header, per-device records, trailer)."""
     blob = path.read_bytes()
     assert blob[:4] == BVR3_MAGIC, "not a bioview-raw-v3 file"
     (header_len,) = struct.unpack("!I", blob[4:8])
@@ -145,16 +136,13 @@ def test_two_devices_at_different_rates_stay_separable(client, tmp_path):
     slow = records["SlowDev"]
     assert fast and slow, "both devices must have written records"
 
-    # Each device's rows are its own; nothing is interleaved into a shared width.
     assert all(b.shape[0] == 2 for _i, _t, b in fast)
     assert all(b.shape[0] == 3 for _i, _t, b in slow)
 
     fast_samples = sum(b.shape[1] for _i, _t, b in fast)
     slow_samples = sum(b.shape[1] for _i, _t, b in slow)
-    # 10x the save rate means ~10x the samples over the same wall-clock window.
     assert fast_samples > slow_samples * 5, (fast_samples, slow_samples)
 
-    # Sample counters are contiguous per device, so the file proves no gaps.
     for blocks in (fast, slow):
         expected = 0
         for sample_idx, _t, block in blocks:
@@ -180,8 +168,6 @@ def test_saved_rate_follows_save_ds_not_disp_ds(client, tmp_path):
     samples = sum(b.shape[1] for _i, _t, b in records["FakeA"])
     elapsed_s = trailer["t_end_offset_us"] / 1e6
     achieved = samples / elapsed_s
-    # Must land near samp_rate/save_ds (250 Hz), nowhere near
-    # samp_rate/(save_ds*disp_ds) (25 Hz), which is the display rate.
     assert 150 < achieved < 350, achieved
 
 
@@ -198,7 +184,6 @@ def test_signal_content_is_intact(client, tmp_path):
 
     row = joined[0].astype(np.float64)
     assert np.isfinite(row).all()
-    # A clean sine is smooth sample-to-sample; interleaving would destroy this.
     assert np.corrcoef(row[:-1], row[1:])[0, 1] > 0.9
     assert 0.9 < np.abs(row).max() <= 1.01
 
@@ -208,7 +193,6 @@ def test_annotations_and_offsets_are_relative(client, tmp_path):
     path = _record(client, tmp_path, groups, label="RunA")
 
     header, _records, trailer = read_bvr(path)
-    # Only t0 is absolute; every other time in the file is an offset from it.
     assert "t0_unix" in header and "t0_utc" in header
     assert trailer["t_end_offset_us"] > 0
     assert isinstance(trailer["Annotations"], list)
@@ -232,3 +216,52 @@ def test_no_recording_without_a_file_name(client, tmp_path):
     client.command(Command.STOP_STREAMING, {})
 
     assert list(tmp_path.glob("*.bvr")) == []
+
+
+def _record_for(client, tmp_path, groups, duration, wall_seconds):
+    """One run of a routine of `duration` seconds, stopped `wall_seconds` in."""
+    resp_type, _ = client.device_command(
+        Command.INITIALIZE_DEVICES, {"device_groups": groups}
+    )
+    assert resp_type == Response.SUCCESS.name
+
+    resp_type, payload = client.command(
+        Command.START_STREAMING,
+        {
+            "Experiment": {
+                "type": "EXPERIMENT",
+                "file_name": "session.bvr",
+                "save_dir": str(tmp_path),
+                "record_duration_s": duration,
+            },
+            **groups,
+        },
+    )
+    assert resp_type == Response.SUCCESS.name, payload
+
+    time.sleep(wall_seconds)
+
+    resp_type, payload = client.command(Command.STOP_STREAMING, {})
+    assert resp_type == Response.SUCCESS.name, payload
+
+    files = sorted(tmp_path.glob("*.bvr"))
+    return files[-1]
+
+
+def test_a_routine_length_survives_a_ragged_stop(client, tmp_path):
+    """Two runs of the same routine must produce identically sized files.
+
+    The stop lands wherever the routine timer, the command round trip and the
+    device spin-up put it, so before the recorder held a sample budget the two
+    runs differed by however many samples arrived in between.
+    """
+    groups = _fake_group("FakeA", samp_rate=1000, num_channels=2, save_ds=1)
+
+    sizes = []
+    for wall in (1.4, 1.9):
+        path = _record_for(client, tmp_path, groups, duration=1.0, wall_seconds=wall)
+        _header, records, trailer = read_bvr(path)
+        sizes.append(sum(b.shape[1] for _i, _t, b in records["FakeA"]))
+        assert trailer["devices"][0]["sample_limit"] == 1000
+
+    assert sizes == [1000, 1000], sizes

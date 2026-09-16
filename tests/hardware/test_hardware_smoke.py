@@ -1,12 +1,4 @@
-"""End-to-end smoke test against physically attached devices.
-
-For every backend that reports devices: discover, initialize, stream briefly,
-stop, disconnect -- asserting the process survives each step and leaves nothing
-behind. The point is not signal quality (that is the fake-backend suite's job)
-but that the lifecycle is crash-free and terminates cleanly on real hardware.
-
-Run with:  pytest tests/hardware --hardware
-"""
+"""End-to-end smoke test against physically attached devices."""
 
 import contextlib
 import multiprocessing as mp

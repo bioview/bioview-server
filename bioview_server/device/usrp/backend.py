@@ -7,12 +7,9 @@ import time
 
 os.environ["UHD_LOG_LEVEL"] = "error"
 
-# See the note in receive.py: the backend module must import without UHD so
-# its pure-logic paths stay reachable (and testable) on machines and CI
-# runners with no driver. Every uhd use below is inside a function.
 try:
     import uhd
-except ImportError:  # pragma: no cover - no USRP driver installed
+except ImportError:  # pragma: no cover
     uhd = None
 from bioview_common import (
     RX_QUEUE_DEPTH,
@@ -51,6 +48,34 @@ SETTLING_TIME = 0.3
 FILLING_TIME = 0.35
 RX_TX_PARAMS = {"rx_gain"}
 
+FILTER_PARAMS = frozenset({"if_filter_bw", "if_filter_type", "if_filter_order"})
+
+DISPLAY_FILTER_PARAMS = frozenset(
+    {
+        "disp_filter_btype",
+        "disp_filter_low",
+        "disp_filter_high",
+        "disp_filter_order",
+    }
+)
+
+RETUNE_PARAMS = frozenset({"carrier_freq", "samp_rate"})
+
+
+def disable_rx_agc(usrp, chan: int, logger=None) -> bool:
+    """Pin one Rx channel to manual gain, and say so in the log."""
+    try:
+        usrp.set_rx_agc(False, chan)
+    except Exception as e:  # pragma: no cover
+        log_print(
+            logger,
+            "debug",
+            f"[USRP] Rx{chan} has no AGC control ({e}); gain is manual.",
+        )
+        return False
+    log_print(logger, "debug", f"[USRP] Rx{chan} AGC explicitly disabled (manual gain)")
+    return True
+
 
 def initialize_usrp_device(
     serial,
@@ -68,8 +93,6 @@ def initialize_usrp_device(
     wire_format,
     logger=None,
 ):
-    # Deferred: .utils imports uhd unconditionally (device/__init__ uses that
-    # import to decide whether the USRP backend is available at all).
     from .utils import check_channels, setup_pps, setup_ref
 
     usrp = uhd.usrp.MultiUSRP(f"serial={serial},num_recv_frames=1024")
@@ -99,6 +122,7 @@ def initialize_usrp_device(
     for idx, chan in enumerate(rx_channels):
         usrp.set_rx_rate(samp_rate, chan)
         usrp.set_rx_freq(tune, chan)
+        disable_rx_agc(usrp, chan, logger)
         usrp.set_rx_gain(rx_gain[idx], chan)
         usrp.set_rx_antenna("RX2", chan)
 
@@ -157,8 +181,6 @@ class USRPBackend(Backend):
         self.tx_command_queue = {}
         self.receive_workers = {}
         self.rx_command_queue = {}
-        # Built by _initialize(); _display_sources() already reads it as
-        # possibly-None, so it must exist before the device is connected.
         self.process_worker = None
         self.schemes_by_device = {}
         self.global_tx_to_device = {}
@@ -192,37 +214,19 @@ class USRPBackend(Backend):
 
         self.populate_data_sources()
 
-    #: Rebuilt in the child rather than shipped to it; see _init_local_state.
     _LOCAL_STATE_KEYS = ("_gain_lock",)
 
     def _init_local_state(self):
         super()._init_local_state()
-        # The gain lists are group-wide but written per channel, and a
-        # parallel balance has one thread per radio writing them at once. The
-        # lock covers the read-modify-write and the hardware apply that
-        # follows it, which re-sends the *whole* list. A lock cannot be
-        # pickled, so it is created on each side of the spawn rather than
-        # shipped: without this the whole handler failed to pickle and the
-        # group came up Unavailable.
         self._gain_lock = threading.Lock()
 
     def get_display_frequency(self) -> float:
-        """Rate (Hz) at which the pipeline emits display samples.
-
-        ProcessWorker averages ``save_ds`` raw samples per output point and the
-        display path drops that again by ``display_ds``. The client sizes its
-        plot ring buffer from this number, so anything else makes the trace
-        scroll at the wrong speed.
-        """
+        """Rate (Hz) at which the pipeline emits display samples."""
         divisor = max(1, int(self.save_ds)) * max(1, int(self.display_ds))
         return float(self.samp_rate) / divisor
 
     def get_save_freq(self) -> float:
-        """Saved rate: ProcessWorker averages ``save_ds`` raw samples per point.
-
-        The display path decimates this again by ``display_ds``; the recording
-        keeps the undecimated save stream.
-        """
+        """Saved rate: ProcessWorker averages ``save_ds`` raw samples per point."""
         return float(self.samp_rate) / max(1, int(self.save_ds))
 
     def populate_data_sources(self):
@@ -311,8 +315,6 @@ class USRPBackend(Backend):
                     "error",
                     f"Unable to resolve serial for {device_name}",
                 )
-                # Raised, not returned: upstream turns a falsy result into a
-                # generic failure message, losing which device went wrong.
                 raise RuntimeError(
                     f"could not resolve the serial number for {device_name}. "
                     "Check that the radio is attached and powered on"
@@ -348,8 +350,6 @@ class USRPBackend(Backend):
                     )
 
                 self.usrp_handlers[device_name] = response["usrp"]
-                # Bounded: an unbounded queue grows without limit whenever the
-                # ProcessWorker falls behind.
                 self.rx_data_queue[device_name] = queue.Queue(maxsize=RX_QUEUE_DEPTH)
                 self.rx_command_queue[device_name] = queue.Queue()
 
@@ -401,6 +401,12 @@ class USRPBackend(Backend):
             samp_rate=self.samp_rate,
             channel_ifs=self.channel_ifs,
             if_filter_bw=self.if_filter_bw,
+            if_filter_type=self.group_config.get("if_filter_type", "ellip"),
+            if_filter_order=self.group_config.get("if_filter_order", 2),
+            disp_filter_btype=self.group_config.get("disp_filter_btype", "off"),
+            disp_filter_low=self.group_config.get("disp_filter_low", 0.5),
+            disp_filter_high=self.group_config.get("disp_filter_high", 40.0),
+            disp_filter_order=self.group_config.get("disp_filter_order", 2),
             rx_queues=self.rx_data_queue,
             rx_device_order=self.rx_device_order,
             schemes_by_device=self.schemes_by_device,
@@ -426,8 +432,6 @@ class USRPBackend(Backend):
         self.process_worker.save_iq = self.save_iq
         self.process_worker.save_ds = self.save_ds
         self.process_worker.save_queue = self.save_queue
-        # save_ds sets the display rate too, so the advertised disp_freq has to
-        # follow it or the client keeps sizing buffers for the old rate.
         self._refresh_display_frequency()
 
     def _refresh_display_frequency(self):
@@ -459,22 +463,6 @@ class USRPBackend(Backend):
         return workers
 
     def _start_streaming(self):
-        # Every thread is created before *any* of them is resumed, and the two
-        # halves are not interleaved.
-        #
-        # `Thread.start()` does not return until the new thread has been
-        # scheduled and has run far enough to set its started event, and it
-        # waits for that without a timeout. Starting a thread after the
-        # transmit and receive threads are already spinning inside UHD means
-        # queueing for the GIL behind two tight native loops, and the start
-        # does not complete: the backend never answers START_STREAMING, the
-        # server times out after 90 s and tears down every other device in the
-        # session, so a working BIOPAC plots nothing either.
-        #
-        # Workers are constructed paused (``PausableWorker(running=False)``),
-        # so bringing them all up first costs nothing and leaves `resume()` as
-        # a bare `Event.set()` with no scheduling to wait on. The steps are
-        # traced because a stall here names no line by itself.
         step = self._StepTimer(self.logger, "start_streaming")
 
         for label, worker in self._workers_in_start_order():
@@ -482,9 +470,6 @@ class USRPBackend(Backend):
                 worker.start()
             step.mark(f"{label} thread up")
 
-        # Resume order, unlike start order, is load-bearing: the process worker
-        # drains the Rx queues, and DPIC balance has no metrics to read until it
-        # has produced some.
         for worker in self.transmit_workers.values():
             worker.resume()
         for worker in self.receive_workers.values():
@@ -496,8 +481,6 @@ class USRPBackend(Backend):
         time.sleep(FILLING_TIME)
         step.mark("filling delay")
 
-        # The current calibration state, not the config's start-up value: the
-        # overlay is toggled at runtime and would be reset on every Start.
         self._set_calibration_enabled(self._cal_enabled)
         step.mark("calibration state")
 
@@ -507,9 +490,16 @@ class USRPBackend(Backend):
             self.display_worker.resume()
         step.mark("consumers running")
 
+        self._record_gain_baseline()
+
         step.done()
 
         return True
+
+    def _record_gain_baseline(self):
+        """Timestamp the gains this session starts at, before anything moves them."""
+        self.record_param_change("rx_gain", list(self.rx_gains_global))
+        self.record_param_change("tx_gain", list(self.tx_gains_global))
 
     def _stop_streaming(self):
         if self.display_worker:
@@ -527,40 +517,22 @@ class USRPBackend(Backend):
     def _post_start_streaming(self):
         dpic_cfg = self.group_config.get("dpic_balance", {})
         if dpic_cfg.get("auto_on_start") and self.dpic_pairs:
-            # On its own thread, like a requested balance: this runs after the
-            # START_STREAMING reply but still on the command loop, so calling
-            # the search inline here left Stop unservable for its duration.
             self._start_balance_thread()
 
     def _set_calibration_enabled(self, enabled: bool):
-        """Toggle the calibration overlay through the Tx command queues.
-
-        Mutating ``scheme`` from this thread would race the transmit threads and
-        would also leave ``TransmitWorker._use_cyclic`` stale -- with a stale
-        flag the worker keeps replaying its pre-built cyclic buffer and the
-        calibration bursts never reach the air.
-        """
+        """Toggle the calibration overlay through the Tx command queues."""
         enabled = bool(enabled)
         for q in self.tx_command_queue.values():
             q.put({"param": "calibration.enabled", "value": enabled})
         self._cal_enabled = enabled
 
     def _apply_channel_if(self, global_tx: int, freq: float):
-        """Move one Tx onto ``freq``, everywhere the IF is held.
-
-        Four places, all of which must agree or the tone is generated at one
-        frequency and looked for at another: the backend's own list (shared by
-        reference with the ProcessWorker), the ProcessWorker's band-pass, the
-        transmit workers' waveform generators, and the config the client reads
-        back.
-        """
+        """Move one Tx onto ``freq``, everywhere the IF is held."""
         freq = float(freq)
         self.channel_ifs[global_tx] = freq
         if global_tx < len(self.registry.tx_if_freq):
             self.registry.tx_if_freq[global_tx] = freq
 
-        # Config, so the settings panel and a saved config show the IF the
-        # radio is actually driven at.
         dev_name, local = self.global_tx_to_device[global_tx]
         hw = self.hardware.get(dev_name)
         if hw is not None:
@@ -574,22 +546,11 @@ class USRPBackend(Backend):
         if self.process_worker is not None:
             self.process_worker.set_channel_if(global_tx, freq)
 
-        # Whole-group list: each transmit worker slices its own window out of
-        # it, so every device has to be told.
         for q in self.tx_command_queue.values():
             q.put({"param": "if_freq", "value": list(self.channel_ifs)})
 
     def _coerce_dpic_inject_frequencies(self):
-        """Put every inject Tx on its measure Tx's IF before balancing.
-
-        The receive chain band-passes around the measure Tx's IF, so an inject
-        Tx anywhere else is rejected by that filter and no phase/amplitude can
-        cancel the direct path (see the rule in ENGINEERING_NOTES 3.5). A
-        mismatch used to be reported as an error and the balance ran anyway,
-        sweeping 241 points against a tone the Rx could not see; the frequency
-        is a consequence of which pair is being cancelled, not an independent
-        setting, so it is coerced rather than complained about.
-        """
+        """Put every inject Tx on its measure Tx's IF before balancing."""
         num_tx = len(self.channel_ifs)
         for pair in self.dpic_pairs:
             if pair.inject_tx >= num_tx or pair.measure_tx >= num_tx:
@@ -624,7 +585,6 @@ class USRPBackend(Backend):
             inject_if = self.channel_ifs[pair.inject_tx]
             measure_if = self.channel_ifs[pair.measure_tx]
             if abs(inject_if - measure_if) > 1e-6:
-                # Only reachable if the coercion above could not run.
                 log_print(
                     self.logger,
                     "error",
@@ -659,11 +619,7 @@ class USRPBackend(Backend):
             return (0.0, 89.75)
 
     def _set_global_rx_gain(self, global_rx: int, value: float):
-        """Apply one Rx channel's analog gain, keeping the group list in step.
-
-        The command carries the whole global list because that is what the
-        ReceiveWorker's ``rx_gain`` handler consumes.
-        """
+        """Apply one Rx channel's analog gain, keeping the group list in step."""
         entry = self.global_rx_to_device.get(global_rx)
         if entry is None or global_rx >= len(self.rx_gains_global):
             return
@@ -675,6 +631,7 @@ class USRPBackend(Backend):
                 self.hardware, "rx_gain", gains, self.group_config, kind="rx"
             )
             self.rx_command_queue[dev_name].put({"param": "rx_gain", "value": gains})
+        self.record_param_change("rx_gain", gains)
 
     def _set_global_tx_gain(self, global_tx: int, value: float):
         """Apply one Tx channel's analog gain through its transmit worker."""
@@ -683,14 +640,16 @@ class USRPBackend(Backend):
         dev_name, _local = self.global_tx_to_device[global_tx]
         with self._gain_lock:
             self.tx_gains_global[global_tx] = float(value)
+            gains = list(self.tx_gains_global)
             apply_global_values_to_hardware(
                 self.hardware,
                 "tx_gain",
-                list(self.tx_gains_global),
+                gains,
                 self.group_config,
                 kind="tx",
             )
         self.transmit_workers[dev_name].set_global_tx_param(global_tx, "gain", value)
+        self.record_param_change("tx_gain", gains)
 
     def _build_dpic_channel(self, pair, dpic_cfg) -> DpicChannel:
         settle_s = float(dpic_cfg.get("settle_time_s", 0.02))
@@ -699,9 +658,6 @@ class USRPBackend(Backend):
 
         dev_name, _ = self.global_tx_to_device[pair.inject_tx]
         worker = self.transmit_workers[dev_name]
-        # Metric freshness timeout: the longest dwell the balancer can ask for,
-        # plus slack, so a silent path fails fast without a slow chunk reading
-        # as "no data".
         read_timeout = max(2.0, settle_s * 8, float(dpic_cfg.get("read_timeout_s", 0)))
 
         rx_entry = self.global_rx_to_device.get(measure_rx)
@@ -712,23 +668,16 @@ class USRPBackend(Backend):
             inject_tx=pair.inject_tx,
             measure_tx=measure_tx,
             measure_rx=measure_rx,
-            # The radio the loop lives on, so ``balance_all`` can run one lane
-            # per radio at the same time. The inject Tx names it: that is the
-            # channel the search actually drives.
             device=dev_name,
             set_phase=lambda v: worker.set_global_tx_param(pair.inject_tx, "phase", v),
             set_amplitude=lambda v: worker.set_global_tx_param(
                 pair.inject_tx, "amplitude", v
             ),
             get_gain=lambda: self._get_inject_gain(pair.inject_tx),
-            # Waits for chunks captured *after* the change, so the search is
-            # never biased by the Rx buffering latency.
             read_metric=lambda: self.process_worker.wait_for_metric(
                 measure_tx, measure_rx, min_new=2, timeout=read_timeout
             ),
-            # The balancer names the dwell; the VI's per-point waits.
             wait_settle=time.sleep,
-            # The VI's gain stage moves the measure Tx and the Rx together.
             get_rx_gain=lambda: float(self.rx_gains_global[measure_rx]),
             set_rx_gain=lambda v: self._set_global_rx_gain(measure_rx, v),
             get_tx_gain=lambda: float(self.tx_gains_global[measure_tx]),
@@ -763,22 +712,15 @@ class USRPBackend(Backend):
             log_print(self.logger, "error", f"[DPIC] {message}")
             return {"ok": False, "message": message, "results": []}
 
-        # Before validation: the IF mismatch it warns about is the one this
-        # resolves, and before the settle below, so the retuned waveform is on
-        # the air by the time the first metric is read.
         self._coerce_dpic_inject_frequencies()
         self._validate_dpic_pairs()
 
         dpic_cfg = self.group_config.get("dpic_balance", {})
         settle_s = float(dpic_cfg.get("settle_time_s", 0.02))
 
-        # The calibration overlay modulates the amplitude the search minimizes,
-        # so it is disabled for the duration and restored to its actual state.
         prev_cal = self._cal_enabled
         if prev_cal:
             self._set_calibration_enabled(False)
-        # One settle covers both the calibration overlay coming off and any IF
-        # coercion above landing on the next transmit buffer.
         time.sleep(settle_s)
 
         balancer = build_balancer(
@@ -815,30 +757,15 @@ class USRPBackend(Backend):
         return set(self.mimo_sources) | set(self.cal_ref_sources)
 
     def _display_sources(self):
-        """Rows the ProcessWorker emits, in channel order.
-
-        Cal-ref sources are advertised by ``get_data_sources()``, so they must
-        appear in the display payload too or their plots never get a row.
-        """
+        """Rows the ProcessWorker emits, in channel order."""
         sources = list(self.mimo_sources)
         if self.process_worker is None or self.process_worker.record_cal_ref:
             sources += list(self.cal_ref_sources)
         return sorted(sources, key=lambda s: s.channel)
 
     def _reload_channel_map(self, channel_map):
-        """Rebuild everything the channel map decides, in place.
-
-        DPIC pairs are *specified* in the channel map, and the channel map is
-        edited in the settings panel -- so this is the path a pair actually
-        arrives by. It used to fall through `_queue_param_update` untouched:
-        the value never reached `group_config`, `populate_data_sources()` was
-        never re-run, and `dpic_pairs` kept whatever the config file had at
-        connect time. Adding a pair in the UI and pressing Balance therefore
-        reported "No DPIC pairs are configured".
-        """
+        """Rebuild everything the channel map decides, in place."""
         if self._streaming.is_set():
-            # The map decides how many rows the pipeline emits, so changing it
-            # mid-recording would desynchronise the file from its own header.
             log_print(
                 self.logger,
                 "error",
@@ -849,12 +776,6 @@ class USRPBackend(Backend):
 
         self.group_config["channel_map"] = channel_map
 
-        # Schemes are a function of `hardware`, which a channel-map edit never
-        # touches, and the live transmit workers hold these exact objects --
-        # letting populate_data_sources() replace them would leave the workers
-        # driving detached schemes while the ProcessWorker demodulated against
-        # the new ones. Same for the runtime gains, which auto-gain moves
-        # without writing back to `hardware`.
         preserved_schemes = dict(self.schemes_by_device)
         preserved_rx_gains = list(self.rx_gains_global)
         preserved_tx_gains = list(self.tx_gains_global)
@@ -888,13 +809,7 @@ class USRPBackend(Backend):
         return True
 
     def _apply_param_update_local(self, params):
-        """Parent-side mirror of the channel map.
-
-        ``get_data_sources()`` is answered out of the parent process, and the
-        parent's own `dpic_pairs` is what the balance command is dispatched
-        against, so the new map has to land here as well as in the child.
-        There are no workers on this side, so the plain rebuild is enough.
-        """
+        """Parent-side mirror of the channel map."""
         channel_map = (params or {}).get("channel_map")
         if isinstance(channel_map, dict):
             self.group_config["channel_map"] = channel_map
@@ -903,9 +818,22 @@ class USRPBackend(Backend):
     def _queue_param_update(self, params):
         for param, value in (params or {}).items():
             if param == "channel_map" and isinstance(value, dict):
-                # Not forwarded to a worker queue: nothing down there reads it,
-                # and everything it decides is rebuilt here.
                 self._reload_channel_map(value)
+                continue
+
+            if param in RETUNE_PARAMS:
+                if param == "carrier_freq":
+                    self._apply_carrier_freq(value)
+                else:
+                    self._apply_samp_rate(value)
+                continue
+
+            if param in FILTER_PARAMS:
+                self._apply_filter_param(param, value)
+                continue
+
+            if param in DISPLAY_FILTER_PARAMS:
+                self._apply_display_filter_param(param, value)
                 continue
 
             if param == "calibration.enabled":
@@ -945,6 +873,267 @@ class USRPBackend(Backend):
             for _device_key, q in queues:
                 q.put({"param": param, "value": value})
 
+    def _radio_param_refused(
+        self, param: str, value: float, unit: str, current: float
+    ) -> bool:
+        """True if the group is streaming, having said so."""
+        if not self._streaming.is_set():
+            return False
+        log_print(
+            self.logger,
+            "error",
+            f"[USRP] Refused {param}={value:g} {unit}: the group is streaming. "
+            f"Stop the recording first; the radio is still at "
+            f"{current:g} {unit}.",
+        )
+        return True
+
+    def _store_radio_param(self, param: str, value: float):
+        """Record a front-end setting everywhere a later connect reads it."""
+        self.group_config[param] = value
+        for hw in (self.hardware or {}).values():
+            hw[param] = value
+        if self.hardware:
+            self.group_config["hardware"] = self.hardware
+        for cfg in self.usrp_configs.values():
+            cfg.set_param(param, value)
+
+    def _apply_carrier_freq(self, value) -> bool:
+        """Retune every radio in the group to a new carrier, or say why not."""
+        freq = _as_positive_float(value)
+        if freq is None:
+            log_print(
+                self.logger,
+                "error",
+                f"[USRP] Ignored carrier_freq={value!r}: not a frequency.",
+            )
+            return False
+        current = float(self.group_config.get("carrier_freq", 0.0))
+        if self._radio_param_refused("carrier_freq", freq, "Hz", current):
+            return False
+
+        self._store_radio_param("carrier_freq", freq)
+
+        tuned = []
+        for device_name, usrp in self._open_radios():
+            cfg = self.usrp_configs[device_name]
+            tune = uhd.types.TuneRequest(freq)
+            try:
+                for chan in cfg.get_param("rx_channels"):
+                    usrp.set_rx_freq(tune, chan)
+                for chan in cfg.get_param("tx_channels"):
+                    usrp.set_tx_freq(tune, chan)
+            except Exception as e:
+                log_print(
+                    self.logger,
+                    "error",
+                    f"[USRP] {device_name} refused carrier {freq / 1e6:.3f} MHz: {e}",
+                )
+                continue
+            try:
+                actual = float(usrp.get_rx_freq(cfg.get_param("rx_channels")[0]))
+            except Exception:
+                actual = freq
+            tuned.append(f"{device_name} {actual / 1e6:.3f} MHz")
+
+        if tuned:
+            log_print(
+                self.logger,
+                "info",
+                f"[USRP] Carrier retuned to {freq / 1e6:.3f} MHz: {', '.join(tuned)}",
+            )
+        else:
+            log_print(
+                self.logger,
+                "info",
+                f"[USRP] Carrier set to {freq / 1e6:.3f} MHz; applied on connect.",
+            )
+        return True
+
+    def _open_radios(self):
+        """The radios currently held open, as (name, handle) pairs."""
+        return [
+            (name, usrp) for name, usrp in self.usrp_handlers.items() if usrp is not None
+        ]
+
+    def _set_radio_rates(self, rate: float):
+        """Program the sample rate onto every open radio."""
+        rate = float(rate)
+        open_radios = self._open_radios()
+        if not open_radios:
+            return rate
+
+        actual = None
+        for device_name, usrp in open_radios:
+            cfg = self.usrp_configs[device_name]
+            try:
+                for chan in cfg.get_param("rx_channels"):
+                    usrp.set_rx_rate(rate, chan)
+                for chan in cfg.get_param("tx_channels"):
+                    usrp.set_tx_rate(rate, chan)
+                device_rate = float(usrp.get_rx_rate(cfg.get_param("rx_channels")[0]))
+            except Exception as e:
+                log_print(
+                    self.logger,
+                    "error",
+                    f"[USRP] {device_name} refused {rate / 1e6:.4f} MSps: {e}",
+                )
+                continue
+            if actual is None:
+                actual = device_rate
+            elif abs(device_rate - actual) > 1.0:
+                log_print(
+                    self.logger,
+                    "warning",
+                    f"[USRP] {device_name} landed on {device_rate / 1e6:.4f} MSps "
+                    f"while the group is at {actual / 1e6:.4f} MSps; the whole "
+                    "group is demodulated at the latter.",
+                )
+        return actual
+
+    def _apply_samp_rate(self, value) -> bool:
+        """Re-rate the whole group: radios, schemes, filters and plot axis."""
+        rate = _as_positive_float(value)
+        if rate is None:
+            log_print(
+                self.logger,
+                "error",
+                f"[USRP] Ignored samp_rate={value!r}: not a sample rate.",
+            )
+            return False
+        if self._radio_param_refused("samp_rate", rate, "Sps", self.samp_rate):
+            return False
+
+        previous = float(self.samp_rate)
+        actual = self._set_radio_rates(rate)
+        if actual is None:
+            return False
+
+        try:
+            if self.process_worker is not None:
+                self.process_worker.set_samp_rate(actual)
+        except Exception as e:
+            log_print(
+                self.logger,
+                "error",
+                f"[USRP] Rejected {actual / 1e6:.4f} MSps: {e}. The group is "
+                f"still at {previous / 1e6:.4f} MSps.",
+            )
+            self._set_radio_rates(previous)
+            return False
+
+        self.samp_rate = actual
+        self._store_radio_param("samp_rate", actual)
+
+        for scheme in self.schemes_by_device.values():
+            scheme.set_samp_rate(actual)
+        for worker in self.transmit_workers.values():
+            if worker is not None:
+                worker.set_samp_rate(actual)
+
+        self._refresh_display_frequency()
+
+        log_print(
+            self.logger,
+            "info",
+            f"[USRP] Sample rate now {actual / 1e6:.4f} MSps "
+            f"(saved at {self.get_save_freq():.1f} Hz, displayed at "
+            f"{self.get_display_frequency():.1f} Hz)"
+            + ("" if self._open_radios() else "; applied on connect"),
+        )
+        return True
+
+    def _apply_display_filter_param(self, param: str, value):
+        """Retune the display-only filter live. The recording is unaffected."""
+        if self.process_worker is None:
+            self.group_config[param] = value
+            return
+
+        kwarg = {
+            "disp_filter_btype": "btype",
+            "disp_filter_low": "low",
+            "disp_filter_high": "high",
+            "disp_filter_order": "order",
+        }[param]
+        try:
+            changed = self.process_worker.set_display_filter(**{kwarg: value})
+        except Exception as e:
+            log_print(
+                self.logger,
+                "error",
+                f"[USRP] Rejected {param}={value!r}: {e}. The previous display "
+                "filter is still running.",
+            )
+            return
+
+        self.group_config[param] = value
+        if changed:
+            worker = self.process_worker
+            shape = (
+                "off"
+                if worker.disp_filter_btype not in ("low", "high", "band")
+                else f"{worker.disp_filter_btype}-pass order "
+                f"{worker.disp_filter_order} at "
+                + (
+                    f"{worker.disp_filter_low:g}-{worker.disp_filter_high:g} Hz"
+                    if worker.disp_filter_btype == "band"
+                    else f"{worker.disp_filter_low:g} Hz"
+                    if worker.disp_filter_btype == "high"
+                    else f"{worker.disp_filter_high:g} Hz"
+                )
+            )
+            log_print(
+                self.logger,
+                "info",
+                f"[USRP] Display filter updated: {shape} "
+                f"(display rate {worker.get_display_rate():.1f} Hz); "
+                "recordings are unchanged",
+            )
+
+    def _apply_filter_param(self, param: str, value):
+        """Retune the IF band-pass live, or say why the request was refused."""
+        if self.process_worker is None:
+            self.group_config[param] = value
+            if param == "if_filter_bw":
+                self.if_filter_bw = _as_bandwidth_list(value, len(self.channel_ifs))
+            return
+
+        kwargs = {
+            "if_filter_bw": "bandwidths",
+            "if_filter_type": "ftype",
+            "if_filter_order": "order",
+        }[param]
+        try:
+            changed = self.process_worker.set_filter_params(**{kwargs: value})
+        except Exception as e:
+            log_print(
+                self.logger,
+                "error",
+                f"[USRP] Rejected {param}={value!r}: {e}. The previous IF "
+                "filter is still running.",
+            )
+            return
+
+        self.group_config[param] = value
+        self.if_filter_bw = list(self.process_worker.if_filter_bw)
+        if param == "if_filter_bw" and self.hardware:
+            apply_global_values_to_hardware(
+                self.hardware,
+                "if_filter_bw",
+                self.if_filter_bw,
+                self.group_config,
+                kind="tx",
+            )
+            self.group_config["hardware"] = self.hardware
+        if changed:
+            log_print(
+                self.logger,
+                "info",
+                f"[USRP] IF filter updated: {self.process_worker.if_filter_type} "
+                f"order {self.process_worker.if_filter_order}, "
+                f"bandwidths {self.process_worker.if_filter_bw}",
+            )
+
     def _disconnect(self):
         self.stop_streaming()
         for device_key in list(self.usrp_handlers.keys()):
@@ -957,6 +1146,28 @@ class USRPBackend(Backend):
         drain(self.display_queue)
         drain(self.save_queue)
         return True
+
+
+def _as_positive_float(value):
+    """A positive, finite float -- or None for anything that is not one."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not number > 0 or number == float("inf"):
+        return None
+    return number
+
+
+def _as_bandwidth_list(value, count: int) -> list[float]:
+    """A per-Tx bandwidth list from either a scalar or a list."""
+    if isinstance(value, list | tuple):
+        values = [float(v) for v in value]
+    else:
+        values = [float(value)] * count
+    while len(values) < count:
+        values.append(values[-1] if values else 5e3)
+    return values[:count]
 
 
 def build_hardware_dict_from_group(group_config, devices: dict, group_id: str) -> dict:

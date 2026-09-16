@@ -8,9 +8,7 @@ from datetime import datetime, timedelta
 import uhd
 from bioview_common import DISCOVERY_CACHE_TTL, DeviceType, log_print
 
-# Name/serial bookkeeping lives in naming.py so it stays importable (and
-# testable) without the UHD driver.
-from .naming import (  # noqa: F401  - re-exported for existing callers
+from .naming import (  # noqa: F401
     apply_alias,
     get_device_aliases,
     get_usrp_address,
@@ -28,13 +26,11 @@ if not hasattr(uhd, "usrp"):
     )
 
 
-CLOCK_TIMEOUT = 1000  # 1000ms timeout for external clock locking
+CLOCK_TIMEOUT = 1000
 
 _discovery_cache: dict[str, dict] = {}
 _discovery_cache_ts = 0.0
 
-# ``uhd.find()`` is not safe to call concurrently: overlapping calls have
-# taken the process down. The lock also makes the cache read/refresh atomic.
 _discovery_lock = threading.Lock()
 
 
@@ -105,7 +101,6 @@ def setup_pps(usrp, pps, num_mboards, logger=None):
                 f"{num_mboards} boards",
             )
             return False
-        # make mboard 1 a slave over the MIMO Cable
         usrp.set_time_source("mimo", 1)
     else:
         usrp.set_time_source(pps)
@@ -127,7 +122,6 @@ def setup_ref(usrp, ref, num_mboards, logger=None):
     else:
         usrp.set_clock_source(ref)
 
-    # Lock onto clock signals for all mboards
     if ref != "internal":
         log_print(logger, "debug", "Now confirming lock on clock signals...")
         end_time = datetime.now() + timedelta(milliseconds=CLOCK_TIMEOUT)
@@ -149,15 +143,11 @@ def setup_ref(usrp, ref, num_mboards, logger=None):
 
 
 def check_channels(usrp, rx_channels, tx_channels, logger=None):
-    # Check that each Rx channel specified is less than the total number
-    # of rx channels that the device can support
     dev_rx_channels = usrp.get_rx_num_channels()
     if not all(map((lambda chan: chan < dev_rx_channels), rx_channels)):
         log_print(logger, "warning", "Invalid RX channel(s) specified.")
         return [], []
 
-    # Check that each Tx channel specified is less than the total number
-    # of tx channels that the device can support
     dev_tx_channels = usrp.get_tx_num_channels()
     if not all(map((lambda chan: chan < dev_tx_channels), tx_channels)):
         log_print(logger, "warning", "Invalid TX channel(s) specified.")

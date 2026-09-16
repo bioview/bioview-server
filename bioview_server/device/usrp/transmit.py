@@ -3,19 +3,17 @@ import queue
 import numpy as np
 
 
-# Optional at import time so this module (and the backend that imports it)
-# loads on machines without the UHD driver -- uhd is only touched once a
-# radio is actually streaming. Backend availability is decided in
-# device/__init__, which imports usrp/utils.py and its hard uhd import.
 try:
     import uhd
-except ImportError:  # pragma: no cover - no USRP driver installed
+except ImportError:  # pragma: no cover
     uhd = None
 from bioview_common import PausableWorker, log_print
 from bioview_common.signal_schemes import SignalScheme
 
 
-INIT_DELAY = 0.05  # 50mS initial delay before transmit
+INIT_DELAY = 0.05
+
+MAX_CYCLIC_SAMPLES = 1 << 21
 
 TX_PARAMS = {
     "tx_gain",
@@ -62,21 +60,41 @@ class TransmitWorker(PausableWorker):
 
         self.tx_metadata = None
         self._sample_idx = 0
-        self._use_cyclic = scheme.cycle_length() is not None
         self.tx_waveform = None
         self.tx_buffer_size = self.tx_streamer.get_max_num_samps()
 
+        length = self._cyclic_length()
+        self._use_cyclic = length is not None
         if self._use_cyclic:
-            self._build_cyclic_buffer()
+            self._build_cyclic_buffer(length)
         else:
             self.tx_waveform = np.zeros(
                 (len(tx_channels), self.tx_buffer_size), dtype=np.complex64
             )
 
-    def _build_cyclic_buffer(self):
+    def _cyclic_length(self):
+        """Samples to pre-render, or None to generate the waveform live."""
         period = self.scheme.cycle_length()
-        len_buf = max(period * 20, self.tx_buffer_size)
-        self.tx_waveform = self.scheme.generate(len_buf, 0)
+        if period is None or period <= 0:
+            return None
+
+        least = -(-self.tx_buffer_size // period)
+        if period * least > MAX_CYCLIC_SAMPLES:
+            log_print(
+                self.logger,
+                "warning",
+                f"[USRP] Tx waveform repeats only every {period} samples, so a "
+                f"whole number of cycles will not fit in the "
+                f"{MAX_CYCLIC_SAMPLES}-sample buffer; generating it live "
+                "instead. IF frequencies that divide into the sample rate "
+                "repeat sooner.",
+            )
+            return None
+
+        return period * max(least, min(20, MAX_CYCLIC_SAMPLES // period))
+
+    def _build_cyclic_buffer(self, length: int):
+        self.tx_waveform = self.scheme.generate(length, 0)
 
     def _generate_chunk(self, n: int) -> np.ndarray:
         if self._use_cyclic and self.tx_waveform is not None:
@@ -110,8 +128,6 @@ class TransmitWorker(PausableWorker):
             self.tx_gain = local_gains
         elif param in ("global_tx_phase", "global_tx_amplitude", "global_tx_gain"):
             self._apply_global_tx_param(param, val)
-        # Global Tx indexing, sliced to this device's window. Must precede the
-        # generic TX_PARAMS branch below.
         elif param in ("tx_amplitude", "if_freq", "tx_phase"):
             values = val if isinstance(val, list | tuple) else [val]
             local = list(
@@ -122,20 +138,25 @@ class TransmitWorker(PausableWorker):
             if not local:
                 return
             self.scheme.update_param(param, local)
-            if param == "if_freq":
-                self._refresh_cyclic()
+            self._refresh_cyclic()
         elif param in TX_PARAMS or param.startswith("calibration."):
             self.scheme.update_param(param, val)
-            if param in ("calibration", "calibration.enabled", "signal_scheme"):
-                self._refresh_cyclic()
+            self._refresh_cyclic()
         elif param == "set_calibration_enabled":
             self.scheme.set_calibration_enabled(bool(val))
             self._refresh_cyclic()
 
     def _refresh_cyclic(self):
-        self._use_cyclic = self.scheme.cycle_length() is not None
+        """Re-cut the transmit buffer from the scheme as it stands now."""
+        length = self._cyclic_length()
+        self._use_cyclic = length is not None
         if self._use_cyclic:
-            self._build_cyclic_buffer()
+            self._build_cyclic_buffer(length)
+
+    def set_samp_rate(self, samp_rate: float):
+        """Generate at a new sample rate."""
+        self.samp_rate = float(samp_rate)
+        self._refresh_cyclic()
 
     def _local_idx(self, global_tx_idx: int):
         local_idx = global_tx_idx - self.global_tx_offset
@@ -160,11 +181,7 @@ class TransmitWorker(PausableWorker):
         return None
 
     def set_global_tx_param(self, global_tx_idx: int, param: str, value):
-        """Queue a per-Tx phase/amplitude change.
-
-        Goes through ``cmd_queue``: mutating the scheme directly would race
-        waveform generation in ``work()``.
-        """
+        """Queue a per-Tx phase/amplitude change."""
         if self._local_idx(global_tx_idx) is None:
             return
         if param == "phase":
@@ -176,8 +193,6 @@ class TransmitWorker(PausableWorker):
                 {"param": "global_tx_amplitude", "value": (global_tx_idx, float(value))}
             )
         elif param == "gain":
-            # Analog Tx gain on a single channel. DPIC needs this to reach
-            # direct paths that a digital weight of at most 1.0 cannot cancel.
             self.cmd_queue.put(
                 {"param": "global_tx_gain", "value": (global_tx_idx, float(value))}
             )
@@ -209,6 +224,8 @@ class TransmitWorker(PausableWorker):
             self.usrp.set_tx_gain(float(val), self.tx_channels[local_idx])
             self.tx_gain = list(self.tx_gain)
             self.tx_gain[local_idx] = float(val)
+            return
+        self._refresh_cyclic()
 
     def work(self):
         log_print(self.logger, "debug", "Transmission Started")
@@ -221,8 +238,6 @@ class TransmitWorker(PausableWorker):
         )
 
         while self.is_running:
-            # Drain fully: a DPIC step enqueues phase and amplitude together
-            # and they must land on the same buffer.
             while True:
                 try:
                     current_command = self.cmd_queue.get_nowait()

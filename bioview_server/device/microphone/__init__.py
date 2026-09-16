@@ -7,9 +7,6 @@ from .utils import (
 )
 
 
-#: No Configurator-editable properties on this backend: a host audio input is
-#: named by the operating system and BioView has no say in it. The Configurator
-#: reads this to decide whether the Edit button is available for a device.
 EDITABLE_PROPERTIES = {}
 
 

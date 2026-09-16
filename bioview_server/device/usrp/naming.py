@@ -1,8 +1,4 @@
-"""USRP name/serial bookkeeping. Free of any UHD import, deliberately.
-
-``usrp_serial_numbers`` maps name -> serial; ``usrp_device_aliases`` maps
-serial -> user-assigned name. See bioview-docs/reference/usrp.md.
-"""
+"""USRP name/serial bookkeeping. Free of any UHD import, deliberately."""
 
 from __future__ import annotations
 
@@ -16,12 +12,7 @@ ALIAS_CACHE = "usrp_device_aliases"
 
 
 def _read_cache(name: str, logger=None) -> dict:
-    """Cache contents, or {} when there is none.
-
-    A *missing* cache is normal -- nothing has been named yet. A cache that
-    exists but cannot be read is not: it silently drops every device alias, so
-    it is reported rather than folded into the same empty result.
-    """
+    """Cache contents, or {} when there is none."""
     path = get_cache_file(name)
     try:
         with open(path) as fobj:

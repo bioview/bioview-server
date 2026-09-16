@@ -3,19 +3,14 @@ import queue
 import numpy as np
 
 
-# Optional at import time so this module (and the backend that imports it)
-# loads on machines without the UHD driver -- uhd is only touched once a
-# radio is actually streaming. Backend availability is decided in
-# device/__init__, which imports usrp/utils.py and its hard uhd import.
 try:
     import uhd
-except ImportError:  # pragma: no cover - no USRP driver installed
+except ImportError:  # pragma: no cover
     uhd = None
 from bioview_common import QUEUE_PUT_TIMEOUT_S, PausableWorker, log_print, put_or_drop
 
 
-INIT_DELAY = 0.05  # 50mS initial delay before transmit
-# This is a good balance between real time display and spikes
+INIT_DELAY = 0.05
 SAVE_BUFFER_SIZE = 20
 
 
@@ -34,24 +29,19 @@ class ReceiveWorker(PausableWorker):
     ):
         super().__init__()
 
-        # Signals
         self.logger = logger
 
-        # Modifiable params
         self.rx_gain = rx_gain
         self.rx_channels = rx_channels
         self.global_rx_offset = global_rx_offset
 
-        # Device params
         self.usrp = usrp
         self.rx_streamer = rx_streamer
-        self.rx_queue = rx_queue  # Data
-        self.cmd_queue = cmd_queue  # Commands (such as gain change)
+        self.rx_queue = rx_queue
+        self.cmd_queue = cmd_queue
 
         self.running = running
 
-        # Counters surfaced for diagnostics; drops are logged at a low rate so
-        # logging never becomes the bottleneck it is reporting on.
         self.buffers_dropped = 0
         self._last_drop_logged = 0
 
@@ -63,45 +53,35 @@ class ReceiveWorker(PausableWorker):
 
         rx_metadata = uhd.types.RXMetadata()
 
-        # Buffer for receiving samples
         num_channels = self.rx_streamer.get_num_channels()
         max_samps_per_packet = self.rx_streamer.get_max_num_samps()
 
-        # Make receive buffer larger than max_samps_per_packet.
-        # This adds a latency of recv_buffer_size / sample_rate (in seconds)
         recv_buffer_size = max_samps_per_packet * SAVE_BUFFER_SIZE
 
         recv_buffer = np.empty((num_channels, recv_buffer_size), dtype=np.complex64)
 
-        # Setup streaming using continuous saving mode by default
         stream_cmd = uhd.types.StreamCMD(uhd.types.StreamMode.start_cont)
 
-        # When using multiple devices, we need to set stream_now to False
-        # to align time edges of packets
         stream_cmd.stream_now = False
         stream_cmd.time_spec = uhd.types.TimeSpec(
             self.usrp.get_time_now().get_real_secs() + INIT_DELAY
         )
         self.rx_streamer.issue_stream_cmd(stream_cmd)
 
-        # Initialize
         total_samps_received = 0
-        timeout = 0.5  # Larger timeout initially
+        timeout = 0.5
         had_an_overflow = False
         last_overflow = uhd.types.TimeSpec(0)
 
-        # Setup the statistic counters
         num_rx_samps = 0
         num_rx_dropped = 0
 
         rate = self.usrp.get_rx_rate()
 
         while self.is_running:
-            # Check for updated parameters
             try:
                 current_command = self.cmd_queue.get_nowait()
 
-                # Make changes to adjustable params
                 param = current_command["param"]
                 val = current_command["value"]
 
@@ -121,7 +101,6 @@ class ReceiveWorker(PausableWorker):
                         f"Rx gain updated to {local_gains}. Current {self.rx_gain}",
                     )
                     self.rx_gain = local_gains
-                # NOTE: Any other modifiable parameters may be added here
                 else:
                     pass
 
@@ -129,18 +108,14 @@ class ReceiveWorker(PausableWorker):
                 pass
 
             try:
-                # Receive samples
                 num_rx_samps = self.rx_streamer.recv(recv_buffer, rx_metadata, timeout)
             except RuntimeError as ex:
                 log_print(self.logger, "error", f"Receiver Runtime Eror: {ex}")
                 continue
 
-            timeout = INIT_DELAY  # Reduce timeout for subsequent transmissions
+            timeout = INIT_DELAY
 
-            # Reference: uhd/examples/python/benchmark_rate.py
-            # Handle the error codes
             if rx_metadata.error_code == uhd.types.RXMetadataErrorCode.none:
-                # Reset the overflow flag
                 if had_an_overflow:
                     had_an_overflow = False
                     num_rx_dropped += (rx_metadata.time_spec - last_overflow).to_ticks(
@@ -148,7 +123,6 @@ class ReceiveWorker(PausableWorker):
                     )
             elif rx_metadata.error_code == uhd.types.RXMetadataErrorCode.overflow:
                 had_an_overflow = True
-                # A new TimeSpec, not a reference to metadata.time_spec.
                 last_overflow = uhd.types.TimeSpec(
                     rx_metadata.time_spec.get_full_secs(),
                     rx_metadata.time_spec.get_frac_secs(),
@@ -164,8 +138,6 @@ class ReceiveWorker(PausableWorker):
                     "warning",
                     f"Receiver Late: {rx_metadata.strerror()}, restarting...",
                 )
-                # Radio core will be in the idle state.
-                # Issue stream command to restart streaming.
                 stream_cmd.time_spec = uhd.types.TimeSpec(
                     self.usrp.get_time_now().get_real_secs() + INIT_DELAY
                 )
@@ -186,8 +158,6 @@ class ReceiveWorker(PausableWorker):
 
             total_samps_received += num_rx_samps
 
-            # Copied so the next recv() cannot overwrite queued samples.
-            # Blocking here would turn a backlog into a UHD overflow.
             if not put_or_drop(
                 self.rx_queue, recv_buffer.copy(), timeout=QUEUE_PUT_TIMEOUT_S
             ):
@@ -201,7 +171,6 @@ class ReceiveWorker(PausableWorker):
                         "(demodulation is not keeping up)",
                     )
 
-        # Gracefully close once receiving is finished
         stream_cmd = uhd.types.StreamCMD(uhd.types.StreamMode.stop_cont)
         self.rx_streamer.issue_stream_cmd(stream_cmd)
         log_print(self.logger, "debug", "Receiving Stopped")
@@ -209,7 +178,6 @@ class ReceiveWorker(PausableWorker):
     def cleanup(self):
         if self.rx_streamer is not None:
             try:
-                # End receiving burst
                 stream_cmd = uhd.types.StreamCMD(uhd.types.StreamMode.stop_cont)
                 self.rx_streamer.issue_stream_cmd(stream_cmd)
                 log_print(self.logger, "debug", "Receiving stopped cleanly")

@@ -1,8 +1,4 @@
-"""BioView server: forwards client commands to device backends.
-
-Several clients share one server and one set of hardware.
-See bioview-docs/architecture/server.md.
-"""
+"""BioView server: forwards client commands to device backends."""
 
 import argparse
 import contextlib
@@ -42,6 +38,13 @@ from bioview_common import (
     validate_token,
 )
 
+from bioview_server.admission import (
+    DEFAULT_POLICY,
+    POLICIES,
+    AdmissionController,
+    AdmissionError,
+    resolve_hostnames,
+)
 from bioview_server.common import BvrWriter
 from bioview_server.device import (
     AVAILABLE_BACKENDS,
@@ -51,14 +54,10 @@ from bioview_server.device import (
 )
 
 
-SLEEP_DURATION = 0.001  # Confirm CPU load with varying this value
+SLEEP_DURATION = 0.001
 
-#: How long the server waits for the recorder to drain the shared save queue,
-#: write the trailer and close the file.
 RECORDING_CLOSE_TIMEOUT_S = 15
 
-# How long a window's claim survives when it did not say how often it would
-# call back. Only reached by a client too old to advertise its heartbeat.
 WINDOW_CLAIM_LIFETIME = 30.0
 
 
@@ -83,7 +82,6 @@ class ClientSession:
         self.info = info or {}
         self.active = True
         self.thread = None
-        # Serializes writes to control_conn against out-of-band device reports.
         self.send_lock = Lock()
 
     @property
@@ -101,93 +99,65 @@ class ClientSession:
 class Server:
     def __init__(
         self,
-        local_only: bool,
         control_port: int,
         data_port: int,
+        local_only: bool = None,
+        allow: str = None,
+        trusted=None,
         logger=None,
         exit_when_idle: float = 0,
     ):
+        """``allow`` is the admission policy; see ``bioview_server.admission``."""
         self.info = get_app_info()
-        # Which backends loaded, and why the others did not. Sent with the
-        # server's identity so every client learns about a missing driver or a
-        # UHD mismatch at connect time, rather than the Configurator learning
-        # it from a device listing and the Monitor never learning it at all.
         self.info["backends"] = backend_report()
-        self.token = 42  # TODO: Load using secrets
+        self.token = 42
 
         self.control_port = control_port
         self.data_port = data_port
 
-        # Advertised, not assumed: a client finds a server by its control port,
-        # but nothing tells it where the *data* port is, so it used to fall
-        # back to the compiled-in default and connect to nothing whenever the
-        # server had been given other ports.
         self.info["control_port"] = control_port
         self.info["data_port"] = data_port
 
         self.running = False
 
-        # Seconds with neither a client nor a window before the server retires
-        # itself; 0 = never.
         self.exit_when_idle = exit_when_idle
         self._idle_since = time.monotonic()
 
-        # Windows currently claiming this server, keyed by the token each one
-        # sends with its heartbeat, mapped to when the claim expires.
-        #
-        # A window is a client of its server long before it authenticates --
-        # the Monitor builds its client only once its configuration dialog has
-        # been answered, and nobody is obliged to answer it -- so a session
-        # count alone cannot say whether this server is still wanted. The
-        # windows say so themselves, and stop saying so when they exit.
         self._windows = {}
         self._windows_lock = Lock()
 
-        # Guarded: the accept loop adds, command threads remove, the data
-        # thread iterates.
         self.sessions = []
         self._sessions_lock = Lock()
 
-        # Thread-local: the session whose command this thread is handling, so
-        # a reply goes back to the client that asked.
+        self._handshake_lock = Lock()
+
         self._thread_session = local()
 
-        self.local_only = local_only
+        if allow is None:
+            allow = "local" if local_only else DEFAULT_POLICY
+        self._admission = AdmissionController(
+            policy=allow, trusted=trusted, logger=logger
+        )
+
         self.discovered_clients = {}
         self.connected_client_info = {}
 
         self.device_group_states = {}
         self.device_group_handlers = {}
-        # Why a group is not usable, keyed by group id, and reported to clients.
         self.device_group_errors = {}
         self.config = None
-        self.data_sources = set()  # set(source: DataSource)
+        self.data_sources = set()
         self.discovered_devices_cache = {}
         self._device_op_lock = Lock()
         self._device_op_in_progress = False
 
-        # Start/Stop is served on the session's own command thread, so two
-        # clients -- or one client whose Start button stayed live through a
-        # minute-long start -- can drive a device through START_STREAMING while
-        # it is already streaming. See _start_streaming().
         self._streaming_lock = Lock()
         self._streaming_active = False
         self._device_op_thread = None
 
-        # DPIC balance is a minute-long hardware search. It is answered
-        # immediately and run on its own thread; the client watches
-        # ``pending`` on GET_DEVICE_STATUS for the outcome. Running it inline
-        # blocked this session's whole command loop -- no Stop, no parameter
-        # change, no status poll -- for the duration.
-        #
-        # State and threads are keyed by device group: each group is its own
-        # backend process driving its own radios, so one group's search has no
-        # reason to wait on another's. A single slot here made them queue.
         self._dpic_lock = Lock()
         self._dpic_threads = {}
         self._dpic_states = {}
-        # The group whose balance started most recently, for the single-slot
-        # ``dpic_balance`` field older clients still read.
         self._dpic_last_device = None
 
         self.data_socket = None
@@ -195,16 +165,10 @@ class Server:
 
         self.data_thread = None
 
-        # One response queue per device backend, created on handler creation.
-        # A queue shared by all of them lets one device consume another's reply.
         self.response_queues = {}
 
         self.data_queue = mp.Queue(maxsize=DATA_OUTPUT_QUEUE_DEPTH)
 
-        # Every backend forwards its save-rate records here; one BvrWriter
-        # drains it into the session's single .bvr file. Bounded, but the
-        # forwarders block briefly rather than dropping, since a lost save
-        # chunk is a hole in the recording.
         self.save_data_queue = mp.Queue(maxsize=SAVE_OUTPUT_QUEUE_DEPTH)
         self.bvr_writer = None
 
@@ -225,12 +189,12 @@ class Server:
 
         self.running = True
 
-        # One data thread for the whole server, fanning out to every client.
         self.data_thread = Thread(target=self._data_handler, daemon=True)
         self.data_thread.start()
 
         while self.running:
             control_conn = None
+            self._check_abandoned_recording()
             self._check_idle_exit()
             try:
                 try:
@@ -240,134 +204,204 @@ class Server:
                         self.logger, "debug", f"Control connection initiated from {addr}"
                     )
                 except TimeoutError:
-                    # No one connected yet; loop back and re-check self.running.
                     continue
                 except OSError:
                     break
 
                 control_conn.settimeout(5.0)
-
-                if self.local_only and not self._is_local_client(addr):
-                    control_conn.close()
-                    continue
-
-                auth_data = recv_message(control_conn, self.logger)
-                if not auth_data:
-                    control_conn.close()
-                    continue
-
-                cmd_type, payload = parse_and_validate_command(auth_data)
-                if cmd_type == Command.DISCOVER_SERVERS.name:
-                    # A probe carrying a window token is a claim, not just a
-                    # question, and a window that is leaving withdraws its
-                    # claim the same way. A probe without a token -- a subnet
-                    # scan, an older client -- is answered but claims nothing.
-                    self._update_window_claim(payload)
-                    send_response(
-                        sock=control_conn,
-                        response=Response.SUCCESS,
-                        # Both counts let a closing window tell whether anyone
-                        # else still needs this server.
-                        params={
-                            **self.info,
-                            "clients": len(self.sessions),
-                            "windows": self._live_window_count(),
-                        },
-                        logger=self.logger,
-                    )
-                    control_conn.close()
-                    continue
-                elif cmd_type == Command.CONNECT_SERVER.name:
-                    hostname = payload.get("client_info", {}).get("hostname", None)
-                    if hostname:
-                        log_print(
-                            self.logger, "info", f"Incoming connection from: {hostname}"
-                        )
-
-                    challenge = generate_challenge()
-                    (
-                        send_response(
-                            sock=control_conn,
-                            response=Response.SERVER_CHALLENGE,
-                            params={"challenge": challenge, "timestamp": time.time()},
-                            logger=self.logger,
-                        ),
-                    )
-
-                    challenge_response = recv_message(control_conn, self.logger)
-                    client_cmd, client_payload = parse_and_validate_command(
-                        challenge_response
-                    )
-
-                    if client_cmd != Command.AUTHENTICATE_CLIENT.name:
-                        # TODO: log the invalid connection attempt.
-                        control_conn.close()
-                        continue
-
-                    auth_token = client_payload.get("token", None)
-                    if auth_token and validate_token(challenge, auth_token):
-                        send_response(
-                            sock=control_conn,
-                            response=Response.AUTHENTICATION_SUCCESS,
-                            params={"server_info": self.info, "timestamp": time.time()},
-                            logger=self.logger,
-                        )
-                    else:
-                        control_conn.close()
-                        continue
-
-                    # Local, not shared: several clients may connect at once.
-                    client_info = payload.get("client_info") or {}
-                    session_info = {
-                        "ip": client_info.get("ip", ""),
-                        "hostname": client_info.get("hostname", ""),
-                        "name": client_info.get("name", ""),
-                        "version": client_info.get("version", ""),
-                    }
-                    self.connected_client_info = session_info
-                else:
-                    control_conn.close()
-                    continue
-
-                """Accept the data connection for a client that just authenticated."""
-                try:
-                    data_conn, _ = self.data_socket.accept()
-                    log_print(self.logger, "debug", "Data connection accepted.")
-                except TimeoutError:
-                    log_print(
-                        self.logger,
-                        "error",
-                        "Client failed to connect data socket in time.",
-                    )
-                    control_conn.close()
-                    continue
-
-                # Served on its own thread so this loop stays free for the
-                # next window to connect.
-                self.handle_client_session(control_conn, data_conn, session_info)
+                self._dispatch_connection(control_conn, addr)
+                control_conn = None
 
             except Exception as e:
-                # Abandon only this connection attempt, never the other clients.
                 log_print(self.logger, "error", f"Error in main loop: {e}")
                 if control_conn is not None:
                     with contextlib.suppress(Exception):
                         control_conn.close()
 
+    def _peer_address(self, addr) -> str:
+        """The peer's IP out of an ``accept()`` address tuple, or ""."""
+        if isinstance(addr, list | tuple) and addr:
+            return str(addr[0])
+        return ""
+
+    def _dispatch_connection(self, control_conn, addr):
+        """Read one connection's opening message and route it."""
+        peer = self._peer_address(addr)
+
+        try:
+            auth_data = recv_message(control_conn, self.logger)
+        except Exception:
+            auth_data = None
+        if not auth_data:
+            control_conn.close()
+            return
+
+        cmd_type, payload = parse_and_validate_command(auth_data)
+
+        if cmd_type == Command.DISCOVER_SERVERS.name:
+            if not self._admission.may_probe(peer):
+                control_conn.close()
+                return
+            self._update_window_claim(payload)
+            send_response(
+                sock=control_conn,
+                response=Response.SUCCESS,
+                params={
+                    **self.info,
+                    "clients": len(self._live_sessions()),
+                    "windows": self._live_window_count(),
+                },
+                logger=self.logger,
+            )
+            control_conn.close()
+            return
+
+        if cmd_type == Command.SHUTDOWN_SERVER.name:
+            self._handle_shutdown_request(control_conn, peer)
+            return
+
+        if cmd_type != Command.CONNECT_SERVER.name:
+            control_conn.close()
+            return
+
+        Thread(
+            target=self._complete_connection,
+            args=(control_conn, peer, payload or {}),
+            name=f"bioview-connect-{peer or 'unknown'}",
+            daemon=True,
+        ).start()
+
+    def _handle_shutdown_request(self, control_conn, peer):
+        """Retire the server on request, but only for its own machine."""
+        try:
+            if not self._admission.is_own_machine(peer):
+                log_print(
+                    self.logger,
+                    "warning",
+                    f"Ignoring a shutdown request from {peer}: not this machine",
+                )
+                send_response(
+                    sock=control_conn,
+                    response=Response.ERROR,
+                    params={"message": "Only this machine may shut this server down"},
+                    logger=self.logger,
+                )
+                return
+
+            log_print(self.logger, "info", "Shutdown requested; retiring server")
+            send_response(
+                sock=control_conn,
+                response=Response.SUCCESS,
+                params={"message": "Shutting down"},
+                logger=self.logger,
+            )
+            self.running = False
+        finally:
+            with contextlib.suppress(Exception):
+                control_conn.close()
+
+    def _complete_connection(self, control_conn, peer, payload):
+        """Admit, authenticate and register one client. Runs on its own thread."""
+        client_info = payload.get("client_info") or {}
+        try:
+            allowed, reason = self._admission.decide(peer, client_info)
+            if not allowed:
+                log_print(
+                    self.logger,
+                    "warning",
+                    f"Refused a connection from {peer}: {reason}",
+                )
+                with contextlib.suppress(Exception):
+                    send_response(
+                        sock=control_conn,
+                        response=Response.ERROR,
+                        params={"message": f"Connection refused: {reason}"},
+                        logger=self.logger,
+                    )
+                control_conn.close()
+                return
+
+            hostname = client_info.get("hostname") or peer
+            log_print(self.logger, "info", f"Incoming connection from: {hostname}")
+
+            with self._handshake_lock:
+                self._authenticate_and_register(control_conn, peer, client_info)
+        except Exception as e:
+            log_print(self.logger, "error", f"Connection from {peer} failed: {e}")
+            with contextlib.suppress(Exception):
+                control_conn.close()
+
+    def _authenticate_and_register(self, control_conn, peer, client_info):
+        """Challenge, verify, take the data connection and start the session."""
+        challenge = generate_challenge()
+        send_response(
+            sock=control_conn,
+            response=Response.SERVER_CHALLENGE,
+            params={"challenge": challenge, "timestamp": time.time()},
+            logger=self.logger,
+        )
+
+        challenge_response = recv_message(control_conn, self.logger)
+        client_cmd, client_payload = parse_and_validate_command(challenge_response)
+
+        if client_cmd != Command.AUTHENTICATE_CLIENT.name:
+            log_print(
+                self.logger,
+                "warning",
+                f"{peer} did not answer the challenge; dropping the connection",
+            )
+            control_conn.close()
+            return
+
+        auth_token = (client_payload or {}).get("token", None)
+        if not (auth_token and validate_token(challenge, auth_token)):
+            log_print(
+                self.logger,
+                "warning",
+                f"{peer} failed authentication; dropping the connection",
+            )
+            control_conn.close()
+            return
+
+        send_response(
+            sock=control_conn,
+            response=Response.AUTHENTICATION_SUCCESS,
+            params={"server_info": self.info, "timestamp": time.time()},
+            logger=self.logger,
+        )
+
+        session_info = {
+            "ip": client_info.get("ip", "") or peer,
+            "hostname": client_info.get("hostname", ""),
+            "name": client_info.get("name", ""),
+            "version": client_info.get("version", ""),
+        }
+        self.connected_client_info = session_info
+
+        try:
+            data_conn, _ = self.data_socket.accept()
+            log_print(self.logger, "debug", "Data connection accepted.")
+        except TimeoutError:
+            log_print(
+                self.logger,
+                "error",
+                "Client failed to connect data socket in time.",
+            )
+            control_conn.close()
+            return
+
+        self.handle_client_session(control_conn, data_conn, session_info)
+
     def _create_sockets(self):
         """Bind the control and data listeners. Done once, at launch."""
         try:
             self.control_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            # Exclusive: a second server must fail to bind rather than run
-            # alongside this one and split the clients between them.
             set_exclusive_bind(self.control_socket)
             self.control_socket.bind(("0.0.0.0", self.control_port))
-            # A LAN discovery scan opens many short-lived probes at once.
             self.control_socket.listen(socket.SOMAXCONN)
-            self.control_socket.settimeout(1)  # Make sure that accept is non-blocking
+            self.control_socket.settimeout(1)
             log_print(self.logger, "debug", "Control socket created")
         except OSError as e:
-            # Almost always another BioView server; surface it so the caller
-            # can exit rather than spin on an unbound socket.
             log_print(self.logger, "error", f"Unable to create control socket: {e}")
             raise
 
@@ -383,12 +417,17 @@ class Server:
             raise
 
     @property
-    def client_control_conn(self):
-        """The control connection of the client this thread is serving.
+    def local_only(self) -> bool:
+        """True when this server will not serve an arbitrary remote machine."""
+        return self._admission.policy in ("loopback", "local")
 
-        Resolving it per thread routes every reply to the client that asked
-        without threading a session argument through every handler.
-        """
+    @property
+    def admission_policy(self) -> str:
+        return self._admission.policy
+
+    @property
+    def client_control_conn(self):
+        """The control connection of the client this thread is serving."""
         session = getattr(self._thread_session, "session", None)
         return session.control_conn if session is not None else None
 
@@ -398,14 +437,7 @@ class Server:
         return bool(self._live_sessions())
 
     def _update_window_claim(self, payload):
-        """Record, refresh or withdraw one window's claim on this server.
-
-        ``window`` is an opaque token identifying a window process; ``leaving``
-        withdraws it. The claim is given a lifetime of a few heartbeat
-        intervals, so a window that dies without a word is forgotten without
-        anyone having to notice that it died -- there is no pid to check and no
-        file to prune, and nothing to be confused by a reused pid.
-        """
+        """Record, refresh or withdraw one window's claim on this server."""
         if not isinstance(payload, dict):
             return
         token = payload.get("window")
@@ -429,9 +461,6 @@ class Server:
                 interval = float(payload.get("heartbeat") or 0)
             except (TypeError, ValueError):
                 interval = 0
-            # The window says how often it will call, so changing that interval
-            # cannot silently outrun a lifetime hard-coded here. Three missed
-            # calls before a claim lapses.
             lifetime = 3 * interval if interval > 0 else WINDOW_CLAIM_LIFETIME
             first_seen = token not in self._windows
             self._windows[token] = (time.monotonic() + lifetime, role)
@@ -460,14 +489,23 @@ class Server:
                 return True
         return self._live_window_count() > 0
 
-    def _check_idle_exit(self):
-        """Shut down once nothing has wanted this server for ``exit_when_idle``.
+    def _check_abandoned_recording(self):
+        """Second line of defence against a recording nobody is watching."""
+        if self.bvr_writer is None and not self._streaming_active:
+            return
+        if self._live_sessions():
+            return
+        self._halt_orphaned_streaming("no client is connected")
+        if self.bvr_writer is not None and not self._live_sessions():
+            log_print(
+                self.logger,
+                "warning",
+                "Closing a recording that no client is left to stop",
+            )
+            self._close_recording()
 
-        This is what lets the window that started the server not be the last
-        one standing, without leaving a server behind. "Wanted" deliberately
-        means more than "connected": a window counts from the moment it starts
-        up, so the countdown is never a deadline for it to connect by.
-        """
+    def _check_idle_exit(self):
+        """Shut down once nothing has wanted this server for ``exit_when_idle``."""
         if not self.exit_when_idle:
             return
 
@@ -543,6 +581,37 @@ class Server:
                 f"{session.name} disconnected ({remaining} client(s) remaining)",
             )
 
+        if remaining == 0:
+            self._halt_orphaned_streaming(
+                "the last client disconnected while data was streaming"
+            )
+
+    def _halt_orphaned_streaming(self, why: str):
+        """Stop devices and finalize the recording when no client is left."""
+        with self._streaming_lock:
+            if not self._streaming_active:
+                return
+            self._streaming_active = False
+
+        if self._live_sessions():
+            with self._streaming_lock:
+                self._streaming_active = True
+            return
+
+        log_print(self.logger, "warning", f"Stopping data streaming: {why}")
+
+        for device_id, handler in self._active_device_handlers().items():
+            try:
+                handler.stop_streaming()
+            except Exception as e:
+                log_print(
+                    self.logger,
+                    "error",
+                    f"{device_id} did not stop cleanly: {e}",
+                )
+
+        self._close_recording()
+
     def close_client_connections(self):
         """Disconnect every client (server shutdown, or an unrecoverable error)."""
         log_print(self.logger, "debug", "Closing client connections")
@@ -551,17 +620,11 @@ class Server:
             self._end_session(session)
 
     def _data_handler(self):
-        """Drain acquired data and fan each chunk out to every connected client.
-
-        One thread, not one per client: the data queue can only be drained once.
-        """
+        """Drain acquired data and fan each chunk out to every connected client."""
         while self.running:
             try:
-                # A short timeout lets the loop re-check self.running and exit.
                 buff = self.data_queue.get(timeout=1.0)
 
-                # Backends push {'data': ndarray, 'sources': [...]}; the source
-                # list is what routes each row on the client.
                 if isinstance(buff, dict) and "data" in buff:
                     data, meta = buff["data"], {"sources": buff.get("sources")}
                 else:
@@ -579,9 +642,8 @@ class Server:
                         )
                         self._end_session(session)
             except queue.Empty:
-                continue  # continue execution if no data arrived
+                continue
             except Exception as e:
-                # One bad chunk must not end streaming for every client.
                 log_print(self.logger, "error", f"Unexpected data handler error: {e}")
                 continue
 
@@ -594,13 +656,13 @@ class Server:
                 try:
                     data = recv_message(self.client_control_conn, self.logger)
                 except TimeoutError:
-                    continue  # ensure timeouts do not kill this thread
+                    continue
                 except (OSError, ConnectionResetError) as e:
                     log_print(self.logger, "error", f"Connection reset by host: {e}")
                     break
 
                 if not data:
-                    break  # Control connection is closed
+                    break
 
                 cmd_type, payload = parse_and_validate_command(data)
                 log_print(self.logger, "debug", f"Received {cmd_type} with {payload}")
@@ -635,20 +697,14 @@ class Server:
 
             except ValidationError as e:
                 log_print(self.logger, "debug", f"Invalid command {cmd_type} sent: {e}")
-                continue  # Invalid command should not close connection
+                continue
 
     def _is_local_client(self, address):
-        """True when a peer address belongs on this machine or its LAN.
-
-        This host's own NIC addresses count: a same-machine client dials the
-        address the server advertised, which need not be loopback or private.
-        """
+        """True when a peer address belongs on this machine or its LAN."""
         if not isinstance(address, list | tuple) or not address:
             return False
         peer = address[0]
         return is_local_request(peer) or peer in get_local_addresses()
-
-    # Device command handling callbacks
 
     def _config_from_payload(self, payload):
         from bioview_common import Configuration
@@ -664,20 +720,11 @@ class Server:
         "message": "",
         "results": [],
         "device_id": None,
-        # The balancer's live phase/amplitude/gain, so the client's poll can
-        # drive the settings panel while the search runs.
         "progress": None,
     }
 
     def _drain_dpic_progress(self):
-        """Fold each group's newest progress entry into its balance state.
-
-        Drained on the way out rather than pushed: the client polls this while
-        a balance runs, and the newest entry is the only one that matters for
-        showing phase, amplitude and gain moving. Every group with a state is
-        drained, not just one -- balances run side by side, and a group whose
-        queue went unread would freeze on screen while its search moved.
-        """
+        """Fold each group's newest progress entry into its balance state."""
         with self._dpic_lock:
             device_ids = list(self._dpic_states)
         for device_id in device_ids:
@@ -686,7 +733,7 @@ class Server:
                 continue
             progress = handler.drain_balance_progress()
             if progress is None:
-                continue  # A gap between measurements is not a reset.
+                continue
             with self._dpic_lock:
                 state = self._dpic_states.get(device_id)
                 if state is not None:
@@ -713,25 +760,14 @@ class Server:
                 "device_status": self.device_group_states,
                 "device_errors": dict(self.device_group_errors),
                 "data_sources": [src.to_dict() for src in self.data_sources],
-                # The client polls these to follow the balances it started; the
-                # command itself only acknowledges the start. The map is keyed
-                # by group so concurrent searches each get their own outcome;
-                # the singular field is the most recently started of them, kept
-                # for clients that predate the map.
                 "dpic_balances": dpic_states,
                 "dpic_balance": dpic_state,
             },
             logger=self.logger,
         )
 
-    # Configurator support
-
     def _enumerate_devices(self):
-        """Every attached device across all loaded backends, config-free.
-
-        A backend that raises is reported as unavailable rather than failing the
-        whole listing.
-        """
+        """Every attached device across all loaded backends, config-free."""
         devices = []
         backends = {
             backend_type: {
@@ -839,8 +875,6 @@ class Server:
                 "info",
                 f"Updated {device_info.get('name')}: {message}",
             )
-            # The listing cache is keyed on device name, so a rename must
-            # evict the old entry.
             self.discovered_devices_cache.pop(device_info.get("name"), None)
             send_response(
                 self.client_control_conn,
@@ -940,8 +974,6 @@ class Server:
         log_print(self.logger, "info", "Discovering connected devices")
 
         discovered_names = set()
-        # Every backend's results land in one cache, so availability has to be
-        # decided per backend rather than from the combined pool.
         discovered_by_backend = {}
         for backend_type, backend in AVAILABLE_BACKENDS.items():
             backend_names = set()
@@ -983,8 +1015,6 @@ class Server:
             device_type = device_cfg.get_param("device_type")
 
             if device_type == DeviceType.BIOPAC.value:
-                # Hardware keys are user-chosen labels, not the device names
-                # discovery reports, and one MP unit is driven per group.
                 biopac_discovered = discovered_by_backend.get(
                     DeviceType.BIOPAC.value, set()
                 )
@@ -1004,11 +1034,6 @@ class Server:
                 continue
 
             if device_type == DeviceType.MICROPHONE.value:
-                # Like BIOPAC, hardware keys here are user-chosen labels rather
-                # than the names discovery reports: a host input is named by the
-                # operating system and a config is usually written before anyone
-                # has seen that name. One input is opened per group, so the group
-                # is available as soon as the machine has any input at all.
                 mic_discovered = discovered_by_backend.get(
                     DeviceType.MICROPHONE.value, set()
                 )
@@ -1034,7 +1059,6 @@ class Server:
 
             hardware = device_cfg.get_param("hardware") or {}
             hw_names = set(hardware.keys()) if isinstance(hardware, dict) else set()
-            # Available when any of the group's hardware entries was found.
             if hw_names & discovered_names:
                 self.device_group_states[device_id] = DeviceStatus.AVAILABLE.value
             else:
@@ -1057,10 +1081,7 @@ class Server:
         log_print(self.logger, "info", "Device discovery completed successfully")
 
     def _explain_device_failure(self, message: str) -> str:
-        """Add machine-level context to a backend's failure message.
-
-        Kept out of the backend subprocess: these queries have been seen to hang.
-        """
+        """Add machine-level context to a backend's failure message."""
         if "MPDRVERR" not in message:
             return message
 
@@ -1157,8 +1178,16 @@ class Server:
             return
 
         try:
-            for handler in active_handlers.values():
+            for device_id, handler in active_handlers.items():
                 handler.disconnect()
+                try:
+                    handler.shutdown()
+                except Exception as e:
+                    log_print(self.logger, "debug", f"{device_id} shutdown failed: {e}")
+                self.device_group_handlers[device_id] = None
+                self.device_group_states[device_id] = DeviceStatus.DISCONNECTED.value
+
+            self.data_sources = set()
 
             msg = "Devices disconnected successfully"
             log_print(self.logger, "info", msg)
@@ -1181,10 +1210,6 @@ class Server:
     def _start_streaming(self, payload):
         with self._streaming_lock:
             if self._streaming_active:
-                # Idempotent rather than an error: the session *is* streaming,
-                # which is what the client asked for, and answering ERROR would
-                # drop a working client into a failed state. Restarting the
-                # devices under a running session is the harmful reading.
                 msg = "Data streaming already in progress"
                 log_print(self.logger, "warning", msg)
                 send_response(
@@ -1207,9 +1232,6 @@ class Server:
             )
             return
 
-        # Saving happens here, not on the client: the save-rate stream never
-        # crosses the wire, only the decimated display stream does. Runtime
-        # parameters are not replayed: UI edits already reach backends live.
         experiment_cfg = payload.get("Experiment", payload.get("experiment", {})) or {}
         enable_save = self._open_recording(experiment_cfg, active_handlers)
         stream_cfg = {
@@ -1233,8 +1255,6 @@ class Server:
                 failures.append(f"{device_id}: {reason}")
 
         if failures:
-            # Never leave half the rig running: a partially started session
-            # writes data that cannot be aligned across devices.
             for _device_id, handler in started:
                 with contextlib.suppress(Exception):
                     handler.stop_streaming()
@@ -1263,11 +1283,7 @@ class Server:
         )
 
     def _open_recording(self, experiment_cfg, active_handlers) -> bool:
-        """Open this session's .bvr file. Returns whether saving is on.
-
-        The device table is fixed here, before any device starts, so that every
-        record's ``device_idx`` resolves against a header entry.
-        """
+        """Open this session's .bvr file. Returns whether saving is on."""
         self._close_recording()
 
         file_name = (experiment_cfg.get("file_name") or "").strip()
@@ -1276,8 +1292,6 @@ class Server:
             log_print(self.logger, "debug", "No file name given; not recording")
             return False
 
-        # save_dir is the client's path. When the client is on another machine
-        # it may not exist here, and the recording is written server-side.
         directory = Path(save_dir) if save_dir else Path.cwd()
         if not directory.is_dir():
             fallback = Path.cwd()
@@ -1308,6 +1322,8 @@ class Server:
         if not devices:
             return False
 
+        sample_limits = self._sample_limits(experiment_cfg, devices)
+
         try:
             save_path = get_unique_path(str(directory), f"{base}.bvr")
             drain(self.save_data_queue)
@@ -1321,6 +1337,7 @@ class Server:
                 }
                 if self.config is not None
                 else {},
+                sample_limits=sample_limits,
                 logger=self.logger,
             )
             self.bvr_writer.open()
@@ -1331,6 +1348,46 @@ class Server:
             self.bvr_writer = None
             return False
         return True
+
+    def _sample_limits(self, experiment_cfg, devices) -> dict:
+        """Exact per-device sample budget for a fixed-length run, if one was asked
+        for.
+
+        A routine that says 255 s should produce the same number of samples
+        every time it runs, so the client sends the duration and the recorder
+        stops at ``duration * fs`` rather than wherever the stop command lands.
+        """
+        duration = experiment_cfg.get("record_duration_s")
+        if duration is None:
+            return {}
+        try:
+            duration = float(duration)
+        except (TypeError, ValueError):
+            return {}
+        if duration <= 0:
+            return {}
+
+        limits = {}
+        for dev in devices:
+            fs = dev.get("fs")
+            if not fs:
+                log_print(
+                    self.logger,
+                    "warning",
+                    f"{dev.get('device_id')} reports no sample rate; its rows "
+                    "cannot be held to the routine length",
+                )
+                continue
+            limits[dev["device_id"]] = int(round(duration * float(fs)))
+
+        if limits:
+            log_print(
+                self.logger,
+                "info",
+                f"[Save] Recording capped at {duration:g}s: "
+                + ", ".join(f"{k} {v} samples" for k, v in limits.items()),
+            )
+        return limits
 
     def _close_recording(self):
         """Stop the recorder and finalize the file, if one is open."""
@@ -1368,7 +1425,6 @@ class Server:
         with self._streaming_lock:
             self._streaming_active = False
 
-        # One device refusing to stop must not leave the others running.
         failures = []
         for device_id, handler in active_handlers.items():
             try:
@@ -1376,8 +1432,6 @@ class Server:
             except Exception as e:
                 failures.append(f"{device_id}: {str(e) or type(e).__name__}")
 
-        # After the devices, so every record they queued is drained and written
-        # before the trailer is appended.
         self._close_recording()
 
         if failures:
@@ -1435,14 +1489,12 @@ class Server:
             for param, value in config.items():
                 self.config.update_device_param(device_id, param, value)
 
-        # A parameter edited mid-run belongs in the recording's trailer.
         writer = self.bvr_writer
         if writer is not None:
             for param, value in config.items():
                 with contextlib.suppress(Exception):
                     writer.record_change(device_id, param, value)
 
-        # device_id is the group_id.
         handler = self.device_group_handlers.get(device_id)
 
         if handler is None:
@@ -1456,8 +1508,6 @@ class Server:
 
         try:
             handler.queue_param_update(**config)
-            # A parameter such as the BIOPAC channel mask changes which streams
-            # exist, so the new source list rides back in the same reply.
             self._refresh_data_sources()
             send_response(
                 self.client_control_conn,
@@ -1477,10 +1527,7 @@ class Server:
             )
 
     def _refresh_data_sources(self):
-        """Rebuild the advertised source list from every live device handler.
-
-        Rebuilt, not merged: a set union can never drop a disabled channel.
-        """
+        """Rebuild the advertised source list from every live device handler."""
         sources = set()
         for device_id, handler in self.device_group_handlers.items():
             if handler is None:
@@ -1488,8 +1535,6 @@ class Server:
             try:
                 sources.update(handler.get_data_sources())
             except Exception as e:
-                # Swallowing this used to drop the group's channels from the
-                # display and the recording with nothing said anywhere.
                 log_print(
                     self.logger,
                     "error",
@@ -1500,13 +1545,7 @@ class Server:
         return self.data_sources
 
     def _run_dpic_balance(self, payload):
-        """Start a balance and answer at once; the result arrives by polling.
-
-        The search drives real hardware for a minute or more. Waiting for it
-        here held the command thread -- and, on the far side of one socket, the
-        client's control lock -- for the whole run, so the UI froze and Stop
-        could not be delivered until it finished.
-        """
+        """Start a balance and answer at once; the result arrives by polling."""
         device_id = payload.get("id") if payload else None
         if not device_id and self.device_group_handlers:
             device_id = next(iter(self.device_group_handlers))
@@ -1522,9 +1561,6 @@ class Server:
             return
 
         with self._dpic_lock:
-            # Only this group's own search blocks a new one. Another group is
-            # another backend process driving other radios; making it wait
-            # turned a four-group rig into four searches end to end.
             existing = self._dpic_states.get(device_id)
             if existing is not None and existing["pending"]:
                 send_response(
@@ -1576,8 +1612,6 @@ class Server:
                 Response.SUCCESS.name,
                 Response.SUCCESS.value,
             )
-            # The backend's own message either way: "complete" for a balance
-            # that never ran is how a no-op looked like a success.
             message = response.get("message") or (
                 "DPIC balance complete" if ok else "DPIC balance failed"
             )
@@ -1598,16 +1632,42 @@ class Server:
                 "message": message,
                 "results": results,
                 "device_id": device_id,
-                # This group's own last progress, so the panel keeps showing
-                # where its search ended rather than another group's values.
                 "progress": previous.get("progress"),
             }
+
+    def _shutdown_devices(self):
+        """Stop every backend, finalize the recording and reap the subprocesses."""
+        handlers = self._active_device_handlers()
+
+        with self._streaming_lock:
+            was_streaming = self._streaming_active
+            self._streaming_active = False
+
+        for device_id, handler in handlers.items():
+            if not was_streaming:
+                break
+            try:
+                handler.stop_streaming()
+            except Exception as e:
+                log_print(self.logger, "debug", f"{device_id} stop failed: {e}")
+
+        self._close_recording()
+
+        for device_id, handler in handlers.items():
+            try:
+                handler.shutdown()
+            except Exception as e:
+                log_print(self.logger, "debug", f"{device_id} shutdown failed: {e}")
+
+        self.device_group_handlers = {}
+        self.data_sources = set()
 
     def stop(self):
         log_print(self.logger, "debug", "Attempting to shutdown server")
 
-        # Dropped first: the data thread and every command loop watch it.
         self.running = False
+
+        self._shutdown_devices()
 
         self.close_client_connections()
 
@@ -1631,7 +1691,31 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--local",
         action="store_true",
-        help="Flag to make server restricteed only to local clients",
+        help=(
+            "Shorthand for --allow local: serve this machine and private "
+            "addresses only, with no prompt"
+        ),
+    )
+    parser.add_argument(
+        "--allow",
+        choices=POLICIES,
+        default=None,
+        help=(
+            "Who may connect. 'loopback': this machine only. 'local': this "
+            "machine and private addresses. 'ask' (default): this machine "
+            "silently, anyone else only if the prompt at this server is "
+            "answered yes. 'any': everyone, unasked."
+        ),
+    )
+    parser.add_argument(
+        "--trust",
+        action="append",
+        default=[],
+        metavar="HOST",
+        help=(
+            "Address or hostname admitted without a prompt. Repeatable, and "
+            "accepts a comma-separated list."
+        ),
     )
     parser.add_argument(
         "--exit-when-idle",
@@ -1668,21 +1752,41 @@ def main(argv=None) -> int:
 
     args = parser.parse_args(argv)
 
-    server = Server(
-        local_only=args.local,
-        exit_when_idle=args.exit_when_idle,
-        control_port=args.control_port,
-        data_port=args.data_port,
-        logger=logger,
+    trusted = resolve_hostnames(
+        entry for value in args.trust for entry in str(value).split(",")
     )
 
-    # Release the sockets promptly when the GUI that spawned us closes.
+    try:
+        server = Server(
+            local_only=args.local,
+            allow=args.allow,
+            trusted=trusted,
+            exit_when_idle=args.exit_when_idle,
+            control_port=args.control_port,
+            data_port=args.data_port,
+            logger=logger,
+        )
+    except AdmissionError as e:
+        log_print(logger, "error", str(e))
+        return 2
+
+    log_print(
+        logger,
+        "info",
+        f"Connection policy: {server.admission_policy}"
+        + (f", trusting {sorted(trusted)}" if trusted else ""),
+    )
+
     def _handle_termination(signum, frame):
         log_print(logger, "info", f"Received signal {signum}. Shutting down server...")
         server.running = False
 
-    with contextlib.suppress(Exception):
-        signal.signal(signal.SIGTERM, _handle_termination)
+    for signal_name in ("SIGTERM", "SIGINT", "SIGBREAK"):
+        handled = getattr(signal, signal_name, None)
+        if handled is None:
+            continue
+        with contextlib.suppress(Exception):
+            signal.signal(handled, _handle_termination)
 
     exit_code = 0
     try:

@@ -8,6 +8,7 @@ from bioview_common import (
     PausableWorker,
     apply_filter,
     get_filter,
+    initial_state,
     log_print,
     put_drop_oldest,
     put_or_drop,
@@ -16,6 +17,7 @@ from bioview_common.signal_schemes import (
     FmcwScheme,
     normalized_amplitude,
 )
+from scipy import signal
 
 
 class ProcessWorker(PausableWorker):
@@ -30,6 +32,12 @@ class ProcessWorker(PausableWorker):
         rx_device_order: list[str],
         schemes_by_device: dict,
         global_tx_to_device: dict,
+        if_filter_type: str = "ellip",
+        if_filter_order: int = 2,
+        disp_filter_btype: str = "off",
+        disp_filter_low: float = 0.5,
+        disp_filter_high: float = 40.0,
+        disp_filter_order: int = 2,
         signal_scheme: str = "cw",
         fmcw_scheme: FmcwScheme | None = None,
         save_queue: queue.Queue = None,
@@ -70,20 +78,23 @@ class ProcessWorker(PausableWorker):
         self.display_queue = display_queue
 
         self.global_sample_idx = 0
-        # (measure_tx, measure_rx) -> (magnitude, seq); ``seq`` lets DPIC
-        # wait for a measurement taken after it changed the injection.
         self.latest_metrics = {}
         self._metrics_cv = threading.Condition()
         self._partial_rows = {}
 
-        num_tx = len(channel_ifs)
-        # Kept so a channel can be retuned after construction; DPIC balance
-        # moves the inject Tx onto the measure Tx's IF.
         self.if_filter_bw = list(if_filter_bw)
-        self.if_filts = [
-            self._load_filter(channel_ifs[idx], if_filter_bw[idx])
-            for idx in range(num_tx)
-        ]
+        self.if_filter_type = str(if_filter_type or "ellip")
+        self.if_filter_order = max(1, int(if_filter_order or 2))
+        self._ramp_cache = {}
+        self._rebuild_filters()
+
+        self.disp_filter_btype = str(disp_filter_btype or "off")
+        self.disp_filter_low = float(disp_filter_low)
+        self.disp_filter_high = float(disp_filter_high)
+        self.disp_filter_order = max(1, int(disp_filter_order or 2))
+        self._disp_filt = None
+        self._disp_zi = None
+        self._rebuild_display_filter()
 
         self.save_chunks_dropped = 0
         self.display_chunks_dropped = 0
@@ -92,23 +103,12 @@ class ProcessWorker(PausableWorker):
         self._rebuild_demod_sources()
 
     def _rebuild_demod_sources(self):
-        """Pick one source per (Tx, Rx) pair to carry the demodulator state.
-
-        A group streaming both amplitude and phase advertises two sources for
-        the same physical pair. Demodulation is per pair, not per row: running
-        it once per source would advance the phase accumulator and the filter
-        state twice per chunk, and the second pass would see a buffer it has
-        already consumed. Only the representative holds state; the other rows
-        read the components it produced.
-        """
+        """Pick one source per (Tx, Rx) pair to carry the demodulator state."""
         seen = {}
         for source in self.mimo_sources:
             seen.setdefault((source.tx_idx, source.rx_idx), source)
         self._demod_sources = list(seen.values())
 
-        # More rows than pairs means components were named explicitly, so each
-        # row already carries exactly one component and the save path stores
-        # them as plain rows rather than as a stacked real/imaginary pair.
         self._per_source_components = len(self.mimo_sources) > len(self._demod_sources)
 
         for source in self.mimo_sources:
@@ -118,35 +118,201 @@ class ProcessWorker(PausableWorker):
             source.accumulated_sample_idx = 0
 
     def _component_of(self, source) -> str:
-        """Which of the two derived quantities this row carries.
-
-        Falls back to the legacy group-wide ``display_imaginary`` switch for
-        sources built before components were named per row.
-        """
+        """Which of the two derived quantities this row carries."""
         component = getattr(source, "component", None)
         if component is not None:
             return component
         return "phase" if self.display_imaginary else "amplitude"
 
-    def _load_filter(self, freq: float, bandwidth: float, order: int = 2):
-        low_cutoff = freq - bandwidth / 2
-        high_cutoff = freq + bandwidth / 2
+    def _load_filter(self, freq: float, bandwidth: float, order: int = None):
+        """Band-pass isolating one Tx's IF tone, in the configured response."""
+        nyquist = self.samp_rate / 2.0
+        half = max(float(bandwidth), 1.0) / 2.0
+        low_cutoff = max(freq - half, nyquist * 1e-6)
+        high_cutoff = min(freq + half, nyquist * (1.0 - 1e-6))
+        if high_cutoff <= low_cutoff:
+            raise ValueError(
+                f"IF {freq:.0f} Hz with bandwidth {bandwidth:.0f} Hz leaves no "
+                f"passband below the {nyquist:.0f} Hz Nyquist limit"
+            )
         return get_filter(
             bounds=[low_cutoff, high_cutoff],
             samp_rate=self.samp_rate,
+            ftype=self.if_filter_type,
             btype="band",
-            order=order,
+            order=self.if_filter_order if order is None else order,
+            dtype=np.float32,
         )
 
-    def set_channel_if(self, tx_idx: int, freq: float):
-        """Retune one Tx's demodulation IF and its band-pass, live.
+    def _rebuild_filters(self):
+        """Redesign every Tx's band-pass from the current filter settings."""
+        filters = [
+            self._load_filter(self.channel_ifs[idx], self.if_filter_bw[idx])
+            for idx in range(len(self.channel_ifs))
+        ]
+        self.if_filts = filters
+        self._ramp_cache.clear()
+        for source in self.all_sources:
+            source.filter_state = None
 
-        ``channel_ifs`` is the backend's own list, so the frequency may already
-        be updated by the time this is called; the filter is not, and a stale
-        band-pass would reject the very tone it is meant to pass. Filter state
-        is dropped for the affected sources because it describes the old
-        passband.
+    # -- display-only filter ---------------------------------------------------
+
+    def get_display_rate(self) -> float:
+        """Rate of the stream the display filter sees, after both decimations."""
+        return float(self.samp_rate) / (
+            max(1, int(self.save_ds)) * max(1, int(self.display_ds))
+        )
+
+    def _rebuild_display_filter(self):
+        """Design the display-only filter. Never touches the saved stream."""
+        self._disp_zi = None
+        btype = self.disp_filter_btype
+        if btype not in ("low", "high", "band"):
+            self._disp_filt = None
+            return
+
+        bounds = (
+            [self.disp_filter_low, self.disp_filter_high]
+            if btype == "band"
+            else (self.disp_filter_low if btype == "high" else self.disp_filter_high)
+        )
+        self._disp_filt = get_filter(
+            bounds=bounds,
+            samp_rate=self.get_display_rate(),
+            ftype="butter",
+            btype=btype,
+            order=self.disp_filter_order,
+            dtype=np.float32,
+        )
+
+    def set_display_filter(self, btype=None, low=None, high=None, order=None) -> bool:
+        """Adopt new display-filter settings live. Returns True if it changed."""
+        previous = (
+            self.disp_filter_btype,
+            self.disp_filter_low,
+            self.disp_filter_high,
+            self.disp_filter_order,
+        )
+        if btype is not None:
+            self.disp_filter_btype = str(btype)
+        if low is not None:
+            self.disp_filter_low = float(low)
+        if high is not None:
+            self.disp_filter_high = float(high)
+        if order is not None:
+            self.disp_filter_order = max(1, int(order))
+
+        current = (
+            self.disp_filter_btype,
+            self.disp_filter_low,
+            self.disp_filter_high,
+            self.disp_filter_order,
+        )
+        if previous == current:
+            return False
+
+        try:
+            self._rebuild_display_filter()
+        except Exception:
+            (
+                self.disp_filter_btype,
+                self.disp_filter_low,
+                self.disp_filter_high,
+                self.disp_filter_order,
+            ) = previous
+            self._rebuild_display_filter()
+            raise
+        return True
+
+    def _filter_display(self, payload: np.ndarray) -> np.ndarray:
+        """Run the display filter across rows, carrying state between chunks."""
+        sos = self._disp_filt
+        if sos is None or payload.size == 0:
+            return payload
+        if self._disp_zi is None or self._disp_zi.shape[1] != payload.shape[0]:
+            # sosfilt wants (n_sections, n_rows, 2) when filtering along axis 1,
+            # seeded from the first sample of each row so the plot does not open
+            # with a step response.
+            steady = signal.sosfilt_zi(sos)[:, np.newaxis, :]
+            self._disp_zi = (steady * payload[np.newaxis, :, 0, np.newaxis]).astype(
+                sos.dtype
+            )
+        filtered, self._disp_zi = signal.sosfilt(sos, payload, axis=1, zi=self._disp_zi)
+        return filtered
+
+    # -- demodulation ----------------------------------------------------------
+
+    def _phasor_ramp(self, if_freq: float, n: int) -> np.ndarray:
+        """``exp(-1j*inc*arange(n))`` for one IF, cached across chunks and Rx.
+
+        Every Rx demodulating the same Tx walks the identical ramp, and the
+        chunk length is fixed by the Rx buffer, so the transcendental is paid
+        once per configuration rather than once per source per chunk. That one
+        substitution is 0.62 ms of the 2.2 ms each source used to cost.
         """
+        key = (float(if_freq), int(n))
+        ramp = self._ramp_cache.get(key)
+        if ramp is None:
+            increment = 2 * np.pi * float(if_freq) / self.samp_rate
+            ramp = np.exp(-1j * increment * np.arange(n)).astype(np.complex64)
+            if len(self._ramp_cache) >= self._RAMP_CACHE_MAX:
+                self._ramp_cache.clear()
+            self._ramp_cache[key] = ramp
+        return ramp
+
+    _RAMP_CACHE_MAX = 64
+
+    def set_filter_params(self, bandwidths=None, ftype: str = None, order: int = None):
+        """Adopt new IF band-pass settings live. Returns True if anything changed."""
+        previous = (list(self.if_filter_bw), self.if_filter_type, self.if_filter_order)
+
+        if bandwidths is not None:
+            values = (
+                [float(bw) for bw in bandwidths]
+                if isinstance(bandwidths, list | tuple)
+                else [float(bandwidths)] * len(self.channel_ifs)
+            )
+            for idx, value in enumerate(values[: len(self.if_filter_bw)]):
+                self.if_filter_bw[idx] = value
+        if ftype is not None:
+            self.if_filter_type = str(ftype)
+        if order is not None:
+            self.if_filter_order = max(1, int(order))
+
+        if previous == (self.if_filter_bw, self.if_filter_type, self.if_filter_order):
+            return False
+
+        try:
+            self._rebuild_filters()
+        except Exception:
+            self.if_filter_bw, self.if_filter_type, self.if_filter_order = (
+                list(previous[0]),
+                previous[1],
+                previous[2],
+            )
+            raise
+        return True
+
+    def set_samp_rate(self, samp_rate: float) -> bool:
+        """Demodulate at a new sample rate. Returns True if anything changed."""
+        samp_rate = float(samp_rate)
+        if samp_rate == self.samp_rate:
+            return False
+
+        previous = self.samp_rate
+        self.samp_rate = samp_rate
+        try:
+            self._rebuild_filters()
+        except Exception:
+            self.samp_rate = previous
+            self._rebuild_filters()
+            raise
+        self._rebuild_display_filter()
+        self._rebuild_demod_sources()
+        return True
+
+    def set_channel_if(self, tx_idx: int, freq: float):
+        """Retune one Tx's demodulation IF and its band-pass, live."""
         if tx_idx < 0 or tx_idx >= len(self.if_filts):
             return
         freq = float(freq)
@@ -157,27 +323,16 @@ class ProcessWorker(PausableWorker):
                 source.filter_state = None
 
     def set_sources(self, data_sources, cal_ref_sources, channel_ifs, if_filter_bw):
-        """Adopt a new channel map's rows, filters and per-source state.
-
-        Everything ``__init__`` derives from the source list, redone: the
-        channel map decides how many rows are emitted and what each one is, so
-        a stale list here means rows demodulated against the wrong Tx.
-        Per-source demodulator state and the DPIC metrics are dropped -- both
-        are indexed by the meanings that just changed.
-        """
+        """Adopt a new channel map's rows, filters and per-source state."""
         self.mimo_sources = sorted(data_sources, key=lambda s: s.channel)
         self.cal_ref_sources = sorted(cal_ref_sources or [], key=lambda s: s.channel)
         self.all_sources = self.mimo_sources + self.cal_ref_sources
         self.data_sources = self.all_sources
 
-        # Held by reference, as in __init__: the backend mutates this list when
-        # DPIC coerces an inject Tx's IF.
         self.channel_ifs = channel_ifs
         self.if_filter_bw = list(if_filter_bw)
-        self.if_filts = [
-            self._load_filter(self.channel_ifs[idx], self.if_filter_bw[idx])
-            for idx in range(len(self.channel_ifs))
-        ]
+        self._rebuild_filters()
+        self._disp_zi = None
 
         self._partial_rows.clear()
         with self._metrics_cv:
@@ -203,11 +358,7 @@ class ProcessWorker(PausableWorker):
         min_new: int = 2,
         timeout: float = 2.0,
     ) -> float | None:
-        """Block until ``min_new`` fresh chunks have been measured.
-
-        The Rx path buffers deeply, so a value read straight after a setting
-        change still describes the old one.
-        """
+        """Block until ``min_new`` fresh chunks have been measured."""
         entry = self._wait_for_entry(measure_tx, measure_rx, min_new, timeout)
         return entry[0] if entry else None
 
@@ -227,41 +378,41 @@ class ProcessWorker(PausableWorker):
                 self._metrics_cv.wait(remaining)
 
     def _process_chunk(self, data, source, filt, if_freq, scheme):
-        """Returns (first_comp, second_comp, metric).
-
-        ``metric`` is always the normalized mean baseband magnitude; it must
-        not be derived from ``first_comp``, which is signed under ``save_iq``.
-        """
+        """Returns (first_comp, second_comp, metric)."""
         if len(data) == 0:
             return np.array([]), np.array([]), None
 
-        current_filter_state = source.filter_state
-        filt_data, new_filter_state = apply_filter(data, filt, zi=current_filter_state)
+        if source.filter_state is None:
+            source.filter_state = initial_state(filt, data[0])
+        filt_data, new_filter_state = apply_filter(data, filt, zi=source.filter_state)
         source.filter_state = new_filter_state
 
+        n_in = len(filt_data)
         current_phase = source.accumulated_phase
         phase_increment = 2 * np.pi * if_freq / self.samp_rate
-        phases = current_phase + np.arange(len(filt_data)) * phase_increment
 
-        downconversion = np.exp(-1j * phases)
+        downconversion = np.complex64(np.exp(-1j * current_phase)) * self._phasor_ramp(
+            if_freq, n_in
+        )
         baseband_data = filt_data * downconversion
 
         if self.signal_scheme == "fmcw" and self.fmcw_scheme is not None:
             ref = self.fmcw_scheme.get_dechirp_reference(
-                len(filt_data), source.accumulated_sample_idx
+                n_in, source.accumulated_sample_idx
             )
             baseband_data = baseband_data * ref
 
-        source.accumulated_phase = phases[-1] + phase_increment
-        source.accumulated_sample_idx += len(filt_data)
+        # Kept inside one turn: the accumulator used to grow without bound, so a
+        # long session slowly lost mantissa on the very quantity the phase
+        # channel is made of.
+        source.accumulated_phase = (current_phase + n_in * phase_increment) % (2 * np.pi)
+        source.accumulated_sample_idx += n_in
 
         step = self.save_ds
         num_windows = len(baseband_data) // step
         if num_windows <= 0:
             return np.array([]), np.array([]), None
 
-        # Save windows are contiguous blocks of ``step`` samples, so this
-        # reshape is a view rather than a copy.
         usable = num_windows * step
         windows = baseband_data[:usable].reshape(num_windows, step)
 
@@ -277,48 +428,35 @@ class ProcessWorker(PausableWorker):
             first_comp = np.mean(np.real(windows), axis=1)
             second_comp = np.mean(np.imag(windows), axis=1)
         else:
-            # Amplitude: one reduction over the whole (n_windows, step) block.
             first_comp = np.abs(windows).mean(axis=1)
             if tx_amp > 0:
                 first_comp = first_comp / tx_amp
 
-            # Unwrap once with continuity from the previous chunk, then
-            # reduce per window.
-            angles = np.angle(baseband_data[:usable])
-            if source.prev_phase is None:
-                unwrapped = np.unwrap(angles)
-            else:
-                unwrapped = np.unwrap(np.concatenate(([source.prev_phase], angles)))[1:]
-            source.prev_phase = float(unwrapped[-1])
-
-            # Static Tx phase only: tx_phase_at() also carries the IF ramp
-            # that the downconversion already removed.
             tx_phase = (
                 active_scheme.tx_phase_offset(local_tx_idx)
                 if active_scheme is not None
                 else 0.0
             )
-            second_comp = unwrapped.reshape(num_windows, step).mean(axis=1) - tx_phase
+            # Vector-average each window, then take one angle per saved point.
+            # The old path unwrapped all `save_ds * num_windows` raw angles and
+            # averaged those: 0.87 ms per source per chunk against 0.04 ms here,
+            # and it produced a phase that ran away linearly instead of sitting
+            # in (-pi, pi]. Averaging the complex samples is also the better
+            # estimator -- noise cancels in the sum rather than folding through
+            # arctan2 first.
+            second_comp = np.angle(windows.mean(axis=1) * np.exp(-1j * tx_phase))
 
-        # Magnitude metric for DPIC, independent of the save format.
         metric = normalized_amplitude(baseband_data, tx_amp)
         return first_comp, second_comp, metric
 
     def _decimate_display(self, payload: np.ndarray) -> np.ndarray:
-        """Reduce the display stream by ``display_ds`` on top of ``save_ds``.
-
-        The advertised ``disp_freq`` on every source is
-        ``samp_rate / (save_ds * display_ds)``; the two must stay in step or
-        the client's time axis scrolls at the wrong speed.
-        """
+        """Reduce the display stream by ``display_ds`` on top of ``save_ds``."""
         step = self.display_ds
         if step <= 1:
             return payload
         n_rows, n_samples = payload.shape
         num_windows = n_samples // step
         if num_windows <= 0:
-            # Chunk shorter than one display window: keep a single averaged
-            # point rather than dropping the chunk entirely.
             return payload.mean(axis=1, keepdims=True)
         usable = num_windows * step
         return payload[:, :usable].reshape(n_rows, num_windows, step).mean(axis=2)
@@ -331,11 +469,7 @@ class ProcessWorker(PausableWorker):
         return envelope[: num_windows * step].reshape(num_windows, step).mean(axis=1)
 
     def _process_mimo_chunk(self, buffer):
-        """Demodulate every (Tx, Rx) pair once.
-
-        Keyed by ``(tx_idx, rx_idx)`` rather than by channel because several
-        display rows can share one pair -- one per streamed component.
-        """
+        """Demodulate every (Tx, Rx) pair once."""
         results = {}
         metrics = {}
         for source in self._demod_sources:
@@ -368,13 +502,7 @@ class ProcessWorker(PausableWorker):
         num_cal = len(self.cal_ref_sources) if self.record_cal_ref else 0
         len_samples = int(buffer.shape[1] // self.save_ds)
 
-        # Calibration reference rows go to the display as well as to disk;
-        # the backend advertises a CalRef_* source for each.
         n_rows = num_mimo + num_cal
-        # The display payload is always one value per advertised source: the
-        # component that source names. The save path keeps its older stacked
-        # (row, sample, 2) form unless the rows already carry one component
-        # each, in which case stacking would just duplicate them.
         stack_save = self.save_imaginary and not self._per_source_components
         if stack_save:
             save_list = np.zeros((n_rows, len_samples, 2))
@@ -404,7 +532,6 @@ class ProcessWorker(PausableWorker):
                 )
                 cal_data = self._decimate_cal_ref(raw_env)
                 if stack_save:
-                    # Real-valued envelope: channel 0, imaginary left at 0.
                     save_list[source.channel, : len(cal_data), 0] = cal_data
                     save_list[source.channel, : len(cal_data), 1] = 0.0
                 else:
@@ -415,8 +542,6 @@ class ProcessWorker(PausableWorker):
         return save_list, display_list
 
     def work(self):
-        # work() is re-entered on every resume; rows held from before the
-        # pause would misalign the MIMO buffer.
         self._partial_rows.clear()
 
         while self.is_running:
@@ -430,20 +555,14 @@ class ProcessWorker(PausableWorker):
                 self._partial_rows.clear()
                 widths = {row.shape[1] for row in rows}
                 if len(widths) > 1:
-                    # Different-length buffers: trim to the common length
-                    # rather than letting vstack raise per chunk.
                     n = min(widths)
                     rows = [row[:, :n] for row in rows]
                 buffer = np.vstack(rows)
 
                 mimo_results = self._process_mimo_chunk(buffer)
-                # Index of this chunk's first *save* sample, taken before
-                # _assemble_outputs advances the raw counter. The recorder uses
-                # it to tell a contiguous chunk from one that follows a drop.
                 save_sample_idx = self.global_sample_idx // max(1, int(self.save_ds))
                 save_data, display_data = self._assemble_outputs(buffer, mimo_results)
 
-                # Save path: absorb a short disk stall before dropping.
                 save_item = {
                     "data": save_data,
                     "sample_idx": save_sample_idx,
@@ -455,10 +574,13 @@ class ProcessWorker(PausableWorker):
                     self.save_chunks_dropped += 1
                     self._log_drops()
 
-                # Display path: evict the oldest rather than add latency.
                 if self.display_queue is not None:
                     display_payload = self._decimate_display(display_data)
-                    # float32 on the wire; the save path stays float64.
+                    display_payload = self._filter_display(
+                        np.ascontiguousarray(display_payload, dtype=np.float32)
+                    )
+                    # The wire format assumes a contiguous float32 block, and
+                    # the filter is the last thing that could have broken that.
                     display_payload = np.ascontiguousarray(
                         display_payload, dtype=np.float32
                     )
@@ -468,7 +590,6 @@ class ProcessWorker(PausableWorker):
 
             except queue.Empty:
                 time.sleep(0.001)
-                # log_print(self.logger, "debug", "[USRP] Rx Queue Empty")
             except Exception as e:
                 log_print(self.logger, "error", f"[USRP] Processing error: {e}")
 

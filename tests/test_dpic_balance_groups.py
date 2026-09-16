@@ -1,11 +1,4 @@
-"""Balances on different device groups must run side by side.
-
-Each group is its own backend process driving its own radios, so a search on
-one has nothing to wait for on another. The server used to hold a single
-balance slot: starting a second group's balance while the first ran was
-refused outright, and a four-group rig had to sit through four minute-long
-searches end to end.
-"""
+"""Balances on different device groups must run side by side."""
 
 import threading
 
@@ -56,8 +49,6 @@ def test_a_second_group_balances_while_the_first_is_running(server):
     server._run_dpic_balance({"id": "grp1"})
     assert one.started.wait(timeout=5)
 
-    # The other group is accepted rather than refused, and actually reaches
-    # its hardware while the first search is still sweeping.
     server._run_dpic_balance({"id": "grp2"})
     assert two.started.wait(timeout=5)
     assert server.sent[-1][0] is Response.SUCCESS
@@ -101,8 +92,6 @@ def test_status_reports_every_group_and_the_last_one_singly(server):
     _response, params = server.sent[-1]
 
     assert set(params["dpic_balances"]) == {"grp1", "grp2"}
-    # The singular field a pre-map client reads is the newest search, so such
-    # a client follows the one it just started.
     assert params["dpic_balance"]["device_id"] == "grp2"
 
     one.release.set()

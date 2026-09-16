@@ -1,16 +1,4 @@
-"""Real-time suitability of the processing pipeline, on synthetic data.
-
-Two things are checked, both against the wall-clock budget a chunk actually has:
-
-1. Per-stage cost. Each stage is timed separately and printed as a table so a
-   regression shows up as a number rather than as "streaming feels laggy".
-2. Sustained behaviour. A fake-RF stream is run long enough that any leak or
-   imbalance would show, then the drop counters are required to be zero.
-
-The budget matters more than the absolute numbers: a chunk of N samples at
-``samp_rate`` must be fully processed in under ``N / samp_rate`` seconds, or the
-queues fill and data is dropped no matter how deep they are.
-"""
+"""Real-time suitability of the processing pipeline, on synthetic data."""
 
 import time
 
@@ -26,12 +14,10 @@ from bioview_server.device.usrp.process import ProcessWorker
 SAMP_RATE = 1e6
 IF_HZ = 100e3
 SAVE_DS = 10
-CHUNK_SAMPLES = 40_000  # 40 ms of audio at 1 MSps
+CHUNK_SAMPLES = 40_000
 CHUNK_SECONDS = CHUNK_SAMPLES / SAMP_RATE
 N_SOURCES = 4
 
-#: Total pipeline budget as a fraction of real time. Leaves room for the socket,
-#: the OS, and a second device group.
 REALTIME_BUDGET = 0.5
 
 
@@ -80,7 +66,7 @@ def _buffer(n_rx, seed=3):
 
 
 def _time(fn, repeats):
-    fn()  # warm up (filter state, allocations)
+    fn()
     start = time.perf_counter()
     for _ in range(repeats):
         fn()
@@ -232,10 +218,6 @@ def test_sustained_fake_rf_stream_drops_nothing(server, client, capsys):
 
     client.command(Command.STOP_STREAMING)
 
-    # FakeRfWorker emits one buffer per chunk_duration * SAVE_BUFFER_SCALE,
-    # mirroring the USRP receive worker's 20-packet buffering. Derive the
-    # expected rate from the config rather than assuming one chunk per
-    # chunk_duration.
     from fakes.rf_worker import SAVE_BUFFER_SCALE
 
     emit_period = group_cfg["chunk_duration"] * SAVE_BUFFER_SCALE

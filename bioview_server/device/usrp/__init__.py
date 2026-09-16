@@ -1,14 +1,8 @@
-"""USRP backend package.
-
-Heavy dependencies (UHD) are loaded lazily, so ``process`` -- the demodulation
-pipeline every RF path shares -- can be imported without USRP drivers present.
-"""
+"""USRP backend package."""
 
 from bioview_common import log_print
 
 
-# Properties the Configurator may edit, as {name: field spec}. An empty
-# mapping means "not editable" and greys out the Edit button.
 EDITABLE_PROPERTIES = {
     "device_name": {
         "type": "text",
@@ -21,11 +15,7 @@ EDITABLE_PROPERTIES = {
 
 
 def set_device_config(device_info: dict, new_config: dict, logger=None):
-    """Apply Configurator edits to one device. Returns ``(ok, message)``.
-
-    Names are BioView-side aliases keyed on serial, applied during discovery;
-    no EEPROM is written. See bioview-docs/reference/usrp.md.
-    """
+    """Apply Configurator edits to one device. Returns ``(ok, message)``."""
     from .naming import get_device_aliases, set_device_alias, update_usrp_address
 
     serial = (device_info or {}).get("serial")
@@ -50,14 +40,12 @@ def set_device_config(device_info: dict, new_config: dict, logger=None):
 
     update_usrp_address(new_name, serial, logger=logger)
 
-    # The alias is overlaid while building the uhd.find cache, so the cache
-    # has to be dropped for a rename to show up.
     try:
         from .utils import invalidate_discovery_cache
 
         invalidate_discovery_cache()
     except ImportError:
-        pass  # UHD absent: nothing was cached to drop.
+        pass
     except Exception as e:
         log_print(
             logger,

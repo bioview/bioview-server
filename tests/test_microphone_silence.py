@@ -1,10 +1,4 @@
-"""A dead input and a quiet one look identical on the plot.
-
-The stream is open, chunks arrive on time, every counter is zero -- and the
-trace is flat because the device is muted, unplugged or set to zero gain in
-Windows. Nothing in the pipeline is wrong, which is exactly why it has to be
-said out loud rather than left for someone to notice after a 255 s routine.
-"""
+"""A dead input and a quiet one look identical on the plot."""
 
 import queue
 
@@ -74,10 +68,8 @@ def test_sustained_silence_is_reported_once(worker):
     warnings = worker.log.messages("warning")
     assert len(warnings) == 1
     assert "digital silence" in warnings[0]
-    # It says the pipeline is fine, because that is the confusing part.
     assert "muted" in warnings[0]
 
-    # Still silent, still one warning: this must not fill the log.
     _feed(worker, zeros, at=200.0)
     _feed(worker, zeros, at=300.0)
     assert len(worker.log.messages("warning")) == 1
@@ -92,7 +84,6 @@ def test_signal_withdraws_the_warning(worker):
     _feed(worker, np.full(160, 0.2), at=111.0)
     assert "Signal detected" in worker.log.messages("info")[-1]
 
-    # And the clock restarts, so a later silence is reported afresh.
     _feed(worker, zeros, at=112.0)
     _feed(worker, zeros, at=112.0 + acquire._SILENCE_WARN_AFTER_S + 0.1)
     assert len(worker.log.messages("warning")) == 2
@@ -105,8 +96,7 @@ def test_a_live_input_is_never_warned_about(worker):
 
 
 def test_a_noise_floor_counts_as_signal(worker):
-    """Only a device sitting at exact zero is silent; a real input's noise
-    floor is orders of magnitude above the threshold."""
+    """Only a device sitting at exact zero is silent; a real input's noise"""
     rng = np.random.default_rng(0)
     for i in range(20):
         _feed(worker, rng.normal(0, 1e-4, 160), at=100.0 + i)
@@ -125,8 +115,7 @@ def test_the_verdict_resets_between_runs(worker):
 
 
 def test_the_check_runs_on_the_real_work_path(worker):
-    """Guards the wiring, not the logic: a silence check nothing calls is
-    exactly the bug this was written to catch."""
+    """Guards the wiring, not the logic: a silence check nothing calls is"""
     worker.capture_queue.put(np.zeros((160, 1), dtype=np.float32))
     worker.work()
     assert worker._silent_since is not None

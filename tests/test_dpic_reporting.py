@@ -1,10 +1,4 @@
-"""A DPIC balance that does not run must never reach the client as a success.
-
-Every early-out in ``_run_dpic_balance`` used to return None, which the IPC
-layer turned into ``Response.SUCCESS``, which the server turned into "DPIC
-balance complete". The UI reported a finished balance in about 2 ms while
-nothing had been driven at all.
-"""
+"""A DPIC balance that does not run must never reach the client as a success."""
 
 import multiprocessing as mp
 
@@ -92,12 +86,10 @@ def test_an_expired_budget_says_so_rather_than_looking_instant():
         set_amplitude=lambda v: None,
         read_metric=lambda: 1.0,
     )
-    # Negative budget: the deadline is already past when the search starts.
     result = DpicBalancer(time_budget_s=-1.0).balance(ch)
 
     assert not result.converged
     assert "budget expired" in result.message
-    # The stages are still reported, showing zero points visited.
     assert [s.name for s in result.stages] == [
         "coarse phase",
         "coarse amplitude",
@@ -123,8 +115,6 @@ def test_a_truncated_sweep_is_flagged():
         set_phase=lambda v: None,
         set_amplitude=lambda v: None,
         read_metric=read_metric,
-        # A fixed dwell, ignoring the duration the balancer asks for: the
-        # point of this test is the budget, not the VI's timings.
         wait_settle=lambda _s: __import__("time").sleep(0.004),
     )
     result = DpicBalancer(time_budget_s=0.05).balance(ch)
@@ -167,7 +157,6 @@ def test_ipc_reply_type_follows_the_outcome(ok):
 
     class Stub(Backend):
         def __init__(self):
-            # Skip Backend.__init__: only the command dispatch is under test.
             self.group_id = "grp"
             self.logger = None
             self._init_local_state()
@@ -183,8 +172,6 @@ def test_ipc_reply_type_follows_the_outcome(ok):
     stub._handle_command(
         {"command": IPCCommand.RUN_DPIC_BALANCE, "request_id": 1, "args": {}}
     )
-    # The balance is answered from its own thread now, so the command loop can
-    # keep serving Stop while it runs.
     assert answered.wait(timeout=5)
 
     assert replies[0]["type"] is (Response.SUCCESS if ok else Response.ERROR)

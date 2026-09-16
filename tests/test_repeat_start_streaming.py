@@ -1,11 +1,4 @@
-"""A second START_STREAMING must not restart a session that is already running.
-
-Start/Stop is served on the session's own command thread, and the client's Start
-button stays live for the minute a start can take (every worker is an OS process
-spawn on Windows). A user who clicks it again -- or a second window on the same
-shared server -- used to have every click reach the devices, tearing down and
-rebuilding the workers under a session that was already streaming.
-"""
+"""A second START_STREAMING must not restart a session that is already running."""
 
 from bioview_common import Response
 
@@ -58,8 +51,6 @@ def test_a_repeat_start_is_answered_without_touching_the_devices(monkeypatch):
 
     assert handler.starts == 1, "repeat starts must not reach the device"
 
-    # SUCCESS, not ERROR: the session *is* streaming, which is what was asked
-    # for, and an error would drop a working client into a failed state.
     assert all(resp is Response.SUCCESS for resp, _ in recorder.sent)
 
 

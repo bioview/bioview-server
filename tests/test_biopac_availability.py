@@ -1,10 +1,4 @@
-"""Whether a configured BIOPAC group counts as attached hardware.
-
-A BIOPAC group's hardware keys are labels the user picked ("BIOPAC_MP36");
-discovery names the unit after its Windows device name ("BIOPAC MP36 USB Data
-Acquisition Unit"). Requiring those to match marked a physically connected unit
-as unavailable, so the Monitor would not discover or initialize it.
-"""
+"""Whether a configured BIOPAC group counts as attached hardware."""
 
 from bioview_common import Configuration, DeviceStatus
 
@@ -61,9 +55,7 @@ def test_no_biopac_attached_is_unavailable(monkeypatch):
 
 
 def test_another_backends_devices_do_not_pass_for_biopac_hardware(monkeypatch):
-    """Every backend's results land in one cache; availability must not be read
-    from the combined pool, or a machine with only a virtual device would look
-    like it had a BIOPAC unit attached."""
+    """Every backend's results land in one cache; availability must not be read"""
     backends = {
         "biopac": FakeBackend({}),
         "fake": FakeBackend({"FakeDevice": {"name": "FakeDevice"}}),

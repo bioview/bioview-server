@@ -1,18 +1,4 @@
-"""A fake device, registered into the server for the duration of a test run.
-
-The server ships three real backends (USRP, BIOPAC, microphone), every one of
-which needs hardware attached. This package supplies a fourth that needs none,
-so the whole connect -> stream -> display -> save path stays covered on an
-ordinary development machine.
-
-It lives under ``tests/`` rather than in ``bioview_server`` on purpose: a test
-double that ships is a device the operator can pick by mistake, and it showed up
-in the Configurator's device list. Nothing in ``bioview_server`` imports this;
-``install()`` below reaches in through the two registries the real backends use
--- ``AVAILABLE_BACKENDS`` / ``HANDLER_FACTORIES`` on the server, and the
-configuration registry in bioview-common -- so the fake travels the same code
-path a real device does, discovery included.
-"""
+"""A fake device, registered into the server for the duration of a test run."""
 
 from bioview_common.datatypes.configuration.config import (
     BaseConfig,
@@ -23,14 +9,9 @@ from bioview_common.datatypes.configuration.config import (
 from .backend import FakeBackend, SineWaveWorker
 
 
-#: Wire-format ``type`` and backend ``device_type`` for the fake. Neither
-#: appears in the shipped enums; the parser learns them from ``install()``.
 FAKE_CFG_TYPE = "FAKE"
 FAKE_DEVICE_TYPE = "fake"
 
-#: What ``discover_devices`` reports. A config group (or a hardware key inside
-#: one) named after any of these is found by the server's ordinary discovery
-#: matching, so the fake needs no special case in the availability rules.
 FAKE_DEVICE_NAMES = ("FakeDevice", "FakeDevice_1", "FakeDevice_2")
 
 
@@ -41,7 +22,6 @@ BASE_FAKE_CONFIG = {
     "amplitude": 1.0,
     "noise_std": 0.0,
     "chunk_duration": 0.05,
-    # RF simulation (optional -- enables MIMO / DPIC / calibration testing)
     "signal_scheme": "cw",
     "tx_gain": [30, 30],
     "tx_amplitude": [1, 1],
@@ -85,12 +65,7 @@ BASE_FAKE_CONFIG = {
 
 
 class FakeConfiguration(BaseConfig):
-    """Reads a ``"type": "FAKE"`` block.
-
-    Without ``hardware``/``channel_map`` the backend synthesizes phase-shifted
-    sine waves; with them it runs the full USRP pipeline against a virtual MIMO
-    channel.
-    """
+    """Reads a ``"type": "FAKE"`` block."""
 
     def __init__(self, config_dict: dict):
         super().__init__(BASE_FAKE_CONFIG)
@@ -117,7 +92,6 @@ def discover_devices(logger=None):
     ]
 
 
-#: No Configurator-editable properties, matching the simplest real backend.
 EDITABLE_PROPERTIES = {}
 
 
@@ -134,10 +108,7 @@ def _build_handler(backend, device_id, device_cfg, queues, discovered_devices):
 
 
 def install():
-    """Register the fake with the server and the configuration parser.
-
-    Idempotent, so an autouse fixture can call it per test.
-    """
+    """Register the fake with the server and the configuration parser."""
     import sys
 
     from bioview_server.device import AVAILABLE_BACKENDS, HANDLER_FACTORIES

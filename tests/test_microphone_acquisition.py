@@ -1,11 +1,4 @@
-"""How the microphone backend turns PortAudio callbacks into pipeline chunks.
-
-Everything here runs against a fake PortAudio: the machines these tests run on
-have no guaranteed audio input, and a test that silently passes because no
-frames ever arrived would be worse than no test. The fake drives the very
-callback ``sd.InputStream`` would call, so the path under test is the real one
-from the callback inward.
-"""
+"""How the microphone backend turns PortAudio callbacks into pipeline chunks."""
 
 import multiprocessing as mp
 import queue
@@ -65,12 +58,7 @@ def worker():
 
 
 def test_callback_frames_are_transposed_to_channel_rows(worker):
-    """PortAudio hands back (frames, channels); the pipeline wants the transpose.
-
-    A missed transpose is not an error anywhere downstream -- it produces a
-    plausible-looking array with the axes swapped, which only shows up as a
-    recording whose channel count changes with its chunk size.
-    """
+    """PortAudio hands back (frames, channels); the pipeline wants the transpose."""
     indata = np.array([[1.0, 10.0], [2.0, 20.0], [3.0, 30.0]], dtype=np.float32)
     worker.callback(indata, 3, None, FakeStatus())
 
@@ -82,14 +70,10 @@ def test_callback_frames_are_transposed_to_channel_rows(worker):
 
 
 def test_callback_copies_the_buffer_it_is_given(worker):
-    """PortAudio reuses its input buffer between callbacks.
-
-    Keeping a view of it means every queued chunk ends up holding whatever the
-    newest callback wrote -- a recording of the last 100 ms, repeated.
-    """
+    """PortAudio reuses its input buffer between callbacks."""
     indata = np.array([[1.0, 1.0]], dtype=np.float32)
     worker.callback(indata, 1, None, FakeStatus())
-    indata[:] = 99.0  # PortAudio overwriting its buffer
+    indata[:] = 99.0
 
     chunks = drain(worker.display_queue)
     assert len(chunks) == 1
@@ -107,11 +91,7 @@ def test_gain_is_applied_to_both_the_saved_and_displayed_copy(worker):
 
 
 def test_saved_chunk_is_not_the_displayed_array(worker):
-    """The two queues must not hand out the same object.
-
-    The display path is allowed to mutate what it is given; sharing the array
-    would corrupt the recording rather than the plot.
-    """
+    """The two queues must not hand out the same object."""
     worker.callback(np.array([[1.0, 2.0]], dtype=np.float32), 1, None, FakeStatus())
     displayed = drain(worker.display_queue)[0]
     saved = drain(worker.save_queue)[0]
@@ -121,12 +101,7 @@ def test_saved_chunk_is_not_the_displayed_array(worker):
 
 
 def test_a_full_capture_queue_drops_rather_than_blocking():
-    """The callback runs on PortAudio's own thread and must never block there.
-
-    Blocking it stalls the audio device itself, which loses far more than the
-    chunk that could not be queued.
-    """
-    # Never started, so nothing drains the capture queue.
+    """The callback runs on PortAudio's own thread and must never block there."""
     w = MicrophoneAcquisitionWorker(
         channels=1, samp_rate=16000, display_queue=queue.Queue()
     )
@@ -147,11 +122,7 @@ def test_host_overflows_are_counted(worker):
 
 
 def test_extra_hardware_channels_are_trimmed_to_the_configured_count():
-    """Some inputs will only open at their full channel count.
-
-    Emitting the extra rows would reshape every chunk against the source list
-    the pipeline was told to expect.
-    """
+    """Some inputs will only open at their full channel count."""
     w = MicrophoneAcquisitionWorker(
         channels=1, samp_rate=16000, display_queue=queue.Queue()
     )
@@ -165,9 +136,6 @@ def test_extra_hardware_channels_are_trimmed_to_the_configured_count():
     finally:
         w.stop()
         w.join(timeout=2)
-
-
-# --------------------------------------------------------------- resolution
 
 
 def test_sanitize_name_collapses_host_punctuation():
@@ -204,8 +172,6 @@ def test_resolve_input_device_matches_key_then_substring(monkeypatch):
     assert resolve_input_device("Headset_Microphone_USB") == 7
     assert resolve_input_device("headset") == 7
     assert resolve_input_device(4) == 4
-    # No host default: a loopback is never the right guess, so the real input
-    # wins even though it enumerates second.
     assert resolve_input_device("default") == 7
 
     with pytest.raises(RuntimeError, match="no audio input device matches"):
@@ -213,12 +179,7 @@ def test_resolve_input_device_matches_key_then_substring(monkeypatch):
 
 
 def test_an_input_that_will_not_open_is_not_chosen(monkeypatch):
-    """A Realtek front-panel jack enumerates whether or not anything is in it.
-
-    An unpopulated one refuses every open with ``Invalid device``. Picking it
-    because it came first in enumeration order failed the whole group at
-    Connect while a working input sat further down the list.
-    """
+    """A Realtek front-panel jack enumerates whether or not anything is in it."""
     devices = [
         {
             "index": 10,
@@ -239,12 +200,7 @@ def test_an_input_that_will_not_open_is_not_chosen(monkeypatch):
 
 
 def test_an_input_named_by_hand_is_honoured_even_if_it_will_not_open(monkeypatch):
-    """The open probe only ranks the automatic choice.
-
-    A named device is the operator's decision, and the error PortAudio raises
-    at Connect names it -- second-guessing it here would make a typo and a
-    deliberate choice indistinguishable.
-    """
+    """The open probe only ranks the automatic choice."""
     devices = [
         {"index": 10, "name": "FrontMic (Realtek)", "max_input_channels": 2},
         {"index": 12, "name": "Headset Microphone (USB)", "max_input_channels": 1},
@@ -255,8 +211,7 @@ def test_an_input_named_by_hand_is_honoured_even_if_it_will_not_open(monkeypatch
 
 
 def test_nothing_usable_says_what_was_rejected_and_why(monkeypatch):
-    """The whole point: PortAudio's own message names neither the device nor
-    the reason, and this machine hits exactly this path."""
+    """The whole point: PortAudio's own message names neither the device nor"""
     devices = [
         {
             "index": 9,
@@ -271,7 +226,6 @@ def test_nothing_usable_says_what_was_rejected_and_why(monkeypatch):
             "default_samplerate": 44100.0,
         },
     ]
-    # Only the loopback opens -- which is never an automatic choice.
     _patch_inputs(monkeypatch, devices, openable={9})
 
     with pytest.raises(RuntimeError) as excinfo:
@@ -280,16 +234,11 @@ def test_nothing_usable_says_what_was_rejected_and_why(monkeypatch):
     message = str(excinfo.value)
     assert "FrontMic" in message
     assert "plugged into the jack" in message
-    # And it lists what could have been named instead.
     assert "Stereo Mix" in message
 
 
 def test_a_loopback_is_still_never_chosen_automatically(monkeypatch):
-    """Even when it is the only input that opens.
-
-    A loopback records the instruction audio being played back instead of the
-    participant, and nothing about the recording says so until it is opened.
-    """
+    """Even when it is the only input that opens."""
     devices = [
         {
             "index": 9,
@@ -303,16 +252,11 @@ def test_a_loopback_is_still_never_chosen_automatically(monkeypatch):
     with pytest.raises(RuntimeError, match="no usable audio input"):
         resolve_input_device("default")
 
-    # Named by hand, it is honoured.
     assert resolve_input_device("Stereo Mix") == 9
 
 
 def test_negotiate_samplerate_falls_back_to_a_supported_rate(monkeypatch):
-    """MME commonly offers a device only at its native rate.
-
-    Refusing the session outright over a rate the driver merely dislikes would
-    be worse than recording at a rate the file then declares.
-    """
+    """MME commonly offers a device only at its native rate."""
     supported = {44100.0}
     monkeypatch.setattr(
         "bioview_server.device.microphone.utils.supports_input",
@@ -328,8 +272,6 @@ def test_negotiate_samplerate_falls_back_to_a_supported_rate(monkeypatch):
         "bioview_server.device.microphone.utils._sounddevice", lambda: FakeSd
     )
 
-    # The device's own native rate is tried before the generic ladder, so a
-    # card that only runs at 44.1 kHz is found in one probe rather than four.
     assert negotiate_samplerate(0, 1, 16000) == 44100.0
     assert negotiate_samplerate(0, 1, 44100) == 44100.0
 
@@ -347,9 +289,6 @@ def test_negotiate_samplerate_returns_the_request_when_nothing_works(monkeypatch
     assert negotiate_samplerate(0, 1, 16000) == 16000.0
 
 
-# ------------------------------------------------------------------ backend
-
-
 def _backend(monkeypatch, group_config, negotiated=16000.0):
     monkeypatch.setattr(
         "bioview_server.device.microphone.backend.resolve_input_device",
@@ -365,11 +304,7 @@ def _backend(monkeypatch, group_config, negotiated=16000.0):
 
 
 def test_sources_carry_the_negotiated_rate_not_the_requested_one(monkeypatch):
-    """``disp_freq`` is the timebase written into the recording header.
-
-    Advertising the rate that was asked for rather than the one the input
-    actually runs at makes every recorded timestamp wrong by that ratio.
-    """
+    """``disp_freq`` is the timebase written into the recording header."""
     backend = _backend(
         monkeypatch,
         {"type": "MICROPHONE", "samp_rate": 16000, "channels": 1},
@@ -403,11 +338,7 @@ def test_configured_labels_win(monkeypatch):
 
 
 def test_a_biopac_shaped_channel_mask_still_loads(monkeypatch):
-    """``channels`` is a count here and a mask for BIOPAC.
-
-    A config copied from a BIOPAC block should open one input per set entry
-    rather than failing on ``int([1, 1, 0, 0])``.
-    """
+    """``channels`` is a count here and a mask for BIOPAC."""
     backend = _backend(
         monkeypatch, {"type": "MICROPHONE", "samp_rate": 16000, "channels": [1, 1, 0, 0]}
     )

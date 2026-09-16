@@ -21,38 +21,18 @@ from bioview_common import (
 from bioview_server.common import DisplayWorker, SaveForwarder
 
 
-# Opening a radio is the slow step: USB enumeration, FPGA/CODEC bring-up and
-# clock locking, plus an OS process spawn per backend on Windows.
 CONNECT_TIMEOUT = 150
 
-# Starting a stream, by contrast, is near-instant once the device is open: every
-# worker thread already exists and is merely resumed, so the whole path is a few
-# Event.set() calls plus a sub-second buffer-filling delay. Measured bring-up is
-# ~0.4 s for a two-channel USRP and ~0.02 s for BIOPAC. A device that has not
-# answered in several seconds is wedged, not slow, and waiting longer only
-# delays the error -- and, because devices are started in sequence, holds up
-# every other device in the session behind it.
 START_STREAMING_TIMEOUT = 5
-# Stopping has real work to do: the transmit worker sends a final end-of-burst
-# buffer and the recorder flushes and closes its HDF5 file.
 STOP_STREAMING_TIMEOUT = 15
 DISCONNECT_TIMEOUT = 15
 DEFAULT_TIMEOUT = 10
 
-# One entry per measurement, drained about once a second by the client's poll.
-# Deep enough to survive a slow poll, shallow enough that a client which stops
-# polling costs nothing.
 BALANCE_PROGRESS_QUEUE_DEPTH = 64
 
 
 class _StepTimer:
-    """Traces a multi-step bring-up so a hang names the step it hung on.
-
-    Each step is logged when it *finishes*, so the last line in the log is the
-    last thing that completed and the hang is in whatever comes next. Elapsed
-    time is per-step; a step that is merely slow is then distinguishable from
-    one that never returned.
-    """
+    """Traces a multi-step bring-up so a hang names the step it hung on."""
 
     def __init__(self, logger, what: str):
         self.logger = logger
@@ -80,11 +60,7 @@ class _StepTimer:
 
 
 class Backend(mp.Process):
-    """Common contract shared by every device-specific backend.
-
-    Each backend runs as its own process, driven over ``command_queue``; replies
-    come back on ``response_queue``, correlated by request id.
-    """
+    """Common contract shared by every device-specific backend."""
 
     def __init__(
         self,
@@ -94,42 +70,29 @@ class Backend(mp.Process):
         save_output_queue: mp.Queue = None,
     ):
         super().__init__()
-        # Parameters
+        self.daemon = True
+
         self.group_id = group_id
         self.data_sources: set[DataSource] = set()
-        # Replaced in run(), inside the child. Defined here so any code touching
-        # it from the parent gets a no-op logger rather than an AttributeError.
         self.logger = None
 
-        # Queues
         self.command_queue = mp.Queue()
         self.save_queue = None
-        # Bounded: an unbounded display queue grows without limit whenever the
-        # client or the socket writer falls behind.
         self.display_queue = mp.Queue(maxsize=DISPLAY_QUEUE_DEPTH)
 
-        # Balance progress, child -> parent. Small dicts, one per measurement;
-        # bounded because a UI that stops draining must never grow it without
-        # limit, and only the newest entry is worth anything anyway.
         self.progress_queue = mp.Queue(maxsize=BALANCE_PROGRESS_QUEUE_DEPTH)
 
         self.data_output_queue = data_output_queue
-        # Shared with every other backend and drained by the server's single
-        # BvrWriter; this device only ever pushes its own tagged records.
         self.save_output_queue = save_output_queue
-        # Never shared between backends: a reply carries no sender, so two
-        # devices reading one queue steal each other's answers.
         self.response_queue = (
             response_queue if response_queue is not None else mp.Queue()
         )
 
         self.enable_save = False
 
-        # Common workers
         self.save_worker = None
         self.display_worker = None
 
-        # State
         self.status = DeviceStatus.DISCONNECTED
         self._running = mp.Event()
         self._streaming = mp.Event()
@@ -137,28 +100,12 @@ class Backend(mp.Process):
         self._init_local_state()
 
     def _init_local_state(self):
-        """Locks, events and threads that must not cross the process boundary.
-
-        Parent-side reply routing: a balance is answered on its own thread
-        while Stop is answered on the command thread, so two callers can be
-        inside ``_request()`` on one response queue; whichever reads a reply
-        that is not its own parks it in ``_pending_replies`` for the thread
-        waiting on it. Dropping it -- what the old ``continue`` did -- lost the
-        other caller's answer and timed it out.
-
-        Child-side balance state: the search runs on its own thread so
-        STOP_STREAMING and SHUTDOWN are still answered while it is in flight.
-
-        Both sides are rebuilt after unpickling (see ``__setstate__``): spawn
-        pickles this object into the child, and a lock, an event or a live
-        thread cannot survive that.
-        """
+        """Locks, events and threads that must not cross the process boundary."""
         self._reply_lock = threading.Lock()
         self._pending_replies = {}
         self._balance_thread = None
         self._balance_abort = threading.Event()
 
-    #: Rebuilt in the child rather than shipped to it; see _init_local_state.
     _LOCAL_STATE_KEYS = (
         "_reply_lock",
         "_pending_replies",
@@ -168,12 +115,7 @@ class Backend(mp.Process):
 
     @classmethod
     def _local_state_keys(cls):
-        """Every ``_LOCAL_STATE_KEYS`` entry declared along the MRO.
-
-        Subclasses add their own locks in ``_init_local_state``; collecting the
-        keys here means a subclass declaring its own tuple extends the base
-        list rather than shadowing it.
-        """
+        """Every ``_LOCAL_STATE_KEYS`` entry declared along the MRO."""
         keys = []
         for klass in cls.__mro__:
             for key in klass.__dict__.get("_LOCAL_STATE_KEYS", ()):
@@ -191,17 +133,10 @@ class Backend(mp.Process):
         self.__dict__.update(state)
         self._init_local_state()
 
-    #: Step tracer for bring-up paths; see _StepTimer.
     _StepTimer = _StepTimer
 
-    # Common setup
     def _setup_saving(self, save_config: dict = None):
-        """Wire this device's save stream to the session recorder.
-
-        The file itself is written by the server's single ``BvrWriter``: every
-        backend is its own process, so each forwards tagged records onto one
-        shared queue rather than opening a file of its own.
-        """
+        """Wire this device's save stream to the session recorder."""
         self.enable_save = save_config.get("enable_save", False)
 
         if not self.save_queue:
@@ -210,8 +145,6 @@ class Backend(mp.Process):
             drain(self.save_queue)
 
         if self.enable_save and self.save_output_queue is not None:
-            # Stop the previous forwarder before replacing it, or its thread
-            # stays alive on the same input queue.
             if self.save_worker is not None:
                 self.save_worker.stop()
             self.save_worker = SaveForwarder(
@@ -221,13 +154,25 @@ class Backend(mp.Process):
                 logger=self.logger,
             )
 
-    def get_save_freq(self) -> float:
-        """Rate (Hz) of this device's save stream, one sample per row per tick.
+    def record_param_change(self, param: str, value, t_wall: float = None):
+        """Timestamp a setting this backend changed into the running recording."""
+        if not self.enable_save or self.save_output_queue is None:
+            return False
+        with contextlib.suppress(Exception):
+            self.save_output_queue.put_nowait(
+                {
+                    "type": "param_change",
+                    "device_id": self.group_id,
+                    "param": param,
+                    "value": value,
+                    "t_wall": float(t_wall if t_wall is not None else time.time()),
+                }
+            )
+            return True
+        return False
 
-        Distinct from ``DataSource.disp_freq``, which describes the decimated
-        display stream. Backends whose save path is decimated relative to
-        acquisition override this.
-        """
+    def get_save_freq(self) -> float:
+        """Rate (Hz) of this device's save stream, one sample per row per tick."""
         return float(getattr(self, "samp_rate", 0.0) or 0.0)
 
     def _save_rows(self):
@@ -252,27 +197,13 @@ class Backend(mp.Process):
         drain(self.save_queue)
 
     def _display_sources(self):
-        """Rows this device emits, in the order the display payload carries them.
-
-        Overridden where the emitted rows are not simply ``data_sources`` -- the
-        USRP appends calibration-reference rows.
-        """
+        """Rows this device emits, in the order the display payload carries them."""
         return list(self.data_sources)
 
     def _setup_display(self, display_config: dict = None):
         if not self.data_output_queue:
             self.data_output_queue = mp.Queue(maxsize=DATA_OUTPUT_QUEUE_DEPTH)
-        # The output queue is deliberately *not* drained here. The server hands
-        # the same queue to every backend, so draining it on one device's Start
-        # discards the chunks another device has already queued -- data loss
-        # that only shows up once two devices stream together. It is bounded and
-        # evicted oldest-first anyway, and the server's data handler drains it
-        # continuously, so nothing stale can accumulate.
 
-        # The client receives the full stream and decides what to plot, so all
-        # sources are forwarded. The worker is reused across Start/Stop cycles:
-        # replacing it leaks the old thread, which stays alive on the same
-        # input queue.
         if self.display_worker is not None:
             self.display_worker.set_display_sources(self._display_sources())
             return
@@ -290,7 +221,6 @@ class Backend(mp.Process):
 
         drain(self.display_queue)
 
-    # Device control, implemented per device
     def _initialize(self):
         raise NotImplementedError
 
@@ -313,10 +243,7 @@ class Backend(mp.Process):
         raise NotImplementedError
 
     def _run_dpic_balance(self):
-        """Overridden by backends that support DPIC.
-
-        Returns ``{"ok": bool, "message": str, "results": list}``.
-        """
+        """Overridden by backends that support DPIC."""
         return {
             "ok": False,
             "message": f"{self.group_id} does not support DPIC balance.",
@@ -328,22 +255,12 @@ class Backend(mp.Process):
         return None
 
     def publish_balance_progress(self, payload: dict):
-        """Child side: offer the balancer's live state to the parent.
-
-        Dropped rather than blocked on when the queue is full: a stalled UI must
-        never slow the search down, and the next measurement supersedes this one
-        anyway.
-        """
+        """Child side: offer the balancer's live state to the parent."""
         with contextlib.suppress(Exception):
             self.progress_queue.put_nowait(payload)
 
     def drain_balance_progress(self):
-        """Parent side: the most recent progress entry, or None if there is none.
-
-        Everything queued is drained, not just one entry, so a poll that runs
-        after a burst of measurements reports where the search *is* rather than
-        walking through where it has been.
-        """
+        """Parent side: the most recent progress entry, or None if there is none."""
         latest = None
         while True:
             try:
@@ -354,12 +271,7 @@ class Backend(mp.Process):
                 return latest
 
     def balance_aborted(self) -> bool:
-        """True once a running balance has been asked to stop.
-
-        Handed to ``DpicBalancer.should_abort`` by the backends that support
-        DPIC, so an abort takes effect at the next sweep point instead of after
-        the whole time budget.
-        """
+        """True once a running balance has been asked to stop."""
         return self._balance_abort.is_set()
 
     def _abort_balance(self, join_timeout: float = 5.0):
@@ -379,22 +291,13 @@ class Backend(mp.Process):
         return self._balance_thread is not None and self._balance_thread.is_alive()
 
     def _start_balance_thread(self, request_id=None):
-        """Run one balance off the command loop and reply when it finishes.
+        """Run one balance off the command loop and reply when it finishes."""
 
-        ``request_id`` is None for the auto-balance that follows START_STREAMING:
-        nobody is waiting on a reply for it, and putting one on the queue with a
-        null id would let an unrelated caller claim it.
-        """
-
-        # Safety net for the caller that does not check first (the
-        # auto-balance): two searches driving one radio would fight.
         if self._balance_in_progress():
             return False
 
         def _worker():
             try:
-                # Always a dict: a balance that bails out early carries the
-                # reason, so it can never reach the client as a success.
                 outcome = self._run_dpic_balance()
                 ok = bool(outcome.get("ok"))
                 payload = {
@@ -423,7 +326,6 @@ class Backend(mp.Process):
         """Parent-side mirror of the parameters that change ``data_sources``."""
         return None
 
-    # Child process
     def run(self):
         self.logger = logging.getLogger(__name__)
         logging.basicConfig(
@@ -475,17 +377,11 @@ class Backend(mp.Process):
                     self._reply(request_id, {"type": Response.SUCCESS, "result": result})
                     step.done()
                     self._streaming.set()
-                    # Slow post-start work (an auto DPIC balance runs for a
-                    # minute or more) goes after the reply, never before it.
                     if result:
                         self._post_start_streaming()
 
                 case IPCCommand.STOP_STREAMING:
                     self._streaming.clear()
-                    # A balance measures a live stream; stopping the radio out
-                    # from under it would leave it waiting on metrics that can
-                    # never arrive until its read timeout expires, once per
-                    # sweep point.
                     self._abort_balance()
                     result = self._stop_streaming()
                     self._reply(request_id, {"type": Response.SUCCESS, "result": result})
@@ -500,9 +396,6 @@ class Backend(mp.Process):
                     self._reply(request_id, {"type": Response.SUCCESS, "result": None})
 
                 case IPCCommand.RUN_DPIC_BALANCE:
-                    # Answered from the balance thread, not from here: the
-                    # search takes a minute or more and the command loop has to
-                    # keep serving Stop and Shutdown throughout.
                     if self._balance_in_progress():
                         self._reply(
                             request_id,
@@ -533,17 +426,12 @@ class Backend(mp.Process):
                 },
             )
 
-    # Parent-side API
     @staticmethod
     def _command_name(command) -> str:
         return getattr(command, "name", str(command))
 
     def _request(self, command, args: dict = None, timeout: float = DEFAULT_TIMEOUT):
-        """Send a command to the child and wait for *its* reply.
-
-        Replies are matched by request id, so a late answer to a request that
-        already timed out is discarded rather than handed to the next caller.
-        """
+        """Send a command to the child and wait for *its* reply."""
         with self._reply_lock:
             self._request_id += 1
             request_id = self._request_id
@@ -569,12 +457,6 @@ class Backend(mp.Process):
             try:
                 response = self.response_queue.get(timeout=min(remaining, 0.25))
             except queue.Empty:
-                # A child that died -- a native crash inside a driver leaves no
-                # Python traceback -- would otherwise be indistinguishable from
-                # a slow one until the full timeout expired, and would then be
-                # reported as "did not answer", which points at the wrong thing.
-                # Checked only after an empty read, so a reply already queued by
-                # a child that exited straight afterwards is still delivered.
                 if self.pid is not None and not self.is_alive():
                     raise DeviceError(
                         f"{self.group_id} backend process exited while handling "
@@ -589,8 +471,6 @@ class Backend(mp.Process):
             if reply_id in (None, request_id):
                 return response
             with self._reply_lock:
-                # Bounded: a reply to a request that already timed out is never
-                # claimed, and this map must not grow for the life of the run.
                 if len(self._pending_replies) >= 32:
                     self._pending_replies.pop(next(iter(self._pending_replies)))
                 self._pending_replies[reply_id] = response
@@ -616,8 +496,6 @@ class Backend(mp.Process):
         )
 
     def queue_param_update(self, **params):
-        # Fire and forget: applying this can restart the device stream, and the
-        # server must not block its command thread on that.
         with self._reply_lock:
             self._request_id += 1
             request_id = self._request_id
@@ -628,8 +506,6 @@ class Backend(mp.Process):
                 "request_id": request_id,
             }
         )
-        # get_data_sources() is answered by the parent, so source-affecting
-        # parameters have to be mirrored here as well as in the child.
         try:
             self._apply_param_update_local(params)
         except Exception as e:

@@ -1,10 +1,4 @@
-"""Several BioView windows share the one server on the machine.
-
-The Monitor and the Configurator both need a server, and only one may run per
-machine, so the server has to serve them at the same time: each client gets its
-own command thread, replies go back on the connection the command arrived on,
-and acquired data is fanned out to every client.
-"""
+"""Several BioView windows share the one server on the machine."""
 import contextlib
 import socket
 import threading
@@ -20,8 +14,6 @@ from bioview_common import (
 
 
 def test_a_second_client_connects_while_the_first_is_connected(server, clients):
-    # Before, the accept loop blocked inside the first client's session, so a
-    # second window's connection sat unanswered until it timed out.
     assert len(server.sessions) == 2
 
 
@@ -71,12 +63,9 @@ def test_discovery_reports_how_many_clients_are_connected(server, clients):
 
 
 def test_a_server_started_by_a_window_retires_once_every_client_has_gone(idle_server):
-    # A shared server outlives the window that spawned it, so it cleans itself
-    # up rather than being killed while another window is still using it.
     srv, client, thread = idle_server(1.0)
     client.connect_and_authenticate()
 
-    # Still serving a client, so it stays up well past the idle timeout.
     time.sleep(2.0)
     assert srv.running
 
@@ -116,12 +105,7 @@ def _claim(token="window-1", heartbeat=0.5, **extra):
 
 
 def test_the_idle_check_does_not_hang_off_accept_timing_out(idle_server):
-    """Traffic that is not a claim must not postpone the idle shutdown.
-
-    The check used to run only when accept() timed out, so anything keeping the
-    accept loop busy -- here, connections the server rejects -- would hold an
-    abandoned server open indefinitely.
-    """
+    """Traffic that is not a claim must not postpone the idle shutdown."""
     srv, _client, thread = idle_server(1.0)
 
     stop = threading.Event()
@@ -135,13 +119,7 @@ def test_the_idle_check_does_not_hang_off_accept_timing_out(idle_server):
 
 
 def test_a_window_holds_its_server_open_without_ever_connecting(idle_server):
-    """A claiming window is a window that intends to connect.
-
-    It may not have authenticated yet -- the Monitor builds its client only
-    once its configuration dialog has been answered, and that can take as long
-    as the user likes. So a window's heartbeat holds the server open, and the
-    server only retires once nothing claims it any more.
-    """
+    """A claiming window is a window that intends to connect."""
     srv, _client, thread = idle_server(1.0)
 
     stop = threading.Event()
@@ -155,14 +133,12 @@ def test_a_window_holds_its_server_open_without_ever_connecting(idle_server):
         stop.set()
         prober.join(timeout=2)
 
-    # ...and it is not immortal: once the last window stops calling, so is it.
     thread.join(timeout=10)
     assert not srv.running, "server stayed up after its last window went quiet"
 
 
 def test_an_anonymous_probe_answers_but_claims_nothing(idle_server):
-    """A subnet scan sweeps every host on the network. Answering one must not
-    be enough to keep an abandoned server alive."""
+    """A subnet scan sweeps every host on the network. Answering one must not"""
     srv, _client, thread = idle_server(1.0)
 
     stop = threading.Event()
@@ -176,8 +152,7 @@ def test_an_anonymous_probe_answers_but_claims_nothing(idle_server):
 
 
 def test_a_window_that_says_goodbye_is_forgotten_at_once(idle_server):
-    """Closing a window must not leave its claim to time out: the next window
-    to close would then see a phantom and decline to shut the server down."""
+    """Closing a window must not leave its claim to time out: the next window"""
     srv, _client, _thread = idle_server(0)
 
     with socket.create_connection(("127.0.0.1", srv.control_port), timeout=5) as sock:

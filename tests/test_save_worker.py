@@ -121,7 +121,6 @@ def test_round_trip_preserves_samples_and_device_identity(tmp_path):
     np.testing.assert_array_equal(records[1]["block"], b)
     assert records[0]["device_id"] == "A"
     assert records[1]["device_id"] == "B"
-    # Offsets are relative to t0, and t0 is the only absolute time in the file.
     assert records[0]["t_offset_us"] == pytest.approx(100_000, abs=2000)
     assert records[1]["t_offset_us"] == pytest.approx(200_000, abs=2000)
     assert trailer["Annotations"] == []
@@ -137,7 +136,6 @@ def test_gap_in_sample_counter_is_recorded(tmp_path):
         writer,
         [
             {"device_id": "A", "data": block, "sample_idx": 0},
-            # Jumps to 25 instead of 10: 15 samples were dropped upstream.
             {"device_id": "A", "data": block, "sample_idx": 25},
         ],
     )
@@ -157,7 +155,7 @@ def test_wrong_row_count_is_rejected_not_written(tmp_path):
     writer.open()
 
     good = np.ones((2, 3), dtype=np.float32)
-    bad = np.ones((5, 3), dtype=np.float32)  # device A declares 2 rows
+    bad = np.ones((5, 3), dtype=np.float32)
     _run(
         writer,
         [
@@ -203,7 +201,6 @@ def test_unfinished_file_has_no_trailer_but_keeps_records(tmp_path):
     block = np.ones((2, 4), dtype=np.float32)
     writer._append({"device_id": "A", "data": block, "sample_idx": 0})
     writer._flush()
-    # No cleanup(): simulates a process that died before closing.
 
     blob = path.read_bytes()
     assert blob[-8:] != BVR_TRAILER_MAGIC
@@ -218,7 +215,7 @@ def test_forwarder_tags_chunks_with_device_and_counter():
     fwd = SaveForwarder(device_id="A", data_input_queue=src, data_output_queue=dst)
 
     src.put({"data": np.zeros((2, 5), np.float32), "sample_idx": 40, "t_wall": 123.0})
-    src.put(np.zeros((2, 7), np.float32))  # bare array: counter is derived
+    src.put(np.zeros((2, 7), np.float32))
 
     fwd.start()
     fwd.resume()
@@ -230,6 +227,5 @@ def test_forwarder_tags_chunks_with_device_and_counter():
     assert first["device_id"] == "A"
     assert first["sample_idx"] == 40
     assert first["t_wall"] == 123.0
-    # Falls back to continuing from where the tagged chunk ended.
     assert second["sample_idx"] == 45
     assert second["t_wall"] > 0

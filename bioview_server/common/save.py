@@ -1,13 +1,4 @@
-"""Session recorder: one ``bioview-raw-v3`` file per session, written server-side.
-
-Every device backend runs in its own process and produces its own save-rate
-stream, so each pushes tagged records onto one shared queue that this worker
-drains. Writing here rather than on the client is what lets the file hold
-save-rate data: the save stream never crosses the wire (only the decimated
-display stream does).
-
-The format itself is documented in ``bioview_common.formats.bvr``.
-"""
+"""Session recorder: one ``bioview-raw-v3`` file per session, written server-side."""
 
 import contextlib
 import multiprocessing as mp
@@ -29,16 +20,11 @@ from bioview_common import (
 )
 
 
-#: Records accumulated before one write() call.
 DEFAULT_BATCH_RECORDS = 16
 
 
 def flatten_chunk(chunk) -> np.ndarray:
-    """Fold a chunk into a 2-D ``(rows, samples)`` block ready to write.
-
-    A complex ``(channels, samples, 2)`` chunk is stored as all real rows then
-    all imaginary rows; a real-valued chunk passes through.
-    """
+    """Fold a chunk into a 2-D ``(rows, samples)`` block ready to write."""
     arr = np.asarray(chunk)
     if arr.ndim == 3:
         return np.vstack([arr[:, :, 0], arr[:, :, 1]])
@@ -46,16 +32,9 @@ def flatten_chunk(chunk) -> np.ndarray:
 
 
 class BvrWriter(PausableWorker):
-    """Drains the shared save queue into a single ``.bvr`` file.
+    """Drains the shared save queue into a single ``.bvr`` file."""
 
-    Queue items are dicts::
-
-        {"device_id": str, "data": ndarray (rows, samples),
-         "t_wall": float (time.time() at emit), "sample_idx": int}
-
-    Devices are registered before streaming starts so that ``device_idx`` and
-    each device's row count and save rate are fixed in the header.
-    """
+    METADATA_TYPES = frozenset({"param_change"})
 
     QUEUE_TIMEOUT_S = 0.1
 
@@ -66,6 +45,7 @@ class BvrWriter(PausableWorker):
         devices: list[dict],
         device_config: dict = None,
         batch_records: int = DEFAULT_BATCH_RECORDS,
+        sample_limits: dict = None,
         logger=None,
     ):
         super().__init__()
@@ -76,16 +56,19 @@ class BvrWriter(PausableWorker):
         self.device_config = device_config or {}
         self.batch_records = max(int(batch_records), 1)
 
-        # Ordered device table; position is the record's device_idx.
         self.devices = list(devices)
         self._idx_of = {d["device_id"]: i for i, d in enumerate(self.devices)}
+        # Per-device hard sample budget. A routine asks for a fixed number of
+        # seconds, but the stream keeps running until the stop command has made
+        # a round trip, so without this the file length varied with whatever the
+        # timer, the network and the device spin-up happened to cost that run.
+        self.sample_limits = dict(sample_limits or {})
 
         self._file = None
         self._pending = []
         self._pending_count = 0
         self.t0_unix = None
 
-        # Per-device tallies, reported in the trailer.
         self._stats = {
             d["device_id"]: {"records": 0, "samples": 0, "gaps": 0, "dropped_samples": 0}
             for d in self.devices
@@ -95,8 +78,6 @@ class BvrWriter(PausableWorker):
         self._param_changes = []
         self.records_written = 0
         self.unknown_device_records = 0
-
-    # ------------------------------------------------------------------ file
 
     def open(self, t0_unix=None):
         """Create the file and write the header. Call before the thread starts."""
@@ -108,7 +89,6 @@ class BvrWriter(PausableWorker):
             "devices": self.devices,
             "device_config": self.device_config,
         }
-        # Not a context manager: the file stays open for the whole session.
         self._file = open(self.save_path, "wb")  # noqa: SIM115
         self._file.write(encode_header(header))
         log_print(self.logger, "info", f"[Save] Recording to {self.save_path}")
@@ -117,8 +97,6 @@ class BvrWriter(PausableWorker):
         if t_wall is None or self.t0_unix is None:
             return 0
         return int(round((float(t_wall) - self.t0_unix) * 1e6))
-
-    # ------------------------------------------------------------- metadata
 
     def record_annotation(self, text, t_wall=None):
         """Add a "Mark Event" note; stored as an offset from ``t0``."""
@@ -142,14 +120,31 @@ class BvrWriter(PausableWorker):
             }
         )
 
-    # --------------------------------------------------------------- writing
+    def _handle_metadata(self, item) -> bool:
+        """Consume a metadata queue item. Returns True if it was one."""
+        if not isinstance(item, dict) or "type" not in item:
+            return False
+        kind = item.get("type")
+        if kind not in self.METADATA_TYPES:
+            log_print(
+                self.logger,
+                "debug",
+                f"[Save] Ignoring unknown metadata record {kind!r}",
+            )
+            return True
+        if kind == "param_change":
+            self.record_change(
+                item.get("device_id"),
+                item.get("param"),
+                item.get("value"),
+                t_wall=item.get("t_wall"),
+            )
+        return True
 
     def _append(self, item):
         device_id = item.get("device_id")
         idx = self._idx_of.get(device_id)
         if idx is None:
-            # A device that never registered: keep streaming, but do not write
-            # rows that no header entry describes.
             self.unknown_device_records += 1
             return
 
@@ -178,10 +173,17 @@ class BvrWriter(PausableWorker):
         n_samples = block.shape[1]
         sample_idx = int(item.get("sample_idx") or 0)
 
-        # A sample counter that does not continue where the last record ended
-        # means the producer dropped samples; record how many.
-        prev_end = self._last_end.get(device_id)
         stats = self._stats[device_id]
+        limit = self.sample_limits.get(device_id)
+        if limit is not None:
+            remaining = limit - stats["samples"]
+            if remaining <= 0:
+                return
+            if n_samples > remaining:
+                block = block[:, :remaining]
+                n_samples = remaining
+
+        prev_end = self._last_end.get(device_id)
         if prev_end is not None and sample_idx != prev_end:
             stats["gaps"] += 1
             stats["dropped_samples"] += max(0, sample_idx - prev_end)
@@ -208,17 +210,12 @@ class BvrWriter(PausableWorker):
             return
         try:
             self._file.write(b"".join(self._pending))
-            # Push to the OS on every batch: a file with no trailer is supposed
-            # to stay readable up to its last complete record, which is only
-            # true if the records actually left Python's buffer.
             self._file.flush()
         except Exception as e:
             log_print(self.logger, "error", f"[Save] Write failed: {e}")
         finally:
             self._pending = []
             self._pending_count = 0
-
-    # ---------------------------------------------------------------- worker
 
     def work(self):
         if self.data_queue is None:
@@ -228,14 +225,14 @@ class BvrWriter(PausableWorker):
             try:
                 item = self.data_queue.get(timeout=self.QUEUE_TIMEOUT_S)
             except queue.Empty:
-                # Idle: commit what is held so a slow stream never leaves data
-                # sitting only in memory.
                 self._flush()
                 continue
             except (OSError, ValueError):
                 break
 
             try:
+                if self._handle_metadata(item):
+                    continue
                 self._append(item)
             except Exception as e:
                 log_print(self.logger, "error", f"[Save] Bad chunk: {e}")
@@ -263,6 +260,7 @@ class BvrWriter(PausableWorker):
                     "device_id": dev["device_id"],
                     "records": stats["records"],
                     "samples": stats["samples"],
+                    "sample_limit": self.sample_limits.get(dev["device_id"]),
                     "gaps": stats["gaps"],
                     "dropped_samples": stats["dropped_samples"],
                     "achieved_fs": achieved,
@@ -298,12 +296,7 @@ def _iso(unix_time):
 
 
 class SaveForwarder(PausableWorker):
-    """Tags one device's save chunks and forwards them to the session recorder.
-
-    Runs inside the device's own process. Producers push either a bare array or
-    a dict carrying the sample counter and emit time; both are accepted so a
-    backend that has no counter still records, just without gap detection.
-    """
+    """Tags one device's save chunks and forwards them to the session recorder."""
 
     QUEUE_TIMEOUT_S = 0.1
 
@@ -314,7 +307,6 @@ class SaveForwarder(PausableWorker):
         self.data_input_queue = data_input_queue
         self.data_output_queue = data_output_queue
         self.chunks_dropped = 0
-        # Fallback counter for producers that do not supply sample_idx.
         self._samples_seen = 0
 
     def work(self):
@@ -351,8 +343,6 @@ class SaveForwarder(PausableWorker):
                 "sample_idx": int(sample_idx),
                 "t_wall": float(t_wall) if t_wall is not None else time.time(),
             }
-            # Saving must not silently lose data: block briefly rather than
-            # dropping, and count it when the recorder genuinely cannot keep up.
             if not put_or_drop(self.data_output_queue, payload, timeout=1.0):
                 self.chunks_dropped += 1
                 log_print(

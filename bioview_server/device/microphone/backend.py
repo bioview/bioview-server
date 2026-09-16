@@ -17,22 +17,13 @@ from .utils import (
 )
 
 
-#: Longest capture chunk, in seconds. The chunk is the acquisition latency, so
-#: a large blocksize would delay every plot update by the same amount.
 MAX_CHUNK_SECONDS = 0.1
 
-#: Chunk used when nothing is configured: 10 per second, matching the BIOPAC
-#: backend's default so a mixed session's chunks arrive at a similar cadence.
 DEFAULT_CHUNKS_PER_SECOND = 10
 
 
 class MicrophoneBackend(Backend):
-    """Host audio input as an ordinary BioView device.
-
-    One row per captured channel at ``samp_rate``, emitted through the standard
-    display path -- which is also the save path -- so speech is recorded
-    sample-aligned with the RF and physiological rows in the same ``.bvr``.
-    """
+    """Host audio input as an ordinary BioView device."""
 
     def __init__(
         self,
@@ -66,21 +57,11 @@ class MicrophoneBackend(Backend):
         self.device_index = None
         self.acquisition_worker: MicrophoneAcquisitionWorker | None = None
 
-        # Negotiated here, in the parent, rather than when the stream opens in
-        # the child: ``get_data_sources()`` is answered out of the parent, so a
-        # rate settled on in the child would leave the advertised ``disp_freq``
-        # -- which is the timebase written into the recording header -- stale.
         self._negotiate_samp_rate()
         self.populate_data_sources()
 
-    # ------------------------------------------------------------- settings
-
     def _setting(self, key, default=None):
-        """Hardware entry first, then the group block, then the default.
-
-        The same precedence BIOPAC uses: a UI edit is written to both, and the
-        nested entry is the one that describes a specific physical device.
-        """
+        """Hardware entry first, then the group block, then the default."""
         if key in self.hw_entry and self.hw_entry[key] is not None:
             return self.hw_entry[key]
         value = self.group_config.get(key, default)
@@ -89,7 +70,6 @@ class MicrophoneBackend(Backend):
     def _channel_count(self) -> int:
         raw = self._setting("channels", 1)
         if isinstance(raw, list | tuple):
-            # A config written against the BIOPAC enable-mask shape.
             return max(1, sum(1 for entry in raw if entry))
         try:
             return max(1, int(raw))
@@ -97,13 +77,7 @@ class MicrophoneBackend(Backend):
             return 1
 
     def _negotiate_samp_rate(self):
-        """Settle ``samp_rate`` against what the input will actually run at.
-
-        Failures are swallowed: this runs during construction, before the
-        device has been asked for anything, and a missing microphone must
-        surface at Connect with its own message rather than as a constructor
-        that raised.
-        """
+        """Settle ``samp_rate`` against what the input will actually run at."""
         try:
             index = resolve_input_device(self.device, self.logger)
             rate = negotiate_samplerate(
@@ -136,9 +110,6 @@ class MicrophoneBackend(Backend):
                 if idx < len(labels) and labels[idx]
                 else (f"Audio{idx + 1}" if self.channel_count > 1 else "Audio")
             )
-            # Every captured sample is emitted, so the display rate is the
-            # sample rate. Saving is fed from this same stream, so decimating
-            # here would decimate the recording too.
             self.data_sources.add(
                 DataSource(
                     group_id=self.group_id,
@@ -148,26 +119,11 @@ class MicrophoneBackend(Backend):
                 )
             )
 
-    # -------------------------------------------------------------- control
-
     def _open_stream(self):
-        """Open the input, wired to the acquisition worker's callback.
-
-        The worker is built first because the callback belongs to it, and it
-        outlives Stop/Start: a PausableWorker is a thread, so it is started once
-        and paused thereafter. The stream is opened here but *not* started -- a
-        running stream with a paused worker only fills the capture queue with
-        audio nobody is going to emit.
-        """
+        """Open the input, wired to the acquisition worker's callback."""
         import sounddevice as sd
 
         self.device_index = resolve_input_device(self.device, self.logger)
-        # Deliberately not sd.check_input_settings: under WDM-KS it answers
-        # about the format without answering about the device, and accepts
-        # settings that Pa_OpenStream then refuses outright. The open below is
-        # the only check that means anything; this one exists to turn its
-        # failure into a message that names what was asked for and what the
-        # likely cause is.
         if not supports_input(self.device_index, self.channel_count, self.samp_rate):
             name = describe_input(self.device_index)
             raise RuntimeError(
@@ -207,8 +163,6 @@ class MicrophoneBackend(Backend):
             )
             return True
         except Exception as e:
-            # Raised, not returned falsy: upstream turns a falsy result into a
-            # generic "unable to initialize" and loses the PortAudio reason.
             self.status = DeviceStatus.DISCONNECTED
             log_print(self.logger, "error", f"Unable to open audio input: {e}")
             self._teardown_capture()
@@ -243,9 +197,6 @@ class MicrophoneBackend(Backend):
                 self.display_worker.start()
             self.display_worker.resume()
 
-        # Anything captured before Start is stale by the time it is pressed, and
-        # emitting it would offset the whole recording against the devices
-        # starting alongside it.
         with contextlib.suppress(queue.Empty):
             while True:
                 self.acquisition_worker.capture_queue.get_nowait()
@@ -270,9 +221,6 @@ class MicrophoneBackend(Backend):
         if self.save_worker is not None:
             self.save_worker.pause()
 
-        # The stream is stopped rather than closed: Start/Stop is pressed many
-        # times a session and reopening a PortAudio device each time is both
-        # slow and a chance for another application to take it in between.
         if self.stream is not None:
             with contextlib.suppress(Exception):
                 self.stream.stop()
@@ -311,7 +259,6 @@ class MicrophoneBackend(Backend):
                 self.group_config["blocksize"] = self.blocksize
                 reopen = True
             elif param == "gain":
-                # Applied per chunk, so it takes effect without reopening.
                 self.gain = float(value)
                 self.group_config["gain"] = self.gain
                 self.hw_entry["gain"] = self.gain
@@ -319,20 +266,14 @@ class MicrophoneBackend(Backend):
                     self.acquisition_worker.gain = self.gain
 
         if reopen:
-            # A new rate or channel count may not be one this input supports.
             self._negotiate_samp_rate()
             self.populate_data_sources()
             if self.display_worker is not None:
-                # The display worker labels each row; a stale source list
-                # mislabels every plot after a channel or rate change.
                 self.display_worker.set_display_sources(self._display_sources())
 
         if not reopen or self.stream is None:
             return
 
-        # A new rate, channel count or input needs a different PortAudio
-        # stream, and the worker is bound to that stream's callback -- so both
-        # are rebuilt rather than adjusted.
         was_streaming = self.status == DeviceStatus.STREAMING
         if was_streaming:
             self._stop_streaming()
@@ -347,13 +288,7 @@ class MicrophoneBackend(Backend):
             self._start_streaming()
 
     def _apply_param_update_local(self, params: dict):
-        """Mirror channel/label/rate changes on the parent side.
-
-        ``get_data_sources()`` is answered out of the parent process, so a
-        change made in the UI has to land here as well as in the child --
-        otherwise the server keeps advertising the old source list and the
-        plot-source selector never changes.
-        """
+        """Mirror channel/label/rate changes on the parent side."""
         params = dict(params or {})
         touched = False
 

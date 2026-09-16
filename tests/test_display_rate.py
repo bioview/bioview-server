@@ -1,11 +1,4 @@
-"""The advertised display rate must match the rate actually emitted.
-
-The client sizes its plot ring buffer from ``DataSource.disp_freq`` and slides
-it by however many samples arrive. If the two disagree, the trace scrolls at
-``actual / advertised`` times real time -- which is how USRP traces ended up
-running 50x fast: the pipeline emitted ``samp_rate / save_ds`` = 10 kHz while
-every USRP source still carried the 200 Hz default.
-"""
+"""The advertised display rate must match the rate actually emitted."""
 
 import queue
 
@@ -47,7 +40,7 @@ def test_emitted_display_length_matches_the_advertised_rate(save_ds, display_ds)
     disp_q = queue.Queue(maxsize=8)
     worker = _worker(save_ds, display_ds, display_queue=disp_q)
 
-    n_raw = int(SAMP_RATE)  # exactly one second
+    n_raw = int(SAMP_RATE)
     buffer = np.zeros((1, n_raw), dtype=np.complex64)
     results = worker._process_mimo_chunk(buffer)
     _, display_data = worker._assemble_outputs(buffer, results)
@@ -61,7 +54,6 @@ def test_display_decimation_averages_rather_than_drops():
     worker = _worker(save_ds=1, display_ds=4)
     payload = np.arange(8, dtype=np.float32).reshape(1, 8)
     out = worker._decimate_display(payload)
-    # windows [0,1,2,3] and [4,5,6,7]
     assert out.tolist() == [[1.5, 5.5]]
 
 
@@ -110,7 +102,6 @@ def test_fake_rf_backend_advertises_the_post_decimation_rate():
     assert sources
     for source in sources:
         assert source.get_disp_freq() == expected
-        # Round-trips to the client through to_dict/from_dict.
         assert DataSource.from_dict(source.to_dict()).get_disp_freq() == expected
 
 

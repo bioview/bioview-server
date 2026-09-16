@@ -1,16 +1,4 @@
-"""No worker may be resumed before every worker thread has been created.
-
-``Thread.start()`` waits, without a timeout, for the new thread to be scheduled
-and set its started event. The USRP bring-up used to interleave start and resume
--- transmit up and running, receive up and running, *then* create the process
-worker -- so the last thread was created only once two threads were already
-spinning inside tight UHD calls, and it never got the GIL to finish starting.
-
-The backend then never answered START_STREAMING. After 90 s the server gave up,
-and because a partially started session is refused outright it also stopped
-every other device: a healthy BIOPAC in the same session plotted nothing, which
-is how this was first reported.
-"""
+"""No worker may be resumed before every worker thread has been created."""
 
 import pytest
 
@@ -50,6 +38,10 @@ def _backend():
 
     backend.tx_command_queue = {}
     backend._cal_enabled = False
+    backend.enable_save = False
+    backend.save_output_queue = None
+    backend.rx_gains_global = [30.0]
+    backend.tx_gains_global = [30.0]
     return backend, log
 
 
